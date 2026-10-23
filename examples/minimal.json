@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "instance": "minimal",
+  "ports": {
+    "wan": { "kind": "l3", "device": "eth0" },
+    "lan": { "kind": "l3", "device": "eth1" }
+  },
+  "interfaces": {
+    "wan0": { "port": "wan", "address": "dhcp" },
+    "lan0": { "port": "lan", "address": "10.0.0.1/24" }
+  },
+  "dhcp": [
+    { "iface": "lan0", "pool": "10.0.0.100-10.0.0.200" }
+  ]
+}

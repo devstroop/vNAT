@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "instance": "travel-router",
+  "log": { "level": "info", "format": "text" },
+  "ports": {
+    "wan": { "kind": "l3", "device": "eth0" },
+    "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 },
+    "usb-lan": { "kind": "l2", "device": "usb0" },
+    "vpn0": { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
+  },
+  "bridges": {
+    "lan-br": { "ports": ["lan", "usb-lan"], "stp": true, "vlan_aware": true }
+  },
+  "interfaces": {
+    "wan0": { "port": "wan", "address": "dhcp" },
+    "lan0": { "bridge": "lan-br", "address": "10.10.0.1/24" }
+  },
+  "routes": [
+    { "dst": "0.0.0.0/0", "via": "192.168.1.1", "dev": "wan0" }
+  ],
+  "nat": {
+    "masquerade": [ { "out": "wan0" } ],
+    "port_forward": [
+      { "proto": "tcp", "ext_port": 8080, "to": "10.10.0.10:80" }
+    ]
+  },
+  "dhcp": [
+    {
+      "iface": "lan0",
+      "pool": "10.10.0.100-10.10.0.200",
+      "lease": "12h",
+      "dns": "10.10.0.1"
+    }
+  ],
+  "dns": {
+    "upstreams": ["1.1.1.1", "8.8.8.8"],
+    "cache": true,
+    "listen": "10.10.0.1"
+  },
+  "firewall": {
+    "default_in": "drop",
+    "default_forward": "drop",
+    "default_out": "accept"
+  }
+}

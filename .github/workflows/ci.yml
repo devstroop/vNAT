@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - run: zig fmt --check build.zig build.zig.zon src test.zig exec
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - run: zig build
+      - run: for f in examples/*.json; do ./zig-out/bin/vnat validate "$f"; done
+
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux
+          - aarch64-linux
+          - aarch64-linux-android
+          - arm-linux-androideabi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - run: zig build -Dtarget=${{ matrix.target }}
+
+  netns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_netns.sh
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_route.sh
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_tun.sh
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_journal.sh
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/nat_matrix.sh
+
+  zig-next:
+    # 0.17 is allowed to fail until the port lands.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.0
+      - run: zig build
