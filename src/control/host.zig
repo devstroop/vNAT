@@ -87,6 +87,85 @@ pub const Host = struct {
         return .applied;
     }
 
+    pub fn ifaceAddBridge(self: *Host, dev: []const u8, stp: bool, vlan_filtering: bool) !Change {
+        if (try linkExists(dev)) return error.Busy;
+        try self.store.append(self.io, .{ .link_add = .{
+            .dev = dev,
+            .kind = .bridge,
+            .stp = stp,
+            .vlan_filtering = vlan_filtering,
+        } });
+        netlink.createLink(self.io, .{
+            .name = dev,
+            .kind = .bridge,
+            .stp = stp,
+            .vlan_filtering = vlan_filtering,
+        }) catch |err| {
+            try self.store.removeLast(self.io);
+            return err;
+        };
+        return .applied;
+    }
+
+    pub fn ifaceAddVeth(self: *Host, dev: []const u8, peer: []const u8) !Change {
+        if (try linkExists(dev) or try linkExists(peer)) return error.Busy;
+        try self.store.append(self.io, .{ .link_add = .{
+            .dev = dev,
+            .kind = .veth,
+            .peer = peer,
+        } });
+        netlink.createLink(self.io, .{
+            .name = dev,
+            .kind = .veth,
+            .peer = peer,
+        }) catch |err| {
+            try self.store.removeLast(self.io);
+            return err;
+        };
+        return .applied;
+    }
+
+    pub fn ifaceSetMaster(self: *Host, dev: []const u8, master: ?[]const u8) !Change {
+        const current = try netlink.linkMaster(self.io, self.gpa, dev);
+        const target: u32 = if (master) |name| try iface_mod.ifindex(name) else 0;
+        if (current == target) return .noop;
+
+        try self.store.append(self.io, .{ .link_master = .{
+            .dev = dev,
+            .master = master,
+        } });
+        netlink.setMaster(self.io, dev, master) catch |err| {
+            try self.store.removeLast(self.io);
+            return err;
+        };
+        return .applied;
+    }
+
+    pub fn bridgeVlanAdd(
+        self: *Host,
+        dev: []const u8,
+        vid: u16,
+        pvid: bool,
+        untagged: bool,
+    ) !Change {
+        if (pvid and !untagged) return error.InvalidArgument;
+        try self.store.append(self.io, .{ .bridge_vlan = .{
+            .dev = dev,
+            .vid = vid,
+            .pvid = pvid,
+            .untagged = untagged,
+        } });
+        netlink.setBridgeVlan(self.io, dev, vid, pvid, untagged, true) catch |err| {
+            try self.store.removeLast(self.io);
+            return err;
+        };
+        return .applied;
+    }
+
+    pub fn checkpoint(self: *Host) !usize {
+        return self.store.lineCount(self.io);
+    }
+
     pub fn routeAdd(
         self: *Host,
         dst: []const u8,
@@ -146,6 +225,13 @@ pub const Host = struct {
     }
 
     pub fn down(self: *Host) !DownResult {
+        return self.downTo(0);
+    }
+
+    /// Replays only records written after `checkpoint`, newest first, then
+    /// truncates them. Lets setup code roll back a failed transaction without
+    /// disturbing earlier user-visible host state.
+    pub fn downTo(self: *Host, start: usize) !DownResult {
         const contents_opt = try self.store.contents(self.io);
         const contents = contents_opt orelse return .{};
         defer self.gpa.free(contents);
@@ -158,10 +244,11 @@ pub const Host = struct {
             if (line.len == 0) continue;
             try lines.append(self.gpa, line);
         }
+        if (start > lines.items.len) return error.InvalidJournal;
 
         var result: DownResult = .{};
         var index = lines.items.len;
-        while (index > 0) {
+        while (index > start) {
             index -= 1;
             var parsed = journal.parseLine(self.gpa, lines.items[index]) catch {
                 result.failed += 1;
@@ -179,7 +266,7 @@ pub const Host = struct {
             result.restored += 1;
         }
 
-        if (result.failed == 0) try self.store.clear(self.io);
+        if (result.failed == 0) try self.store.truncateTo(self.io, start);
         return result;
     }
 
@@ -207,6 +294,36 @@ pub const Host = struct {
                 const current = try iface_mod.isUp(link.dev);
                 if (current != target) try iface_mod.setUp(link.dev, target);
             },
+            .link_add => |link| {
+                _ = iface_mod.ifindex(link.dev) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                netlink.deleteLink(self.io, link.dev) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            },
+            .link_master => |link| {
+                _ = iface_mod.ifindex(link.dev) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                netlink.setMaster(self.io, link.dev, null) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            },
+            .bridge_vlan => |vlan| {
+                _ = iface_mod.ifindex(vlan.dev) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                netlink.setBridgeVlan(self.io, vlan.dev, vlan.vid, vlan.pvid, vlan.untagged, false) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            },
             .route_add => |route| {
                 const ifindex = iface_mod.ifindex(route.dev) catch |err| switch (err) {
                     error.NotFound => return,
@@ -232,6 +349,14 @@ pub const Host = struct {
         return contents_opt orelse try self.gpa.alloc(u8, 0);
     }
 };
+
+fn linkExists(dev: []const u8) !bool {
+    _ = iface_mod.ifindex(dev) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return true;
+}
 
 fn parseRoute(
     dst: []const u8,

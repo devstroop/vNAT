@@ -53,6 +53,20 @@ fn validateFirewallIface(cfg: *const schema.Config, name: []const u8) ConfigErro
     {
         return error.UndefinedReference;
     }
+    // Offloaded members never reach the userspace firewall as their physical
+    // name; all traffic enters through the synthetic trunk port instead.
+    if (portInOffloadBridge(cfg, name)) return error.InvalidValue;
+}
+
+fn portInOffloadBridge(cfg: *const schema.Config, port_name: []const u8) bool {
+    var it = cfg.bridges.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.offload == .none) continue;
+        for (entry.value_ptr.ports) |member| {
+            if (std.mem.eql(u8, member, port_name)) return true;
+        }
+    }
+    return false;
 }
 
 fn validateInstance(instance: []const u8) ConfigError!void {
@@ -113,12 +127,24 @@ fn validateBridges(cfg: *const schema.Config) ConfigError!void {
 
         const bridge = entry.value_ptr.*;
         if (bridge.ports.len == 0) return error.InvalidValue;
-        if (bridge.offload != .none) return error.InvalidValue;
 
         for (bridge.ports, 0..) |port_name, i| {
             const port = cfg.ports.getPtr(port_name) orelse return error.UndefinedReference;
             if (port.kind != .l2) return error.InvalidValue;
             try validatePortVlans(port, bridge.vlan_aware);
+
+            if (bridge.offload != .none) {
+                // A kernel bridge member must already exist and is not opened
+                // by the port manager, so vNAT cannot apply these settings.
+                if (port.create != null) return error.InvalidValue;
+                if (port.mtu != null) return error.InvalidValue;
+                if (bridge.vlan_aware) {
+                    const pvid = port.pvid orelse 1;
+                    for (port.tagged) |vid| {
+                        if (vid == pvid) return error.InvalidValue;
+                    }
+                }
+            }
 
             for (bridge.ports[0..i]) |seen| {
                 if (std.mem.eql(u8, seen, port_name)) return error.DuplicateName;
@@ -394,7 +420,7 @@ test "rejects l3 port in bridge" {
     try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
 }
 
-test "accepts STP but rejects kernel offload" {
+test "accepts STP and kernel offload" {
     const input_stp =
         \\{ "version": 1, "instance": "x",
         \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
@@ -429,7 +455,40 @@ test "accepts STP but rejects kernel offload" {
     ;
     var parsed_offload = try @import("parse.zig").parse(std.testing.allocator, input_offload);
     defer parsed_offload.deinit();
-    try std.testing.expectError(error.InvalidValue, validate(&parsed_offload.config));
+    try validate(&parsed_offload.config);
+}
+
+test "rejects ambiguous VLANs on kernel offload bridge" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1", "pvid": 10, "tagged": [10] } },
+        \\  "bridges": { "br": { "ports": ["lan"], "vlan_aware": true, "offload": "kernel" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects created port on kernel offload bridge" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "tap0", "create": "tap" } },
+        \\  "bridges": { "br": { "ports": ["lan"], "offload": "kernel" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects MTU override on kernel offload bridge" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1", "mtu": 1400 } },
+        \\  "bridges": { "br": { "ports": ["lan"], "offload": "kernel" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
 }
 
 test "rejects port in two bridges" {

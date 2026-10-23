@@ -16,6 +16,7 @@ const NETLINK_ROUTE: u32 = 0;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
@@ -39,8 +40,24 @@ const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_MASTER: u16 = 10;
 const IFLA_OPERSTATE: u16 = 16;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_AF_SPEC: u16 = 26;
 const IFLA_CARRIER: u16 = 33;
+
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+const VETH_INFO_PEER: u16 = 1;
+
+const IFLA_BR_STP_STATE: u16 = 5;
+const IFLA_BR_VLAN_FILTERING: u16 = 7;
+const IFLA_BR_VLAN_DEFAULT_PVID: u16 = 39;
+
+const IFLA_BRIDGE_FLAGS: u16 = 0;
+const IFLA_BRIDGE_VLAN_INFO: u16 = 2;
+const BRIDGE_VLAN_INFO_PVID: u16 = 1 << 1;
+const BRIDGE_VLAN_INFO_UNTAGGED: u16 = 1 << 2;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
@@ -66,6 +83,7 @@ const IFF_LOWER_UP: u32 = 0x10000;
 const IF_OPER_UP: u8 = 6;
 
 const AF_INET: u8 = 2;
+const AF_BRIDGE: u8 = 7;
 
 const NLMSG_HDR_LEN = 16;
 
@@ -107,6 +125,7 @@ pub const LinkInfo = struct {
     up: bool = false,
     running: bool = false,
     operstate: u8 = 0,
+    master: u32 = 0,
 
     pub fn name(self: *const LinkInfo) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -123,6 +142,7 @@ const LinkData = struct {
     running: bool = false,
     operstate: u8 = 0,
     carrier: bool = false,
+    master: u32 = 0,
 };
 
 // --- primitive readers ----------------------------------------------------
@@ -198,6 +218,9 @@ fn parseLinkData(payload: []const u8) ?LinkData {
             IFLA_IFNAME => copyName(&out.name_buf, &out.name_len, attr.data),
             IFLA_MTU => {
                 if (readU32(attr.data, 0)) |mtu| out.mtu = @intCast(@min(mtu, 65535));
+            },
+            IFLA_MASTER => {
+                if (readU32(attr.data, 0)) |master| out.master = master;
             },
             IFLA_ADDRESS => {
                 if (attr.data.len >= 6) @memcpy(&out.mac.bytes, attr.data[0..6]);
@@ -457,6 +480,7 @@ pub fn listLinks(io: std.Io, gpa: std.mem.Allocator) PortError![]LinkInfo {
                         .up = info.up,
                         .running = info.running,
                         .operstate = info.operstate,
+                        .master = info.master,
                     });
                 },
                 else => {},
@@ -465,6 +489,17 @@ pub fn listLinks(io: std.Io, gpa: std.mem.Allocator) PortError![]LinkInfo {
     }
 
     return links.toOwnedSlice(gpa);
+}
+
+/// Returns the ifindex of the bridge master, or zero when the link is not
+/// enslaved. Used by the control plane to refuse stealing an existing port.
+pub fn linkMaster(io: std.Io, gpa: std.mem.Allocator, dev: []const u8) PortError!u32 {
+    const links = try listLinks(io, gpa);
+    defer gpa.free(links);
+    for (links) |link| {
+        if (std.mem.eql(u8, link.name(), dev)) return link.master;
+    }
+    return error.NotFound;
 }
 
 // --- control (mutations) --------------------------------------------------
@@ -727,6 +762,209 @@ pub fn deleteRoute(io: std.Io, spec: RouteSpec) PortError!void {
     return control.transact(io, msg, seq);
 }
 
+// --- link and bridge mutations -------------------------------------------
+
+const IFINFOMSG_LEN = 16;
+
+pub const LinkKind = enum { bridge, veth };
+
+pub const LinkCreateSpec = struct {
+    name: []const u8,
+    kind: LinkKind,
+    peer: ?[]const u8 = null,
+    stp: bool = false,
+    vlan_filtering: bool = false,
+};
+
+fn beginLinkMessage(
+    buf: []u8,
+    typ: u16,
+    flags: u16,
+    seq: u32,
+    family: u8,
+    ifindex: u32,
+) usize {
+    @memset(buf[0 .. NLMSG_HDR_LEN + IFINFOMSG_LEN], 0);
+    buf[NLMSG_HDR_LEN] = family;
+    writeU32(buf, NLMSG_HDR_LEN + 4, ifindex);
+    writeU32(buf, 8, seq);
+    writeU32(buf, 12, 0);
+    writeU16(buf, 4, typ);
+    writeU16(buf, 6, flags);
+    return NLMSG_HDR_LEN + IFINFOMSG_LEN;
+}
+
+fn finishMessage(buf: []u8, off: usize) []u8 {
+    writeU32(buf, 0, @intCast(off));
+    return buf[0..off];
+}
+
+fn beginNested(buf: []u8, off: *usize, typ: u16) usize {
+    const start = off.*;
+    putAttr(buf, off, typ, &.{});
+    return start;
+}
+
+fn endNested(buf: []u8, off: usize, start: usize) void {
+    writeU16(buf, start, @intCast(off - start));
+}
+
+fn putCString(buf: []u8, off: *usize, typ: u16, text: []const u8) void {
+    var tmp: [64]u8 = undefined;
+    @memcpy(tmp[0..text.len], text);
+    tmp[text.len] = 0;
+    putAttr(buf, off, typ, tmp[0 .. text.len + 1]);
+}
+
+fn putU16Attr(buf: []u8, off: *usize, typ: u16, value: u16) void {
+    var raw: [2]u8 = undefined;
+    std.mem.writeInt(u16, &raw, value, native_endian);
+    putAttr(buf, off, typ, &raw);
+}
+
+fn putU32Attr(buf: []u8, off: *usize, typ: u16, value: u32) void {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, value, native_endian);
+    putAttr(buf, off, typ, &raw);
+}
+
+fn putU8Attr(buf: []u8, off: *usize, typ: u16, value: u8) void {
+    putAttr(buf, off, typ, &[_]u8{value});
+}
+
+fn buildLinkCreateMessage(
+    buf: []u8,
+    flags: u16,
+    seq: u32,
+    spec: LinkCreateSpec,
+) []u8 {
+    var off = beginLinkMessage(buf, RTM_NEWLINK, flags, seq, linux.AF.UNSPEC, 0);
+    putCString(buf, &off, IFLA_IFNAME, spec.name);
+
+    const linkinfo = beginNested(buf, &off, IFLA_LINKINFO);
+    putCString(buf, &off, IFLA_INFO_KIND, switch (spec.kind) {
+        .bridge => "bridge",
+        .veth => "veth",
+    });
+
+    const data = beginNested(buf, &off, IFLA_INFO_DATA);
+    switch (spec.kind) {
+        .bridge => {
+            putU32Attr(buf, &off, IFLA_BR_STP_STATE, if (spec.stp) 1 else 0);
+            putU8Attr(buf, &off, IFLA_BR_VLAN_FILTERING, if (spec.vlan_filtering) 1 else 0);
+            putU16Attr(buf, &off, IFLA_BR_VLAN_DEFAULT_PVID, if (spec.vlan_filtering) 0 else 1);
+        },
+        .veth => {
+            const peer = spec.peer orelse "";
+            const peer_attr = beginNested(buf, &off, VETH_INFO_PEER);
+            @memset(buf[off .. off + IFINFOMSG_LEN], 0);
+            off += IFINFOMSG_LEN;
+            putCString(buf, &off, IFLA_IFNAME, peer);
+            endNested(buf, off, peer_attr);
+        },
+    }
+    endNested(buf, off, data);
+    endNested(buf, off, linkinfo);
+    return finishMessage(buf, off);
+}
+
+fn buildBridgeVlanMessage(
+    buf: []u8,
+    typ: u16,
+    seq: u32,
+    ifindex: u32,
+    vid: u16,
+    pvid: bool,
+    untagged: bool,
+) []u8 {
+    var off = beginLinkMessage(buf, typ, NLM_F_REQUEST | NLM_F_ACK, seq, AF_BRIDGE, ifindex);
+    const afspec = beginNested(buf, &off, IFLA_AF_SPEC);
+    putU16Attr(buf, &off, IFLA_BRIDGE_FLAGS, 0);
+    var vlan_flags: u16 = 0;
+    if (pvid) vlan_flags |= BRIDGE_VLAN_INFO_PVID;
+    if (untagged) vlan_flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+    var vlan_info: [4]u8 = undefined;
+    std.mem.writeInt(u16, vlan_info[0..2], vlan_flags, native_endian);
+    std.mem.writeInt(u16, vlan_info[2..4], vid, native_endian);
+    putAttr(buf, &off, IFLA_BRIDGE_VLAN_INFO, &vlan_info);
+    endNested(buf, off, afspec);
+    return finishMessage(buf, off);
+}
+
+pub fn createLink(io: std.Io, spec: LinkCreateSpec) PortError!void {
+    try sys.validateName(spec.name);
+    if (spec.kind == .veth) try sys.validateName(spec.peer orelse return error.InvalidArgument);
+
+    var control = try Control.open();
+    defer control.close();
+
+    var buf: [1024]u8 = undefined;
+    const seq = control.nextSeq();
+    const msg = buildLinkCreateMessage(
+        &buf,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        seq,
+        spec,
+    );
+    return control.transact(io, msg, seq);
+}
+
+pub fn deleteLink(io: std.Io, dev: []const u8) PortError!void {
+    const ifindex = try iface_mod.ifindex(dev);
+    var control = try Control.open();
+    defer control.close();
+
+    var buf: [256]u8 = undefined;
+    const seq = control.nextSeq();
+    const off = beginLinkMessage(&buf, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK, seq, linux.AF.UNSPEC, ifindex);
+    const msg = finishMessage(&buf, off);
+    return control.transact(io, msg, seq);
+}
+
+pub fn setMaster(io: std.Io, dev: []const u8, master: ?[]const u8) PortError!void {
+    const ifindex = try iface_mod.ifindex(dev);
+    const master_index: u32 = if (master) |name| try iface_mod.ifindex(name) else 0;
+
+    var control = try Control.open();
+    defer control.close();
+
+    var buf: [256]u8 = undefined;
+    const seq = control.nextSeq();
+    var off = beginLinkMessage(&buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, seq, linux.AF.UNSPEC, ifindex);
+    putU32Attr(&buf, &off, IFLA_MASTER, master_index);
+    const msg = finishMessage(&buf, off);
+    return control.transact(io, msg, seq);
+}
+
+pub fn setBridgeVlan(
+    io: std.Io,
+    dev: []const u8,
+    vid: u16,
+    pvid: bool,
+    untagged: bool,
+    add: bool,
+) PortError!void {
+    if (vid == 0 or vid > 4094) return error.InvalidArgument;
+    if (pvid and !untagged) return error.InvalidArgument;
+    const ifindex = try iface_mod.ifindex(dev);
+
+    var control = try Control.open();
+    defer control.close();
+
+    var buf: [512]u8 = undefined;
+    const seq = control.nextSeq();
+    const msg = buildBridgeVlanMessage(
+        &buf,
+        if (add) RTM_SETLINK else RTM_DELLINK,
+        seq,
+        ifindex,
+        vid,
+        pvid,
+        untagged,
+    );
+    return control.transact(io, msg, seq);
+}
+
 // --- tests ----------------------------------------------------------------
 
 fn getAttr(attrs: []const u8, typ: u16) ?[]const u8 {
@@ -905,6 +1143,56 @@ test "builds RTM_NEWROUTE message" {
     try std.testing.expectEqualSlices(u8, &.{ 10, 0, 1, 1 }, getAttr(attrs, RTA_GATEWAY).?);
     try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, getAttr(attrs, RTA_OIF).?[0..4], native_endian));
     try std.testing.expectEqual(@as(u32, 50), std.mem.readInt(u32, getAttr(attrs, RTA_PRIORITY).?[0..4], native_endian));
+}
+
+test "builds bridge create message" {
+    var buf: [1024]u8 = undefined;
+    const msg = buildLinkCreateMessage(&buf, NLM_F_REQUEST | NLM_F_ACK, 11, .{
+        .name = "vnatbr0",
+        .kind = .bridge,
+        .stp = true,
+        .vlan_filtering = true,
+    });
+
+    try std.testing.expectEqual(@as(u16, RTM_NEWLINK), readU16(msg, 4).?);
+    const attrs = msg[NLMSG_HDR_LEN + IFINFOMSG_LEN ..];
+    try std.testing.expectEqualStrings("vnatbr0", std.mem.sliceTo(getAttr(attrs, IFLA_IFNAME).?, 0));
+    const linkinfo = getAttr(attrs, IFLA_LINKINFO).?;
+    try std.testing.expectEqualStrings("bridge", std.mem.sliceTo(getAttr(linkinfo, IFLA_INFO_KIND).?, 0));
+    const data = getAttr(linkinfo, IFLA_INFO_DATA).?;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, getAttr(data, IFLA_BR_STP_STATE).?[0..4], native_endian));
+    try std.testing.expectEqual(@as(u8, 1), getAttr(data, IFLA_BR_VLAN_FILTERING).?[0]);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, getAttr(data, IFLA_BR_VLAN_DEFAULT_PVID).?[0..2], native_endian));
+}
+
+test "builds veth create message with peer" {
+    var buf: [1024]u8 = undefined;
+    const msg = buildLinkCreateMessage(&buf, NLM_F_REQUEST | NLM_F_ACK, 12, .{
+        .name = "vnatp0",
+        .kind = .veth,
+        .peer = "vnatb0",
+    });
+
+    const attrs = msg[NLMSG_HDR_LEN + IFINFOMSG_LEN ..];
+    const linkinfo = getAttr(attrs, IFLA_LINKINFO).?;
+    try std.testing.expectEqualStrings("veth", std.mem.sliceTo(getAttr(linkinfo, IFLA_INFO_KIND).?, 0));
+    const data = getAttr(linkinfo, IFLA_INFO_DATA).?;
+    const peer = getAttr(data, VETH_INFO_PEER).?;
+    try std.testing.expect(peer.len >= IFINFOMSG_LEN);
+    try std.testing.expectEqualStrings("vnatb0", std.mem.sliceTo(getAttr(peer[IFINFOMSG_LEN..], IFLA_IFNAME).?, 0));
+}
+
+test "builds bridge vlan message" {
+    var buf: [512]u8 = undefined;
+    const msg = buildBridgeVlanMessage(&buf, RTM_SETLINK, 13, 42, 10, true, true);
+
+    try std.testing.expectEqual(@as(u16, RTM_SETLINK), readU16(msg, 4).?);
+    try std.testing.expectEqual(AF_BRIDGE, msg[NLMSG_HDR_LEN]);
+    try std.testing.expectEqual(@as(u32, 42), readU32(msg, NLMSG_HDR_LEN + 4).?);
+    const afspec = getAttr(msg[NLMSG_HDR_LEN + IFINFOMSG_LEN ..], IFLA_AF_SPEC).?;
+    const info = getAttr(afspec, IFLA_BRIDGE_VLAN_INFO).?;
+    try std.testing.expectEqual(@as(u16, BRIDGE_VLAN_INFO_PVID | BRIDGE_VLAN_INFO_UNTAGGED), std.mem.readInt(u16, info[0..2], native_endian));
+    try std.testing.expectEqual(@as(u16, 10), std.mem.readInt(u16, info[2..4], native_endian));
 }
 
 test "netlink error mapping" {

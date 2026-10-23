@@ -55,7 +55,64 @@ fn run(init: std.process.Init) !void {
 
     var logger = vnat.log.Logger.init(io, parsed.config.log);
 
-    var manager = try vnat.manager.Manager.openFromConfig(gpa, io, &parsed.config);
+    const run_dir = init.environ_map.get("VNAT_RUN_DIR") orelse "/run/vnat";
+    var host: ?vnat.control_host.Host = null;
+    defer if (host) |*h| h.deinit();
+    var offload_checkpoint: usize = 0;
+    if (vnat.control_offload.isEnabled(&parsed.config)) {
+        host = try vnat.control_host.Host.init(
+            io,
+            gpa,
+            run_dir,
+            parsed.config.instance,
+        );
+        offload_checkpoint = try host.?.checkpoint();
+    }
+    errdefer if (host) |*h| {
+        _ = h.downTo(offload_checkpoint) catch {};
+    };
+
+    var offload_plan = vnat.control_offload.Plan.init(gpa);
+    defer offload_plan.deinit();
+    if (host) |*h| {
+        offload_plan = vnat.control_offload.apply(io, gpa, h, &parsed.config) catch |err| {
+            logger.err("kernel offload: {s}; run `vnat down -c <config>` to repair", .{
+                @errorName(err),
+            });
+            return err;
+        };
+        for (offload_plan.devices) |device| {
+            logger.info("offload bridge={s} kernel={s} trunk={s}", .{
+                device.bridge_name,
+                device.kernel_bridge,
+                device.veth_vnat,
+            });
+        }
+        for (offload_plan.skipped) |port_name| {
+            const port = parsed.config.ports.get(port_name) orelse continue;
+            if (port.storm_control != 0) {
+                logger.warn(
+                    "kernel offload: storm_control is not enforced on offloaded members; set it to 0 to silence this warning",
+                    .{},
+                );
+                break;
+            }
+        }
+    }
+
+    const extras = try gpa.alloc(vnat.manager.ExtraPort, offload_plan.synthetic.len);
+    defer gpa.free(extras);
+    for (offload_plan.synthetic, 0..) |synthetic, index| {
+        extras[index] = .{
+            .config_name = synthetic.config_name,
+            .device = synthetic.device,
+        };
+    }
+
+    var manager = try vnat.manager.Manager.openFromConfigWithOptions(gpa, io, &parsed.config, .{
+        .skip = offload_plan.skipped,
+        .extras = extras,
+    });
     defer manager.deinit(io);
     try manager.enableMonitor();
     try manager.refreshAll(io);
@@ -73,7 +130,6 @@ fn run(init: std.process.Init) !void {
     var forwarder = try vnat.forward.Forwarder.fromConfig(gpa, io, &parsed.config, port_entries);
     defer forwarder.deinit();
 
-    const run_dir = init.environ_map.get("VNAT_RUN_DIR") orelse "/run/vnat";
     const counter_packets = try gpa.alloc(u64, forwarder.firewallRuleCount());
     defer gpa.free(counter_packets);
     var counter_save_ms = nowMs(io);

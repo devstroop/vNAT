@@ -21,6 +21,10 @@ pub const buffer_pool = @import("port/pool.zig");
 
 pub const journal = @import("control/journal.zig");
 pub const firewall_counters = @import("control/firewall_counters.zig");
+pub const control_offload = if (builtin.os.tag == .linux)
+    @import("control/offload.zig")
+else
+    struct {};
 pub const control_host = if (builtin.os.tag == .linux)
     @import("control/host.zig")
 else
@@ -71,7 +75,10 @@ test {
     _ = @import("port/pool.zig");
     _ = @import("control/journal.zig");
     _ = @import("control/firewall_counters.zig");
-    if (builtin.os.tag == .linux) _ = @import("control/host.zig");
+    if (builtin.os.tag == .linux) {
+        _ = @import("control/host.zig");
+        _ = @import("control/offload.zig");
+    }
     _ = @import("l2/ethernet.zig");
     _ = @import("l2/stp.zig");
     _ = @import("l3/ipv4.zig");

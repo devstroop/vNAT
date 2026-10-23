@@ -30,10 +30,35 @@ pub const Route = struct {
     table: u32 = 0,
 };
 
+pub const LinkKind = enum { bridge, veth };
+
+pub const LinkAdd = struct {
+    dev: []const u8,
+    kind: LinkKind,
+    peer: ?[]const u8 = null,
+    stp: bool = false,
+    vlan_filtering: bool = false,
+};
+
+pub const LinkMaster = struct {
+    dev: []const u8,
+    master: ?[]const u8,
+};
+
+pub const BridgeVlan = struct {
+    dev: []const u8,
+    vid: u16,
+    pvid: bool = false,
+    untagged: bool = false,
+};
+
 pub const Op = union(enum) {
     addr_add: Address,
     addr_del: Address,
     link: Link,
+    link_add: LinkAdd,
+    link_master: LinkMaster,
+    bridge_vlan: BridgeVlan,
     route_add: Route,
     route_del: Route,
 };
@@ -48,6 +73,14 @@ pub const Wire = struct {
     via: ?[]const u8 = null,
     metric: ?u32 = null,
     table: ?u32 = null,
+    kind: ?[]const u8 = null,
+    peer: ?[]const u8 = null,
+    stp: ?bool = null,
+    vlan_filtering: ?bool = null,
+    master: ?[]const u8 = null,
+    vid: ?u16 = null,
+    pvid: ?bool = null,
+    untagged: ?bool = null,
 };
 
 pub fn parseLine(gpa: std.mem.Allocator, line: []const u8) !std.json.Parsed(Wire) {
@@ -73,6 +106,41 @@ pub fn toOp(wire: Wire) Error!Op {
         return .{ .link = .{
             .dev = wire.dev orelse return error.InvalidJournal,
             .up = wire.up orelse return error.InvalidJournal,
+        } };
+    }
+
+    if (std.mem.eql(u8, wire.op, "link_add")) {
+        const kind_text = wire.kind orelse return error.InvalidJournal;
+        const kind: LinkKind = if (std.mem.eql(u8, kind_text, "bridge"))
+            .bridge
+        else if (std.mem.eql(u8, kind_text, "veth"))
+            .veth
+        else
+            return error.InvalidJournal;
+        const link_add = LinkAdd{
+            .dev = wire.dev orelse return error.InvalidJournal,
+            .kind = kind,
+            .peer = wire.peer,
+            .stp = wire.stp orelse false,
+            .vlan_filtering = wire.vlan_filtering orelse false,
+        };
+        if (kind == .veth and link_add.peer == null) return error.InvalidJournal;
+        return .{ .link_add = link_add };
+    }
+
+    if (std.mem.eql(u8, wire.op, "link_master")) {
+        return .{ .link_master = .{
+            .dev = wire.dev orelse return error.InvalidJournal,
+            .master = wire.master,
+        } };
+    }
+
+    if (std.mem.eql(u8, wire.op, "bridge_vlan")) {
+        return .{ .bridge_vlan = .{
+            .dev = wire.dev orelse return error.InvalidJournal,
+            .vid = wire.vid orelse return error.InvalidJournal,
+            .pvid = wire.pvid orelse false,
+            .untagged = wire.untagged orelse false,
         } };
     }
 
@@ -116,9 +184,40 @@ pub fn writeLine(buf: []u8, op: Op) ![]const u8 {
             "{{\"op\":\"link\",\"dev\":\"{s}\",\"up\":{s}}}\n",
             .{ l.dev, if (l.up) "true" else "false" },
         ),
+        .link_add => |l| writeLinkAdd(buf, l),
+        .link_master => |l| if (l.master) |master| std.fmt.bufPrint(
+            buf,
+            "{{\"op\":\"link_master\",\"dev\":\"{s}\",\"master\":\"{s}\"}}\n",
+            .{ l.dev, master },
+        ) else std.fmt.bufPrint(
+            buf,
+            "{{\"op\":\"link_master\",\"dev\":\"{s}\",\"master\":null}}\n",
+            .{l.dev},
+        ),
+        .bridge_vlan => |v| std.fmt.bufPrint(
+            buf,
+            "{{\"op\":\"bridge_vlan\",\"dev\":\"{s}\",\"vid\":{d},\"pvid\":{s},\"untagged\":{s}}}\n",
+            .{ v.dev, v.vid, if (v.pvid) "true" else "false", if (v.untagged) "true" else "false" },
+        ),
         .route_add => |r| writeRoute(buf, "route_add", r),
         .route_del => |r| writeRoute(buf, "route_del", r),
     };
+}
+
+fn writeLinkAdd(buf: []u8, link: LinkAdd) ![]const u8 {
+    const kind = @tagName(link.kind);
+    if (link.peer) |peer| {
+        return std.fmt.bufPrint(
+            buf,
+            "{{\"op\":\"link_add\",\"dev\":\"{s}\",\"kind\":\"{s}\",\"peer\":\"{s}\",\"stp\":{s},\"vlan_filtering\":{s}}}\n",
+            .{ link.dev, kind, peer, if (link.stp) "true" else "false", if (link.vlan_filtering) "true" else "false" },
+        );
+    }
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"op\":\"link_add\",\"dev\":\"{s}\",\"kind\":\"{s}\",\"peer\":null,\"stp\":{s},\"vlan_filtering\":{s}}}\n",
+        .{ link.dev, kind, if (link.stp) "true" else "false", if (link.vlan_filtering) "true" else "false" },
+    );
 }
 
 fn writeRoute(buf: []u8, comptime name: []const u8, route: Route) ![]const u8 {
@@ -225,6 +324,49 @@ pub const Store = struct {
         defer out.deinit(self.gpa);
         for (lines.items) |line| {
             try out.appendSlice(self.gpa, line);
+            try out.append(self.gpa, '\n');
+        }
+        try self.writeAtomic(io, out.items);
+    }
+
+    pub fn lineCount(self: *const Store, io: std.Io) !usize {
+        const contents_opt = try self.contents(io);
+        const data = contents_opt orelse return 0;
+        defer self.gpa.free(data);
+
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (line.len != 0) count += 1;
+        }
+        return count;
+    }
+
+    /// Keeps only the first `count` journal lines. Used to roll back a
+    /// transaction without touching records written before it.
+    pub fn truncateTo(self: *Store, io: std.Io, count: usize) !void {
+        if (count == 0) {
+            try self.clear(io);
+            return;
+        }
+        const contents_opt = try self.contents(io);
+        const data = contents_opt orelse return;
+        defer self.gpa.free(data);
+
+        var seen: usize = 0;
+        var end: usize = 0;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            seen += 1;
+            end = it.index orelse data.len;
+            if (seen == count) break;
+        }
+        if (seen < count) return error.InvalidJournal;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        try out.appendSlice(self.gpa, data[0..end]);
+        if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') {
             try out.append(self.gpa, '\n');
         }
         try self.writeAtomic(io, out.items);
@@ -360,6 +502,11 @@ test "journal line round trip" {
         .{ .addr_add = .{ .dev = "ra", .prefix = testPrefix("10.0.1.1/24") } },
         .{ .addr_del = .{ .dev = "ra", .prefix = testPrefix("10.0.1.1/24") } },
         .{ .link = .{ .dev = "ra", .up = true } },
+        .{ .link_add = .{ .dev = "vnatbr0", .kind = .bridge, .stp = true, .vlan_filtering = true } },
+        .{ .link_add = .{ .dev = "vnatp0", .kind = .veth, .peer = "vnatb0" } },
+        .{ .link_master = .{ .dev = "eth1", .master = "vnatbr0" } },
+        .{ .link_master = .{ .dev = "eth1", .master = null } },
+        .{ .bridge_vlan = .{ .dev = "eth1", .vid = 10, .pvid = true, .untagged = true } },
         .{ .route_add = .{
             .prefix = testPrefix("10.2.0.0/16"),
             .via = testIp("10.0.1.254"),
@@ -391,6 +538,31 @@ test "journal line round trip" {
             .link => |l| {
                 try testing.expectEqualStrings(l.dev, back.link.dev);
                 try testing.expectEqual(l.up, back.link.up);
+            },
+            .link_add => |l| {
+                try testing.expectEqualStrings(l.dev, back.link_add.dev);
+                try testing.expectEqual(l.kind, back.link_add.kind);
+                try testing.expectEqual(l.stp, back.link_add.stp);
+                try testing.expectEqual(l.vlan_filtering, back.link_add.vlan_filtering);
+                if (l.peer) |peer| {
+                    try testing.expectEqualStrings(peer, back.link_add.peer.?);
+                } else {
+                    try testing.expect(back.link_add.peer == null);
+                }
+            },
+            .link_master => |l| {
+                try testing.expectEqualStrings(l.dev, back.link_master.dev);
+                if (l.master) |master| {
+                    try testing.expectEqualStrings(master, back.link_master.master.?);
+                } else {
+                    try testing.expect(back.link_master.master == null);
+                }
+            },
+            .bridge_vlan => |v| {
+                try testing.expectEqualStrings(v.dev, back.bridge_vlan.dev);
+                try testing.expectEqual(v.vid, back.bridge_vlan.vid);
+                try testing.expectEqual(v.pvid, back.bridge_vlan.pvid);
+                try testing.expectEqual(v.untagged, back.bridge_vlan.untagged);
             },
             .route_add => |r| {
                 try testing.expect(r.prefix.eql(back.route_add.prefix));
@@ -472,6 +644,50 @@ test "journal store append read clear" {
 
     try store.clear(testing.io);
     try testing.expect((try store.contents(testing.io)) == null);
+}
+
+test "journal store checkpoint truncates later records" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(testing.allocator, tmp.dir, "test", false);
+    defer store.deinit(testing.io);
+
+    try store.append(testing.io, .{ .addr_add = .{
+        .dev = "ra",
+        .prefix = testPrefix("10.0.1.1/24"),
+    } });
+    try store.append(testing.io, .{ .link = .{ .dev = "ra", .up = true } });
+
+    const checkpoint = try store.lineCount(testing.io);
+    try testing.expectEqual(@as(usize, 2), checkpoint);
+
+    try store.append(testing.io, .{ .bridge_vlan = .{
+        .dev = "ra",
+        .vid = 10,
+        .pvid = true,
+        .untagged = true,
+    } });
+    try testing.expectEqual(@as(usize, 3), try store.lineCount(testing.io));
+
+    try store.truncateTo(testing.io, checkpoint);
+    const contents = (try store.contents(testing.io)).?;
+    defer testing.allocator.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "bridge_vlan") == null);
+    try testing.expectEqual(checkpoint, try store.lineCount(testing.io));
+    try testing.expectError(error.InvalidJournal, store.truncateTo(testing.io, 3));
+}
+
+test "journal line count ignores blank separator lines" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(testing.allocator, tmp.dir, "test", false);
+    defer store.deinit(testing.io);
+
+    try store.writeAtomic(testing.io, "{\"op\":\"link\",\"dev\":\"ra\",\"up\":true}\n\n" ++
+        "{\"op\":\"link\",\"dev\":\"ra\",\"up\":false}\n");
+    try testing.expectEqual(@as(usize, 2), try store.lineCount(testing.io));
 }
 
 test "journal store rejects unsafe instance names" {

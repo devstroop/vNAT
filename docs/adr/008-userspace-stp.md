@@ -38,5 +38,6 @@ and topology-change-driven FDB flushes are out of scope for this milestone.
   topology change. Small trusted topologies should leave STP off.
 - STP frames are generated in the userspace loop, so a stalled scheduler can
   delay hellos; the 20 s max age tolerates short stalls.
-- Kernel bridge offload remains rejected and can later replace this instance
-  behind the same configuration key.
+- Kernel bridge offload is available separately (ADR-009); when
+  `bridge.offload = "kernel"` the kernel runs STP and this userspace instance
+  is disabled for that bridge.

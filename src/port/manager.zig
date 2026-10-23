@@ -16,6 +16,19 @@ pub const Entry = struct {
     port: port_mod.Port,
 };
 
+pub const ExtraPort = struct {
+    config_name: []const u8,
+    device: []const u8,
+    mtu: ?u16 = null,
+};
+
+pub const OpenOptions = struct {
+    /// Config ports that must not be opened (kernel-offloaded bridge members).
+    skip: []const []const u8 = &.{},
+    /// Synthetic ports opened after configured ports (veth trunk endpoints).
+    extras: []const ExtraPort = &.{},
+};
+
 pub const Manager = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -26,6 +39,15 @@ pub const Manager = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cfg: *const schema.Config,
+    ) PortError!Manager {
+        return openFromConfigWithOptions(gpa, io, cfg, .{});
+    }
+
+    pub fn openFromConfigWithOptions(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cfg: *const schema.Config,
+        options: OpenOptions,
     ) PortError!Manager {
         var self = Manager{
             .gpa = gpa,
@@ -42,6 +64,8 @@ pub const Manager = struct {
         var next_id: u32 = 1;
         var it = cfg.ports.iterator();
         while (it.next()) |map_entry| {
+            if (optionallySkipped(options.skip, map_entry.key_ptr.*)) continue;
+
             const id = types.PortId{ .value = next_id };
             next_id += 1;
 
@@ -50,6 +74,23 @@ pub const Manager = struct {
 
             try list.append(a, .{
                 .config_name = try a.dupe(u8, map_entry.key_ptr.*),
+                .port = port,
+            });
+        }
+
+        for (options.extras) |extra| {
+            const id = types.PortId{ .value = next_id };
+            next_id += 1;
+
+            const port = try openOne(a, io, id, .{
+                .kind = .l2,
+                .device = extra.device,
+                .mtu = extra.mtu,
+            });
+            errdefer port.deinit(io);
+
+            try list.append(a, .{
+                .config_name = try a.dupe(u8, extra.config_name),
                 .port = port,
             });
         }
@@ -113,6 +154,13 @@ pub const Manager = struct {
             }
         }
         return event;
+    }
+
+    fn optionallySkipped(skip: []const []const u8, name: []const u8) bool {
+        for (skip) |item| {
+            if (std.mem.eql(u8, item, name)) return true;
+        }
+        return false;
     }
 
     fn openOne(

@@ -64,8 +64,7 @@ vnat/
 │   │   ├── ethernet.zig         Ethernet II + 802.1Q parse/build (R2)
 │   │   ├── bridge.zig           FDB, flooding, aging
 │   │   ├── vlan.zig             PVID/trunk/filtering
-│   │   ├── stp.zig              optional 802.1D
-│   │   └── offload_linux.zig    kernel bridge backend
+│   │   └── stp.zig              optional 802.1D
 │   ├── l3/
 │   │   ├── ipv4.zig             header, checksum, TTL (R2)
 │   │   ├── ipv6.zig             header, extension parsing
@@ -94,6 +93,7 @@ vnat/
 │   │   ├── commands.zig         CLI verbs → core operations (R7)
 │   │   ├── journal.zig          JSONL forward ops, ownership, rollback (R2)
 │   │   ├── host.zig             iface/route mutations + journal (R2)
+│   │   ├── offload.zig          kernel bridge plan + veth trunk (R5, Linux)
 │   │   └── events.zig           event bus
 │   └── overlay/                 FUTURE: uplink overlay (ADR-004)
 ├── exec/
@@ -110,6 +110,7 @@ vnat/
     ├── test_netns.sh
     ├── test_route.sh
     ├── test_journal.sh
+    ├── test_offload.sh
     ├── nat_matrix.sh
     └── perf.sh
 ```
@@ -218,8 +219,11 @@ pub const Bridge = struct {
 
 - Learning on ingress, lookup on egress.
 - Flood set precomputed per VLAN.
-- Optional kernel offload: `offload_linux.Bridge` creates `br-*` and enslaves
-  ports; the core then only configures and observes.
+- Optional kernel offload (`bridge.offload = "kernel"`): `control/offload.zig`
+  creates one kernel bridge and a veth trunk per bridge, enslaves the physical
+  members, and opens the trunk peer as the bridge's only synthetic port.
+  Userspace bridging, SVIs, routing, NAT, DHCP and firewall keep working on
+  that synthetic port; kernel STP replaces userspace STP when enabled.
 
 ### 3.4 Router / FIB
 
@@ -299,7 +303,7 @@ CLI / API ──▶ config::diff ──▶ mutation list ──▶ journal ─�
 | Backend | Where | When | Trade-off |
 |---|---|---|---|
 | `userspace` | Linux, Android root | Default; portable | CPU-bound, full control |
-| `kernel_bridge` | Linux | `bridge.offload=kernel` | Fast L2, less visibility |
+| `kernel_bridge` | Linux | `bridge.offload=kernel` | Fast L2 via kernel bridge; routed traffic crosses a veth trunk |
 | `kernel_nat` | Linux/Android root | `nat.offload=kernel` | Fast NAT via nft/iptables, control-plane only |
 | `nfqueue` | Android root (experimental) | `intercept=nfqueue` | Userspace control of tethered traffic, slower |
 | `proxy` | Android VPN mode | No raw uplink; sockets only | Works unrooted, TCP/UDP proxy NAT |

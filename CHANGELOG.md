@@ -8,6 +8,13 @@ All notable changes to vNAT are documented here. The format follows
 
 ### Added
 
+- Optional Linux kernel-bridge offload (`bridge.offload = "kernel"`): creates a
+  journaled kernel bridge, enslaves existing L2 members, and attaches a veth
+  trunk as the bridge's synthetic userspace port. Kernel VLAN filtering/STP,
+  transactional rollback, `vnat down` restoration, and the
+  `scripts/test_offload.sh` L2/SVI/DHCP/NAT/STP parity test are included.
+  Offloaded members reject `create`/`mtu` overrides and warn when per-port
+  `storm_control` cannot be enforced by the kernel bridge.
 - R0 scaffold: `build.zig`/`build.zig.zon`, cross-compilation for Linux and
   Android, CI matrix.
 - Strict JSON configuration schema, parser and semantic validator.
@@ -81,8 +88,7 @@ All notable changes to vNAT are documented here. The format follows
 - Enforce firewall default input/forward policies (`drop`/`reject`/`accept`)
   and ordered rules in the datapath. Explicit port forwards are treated as
   administrator allows, and `default_out` rejects non-accept values until
-  outbound policy is implemented. Reject the kernel-offload bridge option
-  until implemented instead of silently ignoring it.
+  outbound policy is implemented.
 - Keep bridge floods running when one member is down or its MTU is exceeded,
   rate-limit bridge-wide ARP resolution, and send valid ARP probes for DHCP
   conflict detection.

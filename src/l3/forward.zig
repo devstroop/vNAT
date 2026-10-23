@@ -566,22 +566,29 @@ pub const Forwarder = struct {
         while (bridge_it.next()) |bridge_entry| {
             const bridge_cfg = bridge_entry.value_ptr;
             if (bridge_cfg.ports.len == 0) return error.InvalidArgument;
-            const members = try gpa.alloc(types.PortId, bridge_cfg.ports.len);
+            const offload = bridge_cfg.offload == .kernel;
+            const userspace_stp = bridge_cfg.stp and !offload;
+            var synthetic_name = [_][]const u8{bridge_entry.key_ptr.*};
+            const member_names: []const []const u8 = if (offload)
+                synthetic_name[0..]
+            else
+                bridge_cfg.ports;
+            const members = try gpa.alloc(types.PortId, member_names.len);
             errdefer gpa.free(members);
-            const vlans = try gpa.alloc(BridgePortVlan, bridge_cfg.ports.len);
+            const vlans = try gpa.alloc(BridgePortVlan, member_names.len);
             errdefer gpa.free(vlans);
-            const stp_ports: []StpPort = if (bridge_cfg.stp)
-                try gpa.alloc(StpPort, bridge_cfg.ports.len)
+            const stp_ports: []StpPort = if (userspace_stp)
+                try gpa.alloc(StpPort, member_names.len)
             else
                 &.{};
-            errdefer if (bridge_cfg.stp) gpa.free(stp_ports);
+            errdefer if (userspace_stp) gpa.free(stp_ports);
             var bridge_mac = types.Mac{};
             var vlan_count: usize = 0;
             errdefer for (vlans[0..vlan_count]) |vlan| gpa.free(vlan.tagged);
-            for (bridge_cfg.ports, 0..) |port_name, i| {
+            for (member_names, 0..) |port_name, i| {
                 const port_entry = findPort(ports, port_name) orelse return error.NotFound;
                 members[i] = port_entry.id;
-                if (bridge_cfg.stp) {
+                if (userspace_stp) {
                     const mac = port_entry.port.info().mac;
                     if (!mac.isZero() and
                         (bridge_mac.isZero() or std.mem.order(u8, &mac.bytes, &bridge_mac.bytes) == .lt))
@@ -590,10 +597,15 @@ pub const Forwarder = struct {
                     }
                 }
                 if (bridge_cfg.vlan_aware) {
-                    const port_cfg = cfg.ports.getPtr(port_name) orelse return error.NotFound;
-                    const tagged = try gpa.dupe(u16, port_cfg.tagged);
+                    const tagged = if (offload)
+                        try offloadTrunkVlans(gpa, cfg, bridge_entry.key_ptr.*, bridge_cfg.*)
+                    else blk: {
+                        const port_cfg = cfg.ports.getPtr(port_name) orelse return error.NotFound;
+                        break :blk try gpa.dupe(u16, port_cfg.tagged);
+                    };
                     vlans[i] = .{
-                        .pvid = port_cfg.pvid orelse 1,
+                        .pvid = if (offload) 1 else (cfg.ports.getPtr(port_name) orelse
+                            return error.NotFound).pvid orelse 1,
                         .tagged = tagged,
                     };
                     vlan_count = i + 1;
@@ -601,7 +613,7 @@ pub const Forwarder = struct {
                     vlans[i] = .{};
                 }
             }
-            if (bridge_cfg.stp) {
+            if (userspace_stp) {
                 if (bridge_mac.isZero()) {
                     bridge_mac = .{ .bytes = .{
                         0x02,
@@ -616,7 +628,7 @@ pub const Forwarder = struct {
                     port.* = .{ .port_id = @intCast((i + 1) << 8) };
                 }
             }
-            const stp_bridge_id = if (bridge_cfg.stp)
+            const stp_bridge_id = if (userspace_stp)
                 stp.bridgeId(stp.default_priority, bridge_mac)
             else
                 0;
@@ -625,7 +637,7 @@ pub const Forwarder = struct {
                 .members = members,
                 .vlan_aware = bridge_cfg.vlan_aware,
                 .vlans = vlans,
-                .stp = bridge_cfg.stp,
+                .stp = userspace_stp,
                 .stp_ports = stp_ports,
                 .stp_bridge_id = stp_bridge_id,
                 .stp_root_id = stp_bridge_id,
@@ -3599,6 +3611,7 @@ fn resolveMasquerade(
             name
         else if (itf.bridge) |bridge_name| blk: {
             const bridge = cfg.bridges.get(bridge_name) orelse return null;
+            if (bridge.offload == .kernel) break :blk bridge_name;
             if (bridge.ports.len == 0) return null;
             break :blk bridge.ports[0];
         } else return null;
@@ -3618,6 +3631,44 @@ fn resolveMasquerade(
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toMilliseconds();
+}
+
+fn offloadTrunkVlans(
+    gpa: std.mem.Allocator,
+    cfg: *const schema.Config,
+    bridge_name: []const u8,
+    bridge: schema.BridgeConfig,
+) ![]u16 {
+    var seen = [_]bool{false} ** 4096;
+    seen[1] = true;
+    for (bridge.ports) |port_name| {
+        const port = cfg.ports.get(port_name) orelse return error.NotFound;
+        const pvid = port.pvid orelse 1;
+        if (pvid >= seen.len) return error.InvalidArgument;
+        seen[pvid] = true;
+        for (port.tagged) |vid| {
+            if (vid >= seen.len) return error.InvalidArgument;
+            seen[vid] = true;
+        }
+    }
+    var it = cfg.interfaces.iterator();
+    while (it.next()) |entry| {
+        const itf = entry.value_ptr.*;
+        if (itf.bridge) |name| {
+            if (std.mem.eql(u8, name, bridge_name)) {
+                const vlan = itf.vlan orelse 1;
+                if (vlan >= seen.len) return error.InvalidArgument;
+                seen[vlan] = true;
+            }
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u16) = .empty;
+    errdefer out.deinit(gpa);
+    for (seen, 0..) |present, vid| {
+        if (present and vid != 0 and vid != 1) try out.append(gpa, @intCast(vid));
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 fn findPort(ports: []const PortEntry, name: []const u8) ?PortEntry {
@@ -4354,6 +4405,53 @@ test "forwarder builds state from config" {
     try testing.expectEqual(@as(u16, 8080), fwd.forward_rules.items[0].ext_port);
     try testing.expect(fwd.forward_rules.items[0].to_addr.eql(testIp("10.0.1.10")));
     try testing.expectEqual(@as(u16, 80), fwd.forward_rules.items[0].to_port);
+}
+
+test "kernel offload bridge maps its veth trunk as one synthetic member" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var trunk = MemoryPort.init(testing.allocator, port_a, "vnatp0", 1500);
+    defer trunk.deinit();
+    trunk.mac = port_a_mac;
+
+    const entries = [1]PortEntry{
+        .{ .id = port_a, .config_name = "br", .port = trunk.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "offload",
+        \\  "ports": {
+        \\    "lan": { "kind": "l2", "device": "eth1", "pvid": 10, "tagged": [20] }
+        \\  },
+        \\  "bridges": {
+        \\    "br": { "ports": ["lan"], "vlan_aware": true, "stp": true, "offload": "kernel" }
+        \\  },
+        \\  "interfaces": {
+        \\    "lan0": { "bridge": "br", "address": "10.0.10.1/24", "vlan": 10 }
+        \\  },
+        \\  "firewall": {
+        \\    "rules": [ { "action": "accept", "iif": "br" } ]
+        \\  }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fwd.bridges.items.len);
+    const bridge = fwd.bridges.items[0];
+    try testing.expectEqual(@as(usize, 1), bridge.members.len);
+    try testing.expect(bridge.members[0].eql(port_a));
+    try testing.expect(!bridge.stp);
+    try testing.expectEqual(@as(usize, 0), bridge.stp_ports.len);
+    try testing.expectEqual(@as(u16, 1), bridge.vlans[0].pvid);
+    try testing.expectEqualSlices(u16, &.{ 10, 20 }, bridge.vlans[0].tagged);
+    try testing.expectEqual(@as(usize, 1), fwd.local.items.len);
+    try testing.expect(fwd.local.items[0].port.eql(port_a));
+    try testing.expectEqual(@as(u16, 10), fwd.local.items[0].vlan);
+    try testing.expectEqual(@as(usize, 1), fwd.firewall_rules.items.len);
+    try testing.expectEqual(port_a, fwd.firewall_rules.items[0].iif.?.port);
 }
 
 test "firewall rules are ordered and match interfaces and addresses" {

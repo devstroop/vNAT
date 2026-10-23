@@ -161,8 +161,23 @@ pub const Frame = struct {
 
 `bridge.offload = "none" | "kernel"`:
 - `none`: userspace forwarding (default, portable).
-- `kernel` (Linux): reserved for a later milestone; currently rejected rather
-  than silently falling back to userspace.
+- `kernel` (Linux): create one kernel bridge and enslave the configured
+  members. vNAT opens the peer of a veth trunk as a synthetic L2 port, so SVIs,
+  routing, NAT, DHCP, DNS and firewall remain in userspace. When
+  `vlan_aware = true`, the kernel bridge filters VLANs and the trunk carries
+  PVID 1 untagged plus the union of member/SVI VLANs tagged. `bridge.stp`
+  enables kernel STP and disables the userspace instance.
+- Kernel offload requires existing L2 members (`create` and `mtu` overrides
+  are rejected), rejects a `pvid` that is also tagged, and never adopts an
+  existing bridge or an already-enslaved port. Setup is journaled as one
+  transaction; on failure the inverse is replayed to its checkpoint.
+  `vnat down` removes the bridge, veth and VLAN entries and restores member
+  link state.
+- Per-port `storm_control` is not enforced on offloaded physical members; the
+  bridge is forwarded by the kernel. vnatd warns while any offloaded member
+  requests it (set `storm_control = 0` to silence).
+- Firewall `iif`/`oif` references to offloaded physical members are rejected;
+  use the bridge name to match the synthetic trunk.
 
 ### 3.4 Counters
 
@@ -478,7 +493,11 @@ Rules for config:
 - `ports.<name>.storm_control` caps flooded frames per second from that port
   (default 1000, `0` disables).
 - `bridges.<name>.stp` enables basic 802.1D root election and port-state
-  transitions; it is off by default. Kernel bridge offload is still rejected.
+  transitions; it is off by default. With `offload = "kernel"` the kernel runs
+  STP instead of the userspace instance.
+- `bridges.<name>.offload = "kernel"` enables the Linux kernel bridge backend;
+  see §3.3. The backend is Linux-only; startup fails rather than silently
+  falling back to userspace.
 - `firewall.rules` is evaluated in order before the default policy. Each rule
   may match `proto`, `src`/`dst` CIDRs, `sport`/`dport` (TCP/UDP only),
   `iif`/`oif` (port, interface or bridge name) and `ct_state`, and applies
@@ -500,10 +519,9 @@ Rules for config:
 - **reserved**: recognized but not implemented; enabling it fails with a
   typed error instead of silently falling back.
 
-Current reserved fields include bridge STP/kernel offload. Bridge membership,
-VLAN membership, per-port storm control, the DHCP client, firewall rules,
-control-plane rate limits, and `default_in`/`default_forward` are consumed by
-the datapath; `default_out`
+Bridge membership, VLAN membership, STP/kernel offload, per-port storm
+control, the DHCP client, firewall rules, control-plane rate limits, and
+`default_in`/`default_forward` are consumed by the datapath; `default_out`
 only accepts `"accept"` until outbound policy is implemented. Explicit
 `port_forward` rules are treated as administrator allows and bypass
 `default_forward` for the flow they create; ordered `firewall.rules` still

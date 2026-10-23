@@ -133,18 +133,20 @@ DHCP + DNS + NAT.
 - [x] Netns test with veth pairs and tagged traffic.
 - [x] Storm control and loop protection (per-port flooded-frame limit).
 - [x] Optional STP 802.1D (root election, BPDU exchange, port states).
-- [ ] Optional Linux kernel-bridge offload backend.
+- [x] Optional Linux kernel-bridge offload backend (kernel bridge + veth trunk).
 - [x] `vnat bridge list` inspection CLI (membership, PVID/tagged, SVI).
 
-**Status: IN PROGRESS.** Userspace FDB learning/aging/flooding, broadcast and
+**Status: COMPLETE.** Userspace FDB learning/aging/flooding, broadcast and
 multicast handling, per-VLAN FDB keys, PVID/tagged/access semantics, VLAN
 filtering and offload tag recovery are implemented and covered by a veth
 access/trunk netns test; `vnat bridge list` renders membership and SVIs.
 Per-port storm control (broadcast/multicast/unknown-unicast) is enforced in the
-bridge datapath. STP and kernel offload remain.
+bridge datapath. Userspace STP and the optional Linux kernel-bridge backend are
+implemented; the latter uses a journaled kernel bridge plus one veth trunk per
+bridge so SVIs, routing, NAT, DHCP and firewall stay in userspace.
 
 **Exit:** Two L2 segments bridged in userspace; tagged/untagged traffic passes;
-kernel offload produces the same result.
+kernel offload produces the same result. `scripts/test_offload.sh` covers both.
 
 ### R6 — Firewall (2–3 weeks)
 
