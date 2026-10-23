@@ -1,105 +1,76 @@
 # vNAT
 
-A **portable virtual router** written in Zig. Turn a Linux machine or an
-Android device into an opt-in router: attach L2/L3 interfaces, bridge or route
-between them, and provide NAT, DHCP, DNS, firewall and port forwarding.
-
-No GUI. No cloud. Daemon + CLI + local API.
-
-**Platforms:** Linux (full) → Android (VpnService mode, and root router mode).
-Zig 0.16.x. macOS/Windows later.
-
-## What it does
-
-```
-                 ┌──────────────────────────────────────────┐
-   uplink ───────┤  vNAT core (userspace router)            │
-   (eth/wlan/    │                                          │
-    usb/wwan)    │  L2 bridge · L3 router · NAT · firewall  │──── LAN ports
-                 │  DHCPv4 · DNS · conntrack · port forward │     (eth/usb/ap)
-                 └──────────────────────────────────────────┘
-                          ▲                    ▲
-                    CLI / daemon         local API (unix socket)
-                    config file          C ABI (Android host)
-```
-
-- **Linux:** `AF_PACKET` L2 ports, TUN/TAP L3 ports, netlink hotplug, userspace
-  bridge/routing/NAT, optional kernel offload. A tethered/hotspot device can be
-  the upstream; LAN clients get DHCP/DNS/NAT.
-- **Android (no root):** `VpnService` L3 port + protected uplink sockets;
-  per-app split tunnel, DNS, NAT and firewall for on-device traffic.
-- **Android (root):** raw interfaces, bridging, and tethering takeover so
-  hotspot/USB clients route through vNAT.
-
-## Build
-
-Requires Zig 0.16.x (`zig version` must print `0.16.0`).
-
-```bash
-zig build
-./zig-out/bin/vnat validate examples/travel-router.json
-zig build test
-
-# Linux netns smoke test: veth L2 forwarding, TUN/TAP, status, hotplug
-bash scripts/test_netns.sh
-
-# IPv4 routing: two isolated hosts ping and fetch HTTP through vnatd
-bash scripts/test_route.sh
-
-# TUN ingress/egress: kernel peer over TUN to a veth host (ICMP + TCP)
-bash scripts/test_tun.sh
-
-# Journal/rollback for vnat iface/route mutations
-bash scripts/test_journal.sh
-
-# NAT matrix: SNAT UDP/ICMP/TCP, DNAT/port forwarding and hairpin
-bash scripts/nat_matrix.sh
-
-# DHCP server: client lease + ping through the router
-bash scripts/test_dhcp.sh
-
-# DNS forwarder: query, answer and cache hit through vnatd
-bash scripts/test_dns.sh
-```
-
-## Read in this order
-
-| Doc | What it answers |
-|---|---|
-| [docs/PRODUCT.md](docs/PRODUCT.md) | Vision, personas, use cases, non-goals, success criteria |
-| [docs/CORE-SCOPE.md](docs/CORE-SCOPE.md) | Exact v1 functional contract: ports, bridge, router, NAT, DHCP, DNS, firewall, CLI/API |
-| [docs/ANDROID.md](docs/ANDROID.md) | What Android can and cannot do; VPN vs root modes; tethering interception |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Module layout, interfaces, datapath backends, threading, security |
-| [docs/PLAN.md](docs/PLAN.md) | R0–R9 milestones, effort, risks, CI |
-| [docs/RESEARCH.md](docs/RESEARCH.md) | Knowledge base: SoftEtherVPN internals, NAT theory, Zig 0.16/0.17, platform APIs |
-| [docs/SOURCES.md](docs/SOURCES.md) | Every reference URL |
-| [docs/adr/](docs/adr/) | Accepted decisions |
-| [AGENTS.md](AGENTS.md) | Rules for agents/contributors |
-
-## Scope at a glance
-
-**In v1:** Linux router (L2 bridge + IPv4 routing + NAT + DHCP + DNS +
-firewall + port forwarding + journal/rollback); Android VPN mode; Android root
-mode for tethered clients; CLI + daemon + Unix-socket API; C ABI.
-
-**Out of v1:** GUI, cloud, overlay/P2P (ADR-004), dynamic routing, NAT64, ALGs,
-QoS shaping, macOS/Windows.
-
-## Installed skills
-
-`.opencode/skills/` contains `skill-creator`, `doc-coauthoring`, and
-`webapp-testing` from [anthropics/skills](https://github.com/anthropics/skills).
+Portable virtual router in Zig 0.16.x: L2/L3 forwarding, bridging, IPv4 routing,
+NAT, DHCP, DNS, and firewall for Linux and Android. No GUI. Daemon + CLI +
+local API.
 
 ## Status
 
-R2 is complete for the IPv4 path (L2 and TUN), including journaled
-`vnat iface`/`vnat route` mutations and `vnat down` rollback. R3 is complete
-for conntrack, SNAT/masquerade, DNAT/port forwarding with hairpin NAT, and
-ICMP-error translation. R4 is in progress: the userspace DHCPv4 server (reservations, options,
-DECLINE, optional lease DB) and an initial DHCP client on the uplink are
-integrated into `vnatd`; the DNS forwarder supports UDP/TCP, split zones and
-a local status zone. DHCP/DNS CLI verbs and the DHCP conflict probe remain
-open.
-`scripts/test_route.sh`, `test_tun.sh`, `test_journal.sh`, `nat_matrix.sh`,
-`test_dhcp.sh` and `test_dns.sh` cover forwarding, TUN, rollback, NAT,
-DHCP and DNS. See [docs/PLAN.md](docs/PLAN.md).
+- R0–R3: complete (ports, forwarding, journal, conntrack, SNAT/DNAT, hairpin,
+  ICMP-error translation).
+- R4: in progress (DHCP server/client, DNS forwarder, lease persistence, CLI
+  status/query; conflict probe done).
+- R5–R9: planned (bridge, firewall, control plane, Android, performance).
+
+See `docs/PLAN.md` for milestones and `docs/CORE-SCOPE.md` for the v1 contract.
+
+## Build
+
+Requires Zig 0.16.x.
+
+```bash
+zig build
+zig build --release=fast
+zig build test
+```
+
+## Tests
+
+```bash
+zig build test
+bash scripts/test_netns.sh
+bash scripts/test_route.sh
+bash scripts/test_tun.sh
+bash scripts/test_journal.sh
+bash scripts/nat_matrix.sh
+bash scripts/test_dhcp.sh
+bash scripts/test_dns.sh
+```
+
+Cross-build:
+
+```bash
+zig build -Dtarget=x86_64-linux
+zig build -Dtarget=aarch64-linux
+zig build -Dtarget=aarch64-linux-android
+zig build -Dtarget=arm-linux-androideabi
+```
+
+## Configuration
+
+```bash
+./zig-out/bin/vnat validate examples/minimal.json
+./zig-out/bin/vnat validate examples/travel-router.json
+```
+
+`examples/minimal.json` is runnable. `examples/travel-router.json` is
+illustrative of target-state features. See `examples/README.md`.
+
+## Documentation
+
+Read in this order:
+
+1. `docs/PRODUCT.md`
+2. `docs/CORE-SCOPE.md`
+3. `docs/ANDROID.md`
+4. `docs/ARCHITECTURE.md`
+5. `docs/PLAN.md`
+6. `docs/RESEARCH.md`
+7. `docs/SOURCES.md`
+8. `docs/adr/`
+
+Agent/contributor rules: `AGENTS.md`.
+
+## License
+
+Not specified.
