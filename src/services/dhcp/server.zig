@@ -65,6 +65,7 @@ pub const Reply = struct {
     dst_ip: types.Ipv4,
     dst_mac: types.Mac,
     typ: message.MessageType,
+    yiaddr: types.Ipv4 = .{},
 };
 
 pub const LeaseSnapshot = struct {
@@ -359,7 +360,7 @@ pub const Server = struct {
         }
     }
 
-    fn decline(self: *Server, mac: types.Mac, ip: types.Ipv4, now_ms: i64) void {
+    pub fn decline(self: *Server, mac: types.Mac, ip: types.Ipv4, now_ms: i64) void {
         if (self.reservedForOther(ip, mac)) return;
         const lease = self.leaseForIp(ip) orelse return;
         if (lease.state != .free and !lease.mac.eql(mac)) return;
@@ -461,6 +462,7 @@ pub const Server = struct {
                 .dst_ip = types.Ipv4.limited_broadcast,
                 .dst_mac = types.Mac.broadcast,
                 .typ = typ,
+                .yiaddr = yiaddr,
             };
         }
         if (!request.ciaddr.isUnspecified()) {
@@ -469,6 +471,7 @@ pub const Server = struct {
                 .dst_ip = request.ciaddr,
                 .dst_mac = mac,
                 .typ = typ,
+                .yiaddr = yiaddr,
             };
         }
         if (!yiaddr.isUnspecified()) {
@@ -477,6 +480,7 @@ pub const Server = struct {
                 .dst_ip = yiaddr,
                 .dst_mac = mac,
                 .typ = typ,
+                .yiaddr = yiaddr,
             };
         }
         return .{
@@ -484,6 +488,7 @@ pub const Server = struct {
             .dst_ip = types.Ipv4.limited_broadcast,
             .dst_mac = types.Mac.broadcast,
             .typ = typ,
+            .yiaddr = yiaddr,
         };
     }
 };

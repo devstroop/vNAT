@@ -70,6 +70,7 @@ pub const Counters = struct {
     dhcp_acks: u64 = 0,
     dhcp_naks: u64 = 0,
     dhcp_dropped: u64 = 0,
+    dhcp_conflicts: u64 = 0,
     dhcp_client_bound: u64 = 0,
     nat_unsupported: u64 = 0,
 };
@@ -1085,21 +1086,44 @@ pub const Forwarder = struct {
         };
 
         var reply_buf: [576]u8 = undefined;
-        const reply = (server.handle(msg, &reply_buf, now) catch {
-            self.counters.dhcp_dropped += 1;
-            return true;
-        }) orelse return true;
+        var reply: ?dhcp_server.Reply = null;
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            const candidate = (server.handle(msg, &reply_buf, now) catch {
+                self.counters.dhcp_dropped += 1;
+                return true;
+            }) orelse return true;
+            if (candidate.typ != .offer) {
+                reply = candidate;
+                break;
+            }
+            // Conflict detection: if the offered address is already known from
+            // ARP traffic, decline it and try the next free lease.
+            if (self.arp.get(candidate.yiaddr)) |entry| {
+                if (!entry.mac.eql(msg.clientMac().?)) {
+                    server.decline(msg.clientMac().?, candidate.yiaddr, now);
+                    self.counters.dhcp_conflicts += 1;
+                    continue;
+                }
+            }
+            reply = candidate;
+            break;
+        }
+        const final_reply = reply orelse return true;
 
-        switch (reply.typ) {
+        switch (final_reply.typ) {
             .offer => self.counters.dhcp_offers += 1,
             .ack => self.counters.dhcp_acks += 1,
             .nak => self.counters.dhcp_naks += 1,
             else => {},
         }
-        self.sendDhcpReply(io, server.cfg.port, reply) catch {
+        self.sendDhcpReply(io, server.cfg.port, final_reply) catch {
             self.counters.dhcp_dropped += 1;
             return true;
         };
+        if (final_reply.typ == .offer) {
+            self.sendArpProbe(io, server.cfg.port, final_reply.yiaddr) catch {};
+        }
         return true;
     }
 
@@ -1108,6 +1132,19 @@ pub const Forwarder = struct {
             if (server.cfg.port.eql(ingress)) return server;
         }
         return null;
+    }
+
+
+    fn sendArpProbe(self: *Forwarder, io: std.Io, port: types.PortId, ip: types.Ipv4) PortError!void {
+        const port_mac = self.portMac(port);
+        var arp_buf: [28]u8 = undefined;
+        _ = arp.write(&arp_buf, .request, port_mac, .{ .value = 0 }, types.Mac{}, ip) catch return error.FrameTooLarge;
+        var eth_buf: [64]u8 = undefined;
+        const hdr_len = ethernet.write(&eth_buf, types.Mac.broadcast, port_mac, ethernet.EtherType.arp, null) catch
+            return error.FrameTooLarge;
+        if (hdr_len + arp_buf.len > eth_buf.len) return error.FrameTooLarge;
+        @memcpy(eth_buf[hdr_len .. hdr_len + arp_buf.len], &arp_buf);
+        try self.sendL2(io, port, types.Mac.broadcast, ethernet.EtherType.arp, eth_buf[0 .. hdr_len + arp_buf.len]);
     }
 
     fn sendDhcpReply(
@@ -3628,6 +3665,9 @@ test "dhcp server offers and acks a lease" {
     try testing.expectEqual(dhcp_message.MessageType.offer, offer.messageType().?);
     try testing.expectEqual(@as(u32, 0x0a000164), offer.yiaddr.value);
     try testing.expectEqual(@as(u32, 0x0a000101), offer.options.serverId().?.value);
+
+    var probe_buf: [512]u8 = undefined;
+    _ = try a.takeSent(&probe_buf);
 
     const request = try buildDhcpPayload(
         &payload_buf,
