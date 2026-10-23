@@ -38,7 +38,7 @@ pub fn parse(gpa: std.mem.Allocator, input: []const u8) ConfigError!Parsed {
 
 const config_keys = [_][]const u8{
     "version", "instance", "log",  "ports", "bridges",  "interfaces",
-    "routes",  "nat",      "dhcp", "dns",   "firewall",
+    "routes",  "nat",      "dhcp", "dns",   "firewall", "lease_db",
 };
 const log_keys = [_][]const u8{ "level", "format" };
 const port_keys = [_][]const u8{ "kind", "device", "create", "mtu" };
@@ -48,8 +48,11 @@ const route_keys = [_][]const u8{ "dst", "via", "dev", "metric", "table" };
 const nat_keys = [_][]const u8{ "masquerade", "port_forward" };
 const masquerade_keys = [_][]const u8{"out"};
 const forward_keys = [_][]const u8{ "proto", "ext_port", "to" };
-const dhcp_keys = [_][]const u8{ "iface", "pool", "lease", "dns" };
-const dns_keys = [_][]const u8{ "upstreams", "cache", "listen" };
+const dhcp_keys = [_][]const u8{
+    "iface", "pool", "lease", "dns", "domain", "mtu", "ntp", "reservations",
+};
+const dhcp_reservation_keys = [_][]const u8{ "mac", "ip" };
+const dns_keys = [_][]const u8{ "upstreams", "cache", "listen", "max_entries" };
 const firewall_keys = [_][]const u8{ "default_in", "default_forward", "default_out" };
 
 fn parseRoot(a: std.mem.Allocator, value: std.json.Value) ConfigError!schema.Config {
@@ -73,6 +76,7 @@ fn parseRoot(a: std.mem.Allocator, value: std.json.Value) ConfigError!schema.Con
     if (field(obj, "dhcp")) |v| config.dhcp = try parseDhcp(a, v);
     if (field(obj, "dns")) |v| config.dns = try parseDns(a, v);
     if (field(obj, "firewall")) |v| config.firewall = try parseFirewall(v);
+    config.lease_db = try optString(obj, "lease_db");
 
     return config;
 }
@@ -239,6 +243,30 @@ fn parseDhcp(a: std.mem.Allocator, value: *const std.json.Value) ConfigError![]c
             .pool = try reqString(obj, "pool"),
             .lease = try optString(obj, "lease") orelse "12h",
             .dns = try optString(obj, "dns"),
+            .domain = try optString(obj, "domain"),
+            .mtu = if (field(obj, "mtu")) |v| try asInt(u16, v) else null,
+            .ntp = try optString(obj, "ntp"),
+            .reservations = if (field(obj, "reservations")) |v|
+                try parseDhcpReservations(a, v)
+            else
+                &.{},
+        };
+    }
+    return out;
+}
+
+fn parseDhcpReservations(
+    a: std.mem.Allocator,
+    value: *const std.json.Value,
+) ConfigError![]const schema.DhcpReservation {
+    const arr = try asArray(value);
+    const out = try a.alloc(schema.DhcpReservation, arr.items.len);
+    for (arr.items, 0..) |item, i| {
+        const obj = try asObject(&item);
+        try onlyKeys(obj, &dhcp_reservation_keys);
+        out[i] = .{
+            .mac = try reqString(obj, "mac"),
+            .ip = try reqString(obj, "ip"),
         };
     }
     return out;
@@ -251,6 +279,7 @@ fn parseDns(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!sche
         .upstreams = if (field(obj, "upstreams")) |v| try parseStringArray(a, v) else &.{},
         .cache = try optBool(obj, "cache", true),
         .listen = try optString(obj, "listen"),
+        .max_entries = try optInt(u32, obj, "max_entries", 1024),
     };
 }
 

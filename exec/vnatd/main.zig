@@ -73,6 +73,54 @@ fn run(init: std.process.Init) !void {
     var forwarder = try vnat.forward.Forwarder.fromConfig(gpa, &parsed.config, port_entries);
     defer forwarder.deinit();
 
+    var lease_store: ?vnat.dhcp_leases.Store = null;
+    defer if (lease_store) |*store| store.deinit();
+    if (parsed.config.lease_db) |db_path| {
+        lease_store = vnat.dhcp_leases.Store.init(gpa, io, db_path) catch |err| {
+            logger.err("lease db {s}: {s}", .{ db_path, @errorName(err) });
+            return err;
+        };
+        const restored = lease_store.?.load(forwarder.dhcpServers(), nowMs(io)) catch |err| {
+            logger.err("lease db {s}: {s}", .{ db_path, @errorName(err) });
+            return err;
+        };
+        if (restored != 0) {
+            logger.info("dhcp leases restored={d} db={s}", .{ restored, db_path });
+        }
+    }
+
+    var upstreams: ?[]vnat.types.Ipv4 = null;
+    defer if (upstreams) |items| gpa.free(items);
+    var dns_service: ?vnat.dns_service.Service = null;
+    defer if (dns_service) |*service| service.deinit();
+    if (parsed.config.dns.upstreams.len != 0) {
+        const items = try gpa.alloc(vnat.types.Ipv4, parsed.config.dns.upstreams.len);
+        upstreams = items;
+        for (parsed.config.dns.upstreams, 0..) |text, upstream_index| {
+            items[upstream_index] = vnat.types.Ipv4.parse(text) catch return error.InvalidArgument;
+        }
+        const listen = vnat.types.Ipv4.parse(parsed.config.dns.listen orelse
+            return error.InvalidArgument) catch return error.InvalidArgument;
+        dns_service = vnat.dns_service.Service.init(io, gpa, .{
+            .listen_ip = listen,
+            .upstreams = items,
+            .cache = parsed.config.dns.cache,
+            .cache_max_entries = parsed.config.dns.max_entries,
+        }) catch |err| {
+            logger.err(
+                "dns listen={f}: {s}; assign the address first with `vnat iface set <dev> <cidr>`",
+                .{ listen, @errorName(err) },
+            );
+            return err;
+        };
+        try dns_service.?.start();
+        logger.info("dns listening={f} upstreams={d} cache={}", .{
+            listen,
+            items.len,
+            parsed.config.dns.cache,
+        });
+    }
+
     const action = std.posix.Sigaction{
         .handler = .{ .handler = handleSignal },
         .mask = std.mem.zeroes(std.posix.sigset_t),
@@ -92,8 +140,18 @@ fn run(init: std.process.Init) !void {
 
     var buf: [2048]u8 = undefined;
     var netlink_tick: u8 = 0;
+    var lease_save_ms = nowMs(io);
     while (!stop.load(.acquire)) {
         forwarder.tick(io);
+        if (lease_store) |*store| {
+            const now = nowMs(io);
+            if (now - lease_save_ms >= 60_000) {
+                store.save(forwarder.dhcpServers()) catch |err| {
+                    logger.warn("lease db save: {s}", .{@errorName(err)});
+                };
+                lease_save_ms = now;
+            }
+        }
         netlink_tick +%= 1;
         if (netlink_tick >= 100) {
             netlink_tick = 0;
@@ -125,8 +183,24 @@ fn run(init: std.process.Init) !void {
         }
     }
 
+    if (lease_store) |*store| {
+        store.save(forwarder.dhcpServers()) catch |err| {
+            logger.warn("lease db save: {s}", .{@errorName(err)});
+        };
+    }
+
+    if (dns_service) |service| {
+        logger.info("dns stopping queries={d} responses={d} hits={d} errors={d} dropped={d}", .{
+            service.counters.queries,
+            service.counters.responses,
+            service.counters.cache_hits,
+            service.counters.upstream_errors,
+            service.counters.dropped,
+        });
+    }
+
     logger.info(
-        "stopping instance={s} forwarded={d} dropped={d} pending={d}/{d} ct={d}/{d} snat={d}",
+        "stopping instance={s} forwarded={d} dropped={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d}",
         .{
             parsed.config.instance,
             forwarder.counters.forwarded,
@@ -136,8 +210,17 @@ fn run(init: std.process.Init) !void {
             forwarder.conntrack.counters.created,
             forwarder.conntrack.counters.hits,
             forwarder.counters.snat_packets,
+            forwarder.counters.dnat_packets,
+            forwarder.counters.icmp_translated,
+            forwarder.counters.dhcp_offers,
+            forwarder.counters.dhcp_acks,
+            forwarder.counters.dhcp_requests,
         },
     );
+}
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Clock.now(.awake, io).toMilliseconds();
 }
 
 fn logEvent(logger: *const vnat.log.Logger, event: *const vnat.linux_ports.netlink.Event) void {

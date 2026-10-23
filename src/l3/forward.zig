@@ -16,6 +16,8 @@ const icmp = @import("icmp.zig");
 const fib = @import("fib.zig");
 const conntrack_mod = @import("../nat/conntrack.zig");
 const nat_mod = @import("../nat/nat.zig");
+const dhcp_message = @import("../services/dhcp/message.zig");
+const dhcp_server = @import("../services/dhcp/server.zig");
 
 const PortError = @import("../errors.zig").PortError;
 
@@ -61,6 +63,13 @@ pub const Counters = struct {
     pending_flushed: u64 = 0,
     pending_dropped: u64 = 0,
     snat_packets: u64 = 0,
+    dnat_packets: u64 = 0,
+    icmp_translated: u64 = 0,
+    dhcp_requests: u64 = 0,
+    dhcp_offers: u64 = 0,
+    dhcp_acks: u64 = 0,
+    dhcp_naks: u64 = 0,
+    dhcp_dropped: u64 = 0,
     nat_unsupported: u64 = 0,
 };
 
@@ -74,6 +83,8 @@ pub const Forwarder = struct {
     pending: [pending_slots]PendingPacket = [_]PendingPacket{.{}} ** pending_slots,
     conntrack: conntrack_mod.Conntrack,
     snat_rules: std.ArrayListUnmanaged(nat_mod.Rule) = .empty,
+    forward_rules: std.ArrayListUnmanaged(nat_mod.ForwardRule) = .empty,
+    dhcp_servers: std.ArrayListUnmanaged(dhcp_server.Server) = .empty,
     counters: Counters = .{},
 
     pub fn init(gpa: std.mem.Allocator, ports: []const PortEntry) PortError!Forwarder {
@@ -102,6 +113,9 @@ pub const Forwarder = struct {
         self.local.deinit(self.gpa);
         self.arp_misses.deinit(self.gpa);
         self.snat_rules.deinit(self.gpa);
+        self.forward_rules.deinit(self.gpa);
+        for (self.dhcp_servers.items) |*server| server.deinit();
+        self.dhcp_servers.deinit(self.gpa);
         self.conntrack.deinit();
     }
 
@@ -117,11 +131,39 @@ pub const Forwarder = struct {
         try self.snat_rules.append(self.gpa, .{ .port = port, .addr = addr });
     }
 
+    pub fn addForwardRule(
+        self: *Forwarder,
+        proto: u8,
+        ext_port: u16,
+        to_addr: types.Ipv4,
+        to_port: u16,
+    ) PortError!void {
+        try self.forward_rules.append(self.gpa, .{
+            .proto = proto,
+            .ext_port = ext_port,
+            .to_addr = to_addr,
+            .to_port = to_port,
+        });
+    }
+
+    pub fn dhcpServers(self: *Forwarder) []dhcp_server.Server {
+        return self.dhcp_servers.items;
+    }
+
+    pub fn addDhcpServer(self: *Forwarder, cfg: dhcp_server.Config) PortError!void {
+        const server = dhcp_server.Server.init(self.gpa, cfg) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidArgument,
+        };
+        try self.dhcp_servers.append(self.gpa, server);
+    }
+
     pub fn tick(self: *Forwarder, io: std.Io) void {
         const now = nowMs(io);
         if (now - self.conntrack.last_gc_ms >= conntrack_mod.gc_interval_ms) {
             self.conntrack.gc(now);
         }
+        for (self.dhcp_servers.items) |*server| server.gc(now);
     }
 
     pub fn fromConfig(
@@ -170,6 +212,59 @@ pub const Forwarder = struct {
             const rule = resolveMasquerade(cfg, self.local.items, ports, masquerade.out) orelse
                 return error.InvalidArgument;
             try self.addSnatRule(rule.port, rule.addr);
+        }
+
+        for (cfg.nat.port_forward) |forward| {
+            const to = types.parseIpPort(forward.to) catch return error.InvalidArgument;
+            const proto: u8 = switch (forward.proto) {
+                .tcp => 6,
+                .udp => 17,
+                .icmp => return error.InvalidArgument,
+            };
+            try self.addForwardRule(proto, forward.ext_port, to.ip, to.port);
+        }
+
+        for (cfg.dhcp) |dhcp| {
+            const itf = cfg.interfaces.getPtr(dhcp.iface) orelse return error.InvalidArgument;
+            const port_name = itf.port orelse return error.InvalidArgument;
+            const port_entry = findPort(ports, port_name) orelse return error.NotFound;
+            const address = itf.address orelse return error.InvalidArgument;
+            if (std.mem.eql(u8, address, "dhcp")) return error.InvalidArgument;
+
+            const prefix = types.Prefix4.parse(address) catch return error.InvalidArgument;
+            const pool = types.parseIpRange(dhcp.pool) catch return error.InvalidArgument;
+            const lease_seconds = types.parseDurationSeconds(dhcp.lease) catch
+                return error.InvalidArgument;
+            const dns = if (dhcp.dns) |dns_text|
+                types.Ipv4.parse(dns_text) catch return error.InvalidArgument
+            else
+                prefix.addr;
+            const ntp: ?types.Ipv4 = if (dhcp.ntp) |ntp_text|
+                types.Ipv4.parse(ntp_text) catch return error.InvalidArgument
+            else
+                null;
+
+            var reservations: std.ArrayListUnmanaged(dhcp_server.Reservation) = .empty;
+            defer reservations.deinit(self.gpa);
+            for (dhcp.reservations) |reservation| {
+                try reservations.append(self.gpa, .{
+                    .mac = types.Mac.parse(reservation.mac) catch return error.InvalidArgument,
+                    .ip = types.Ipv4.parse(reservation.ip) catch return error.InvalidArgument,
+                });
+            }
+
+            try self.addDhcpServer(.{
+                .port = port_entry.id,
+                .server_ip = prefix.addr,
+                .prefix = prefix,
+                .pool = pool,
+                .lease_seconds = lease_seconds,
+                .dns = dns,
+                .domain = dhcp.domain,
+                .mtu = dhcp.mtu,
+                .ntp = ntp,
+                .reservations = reservations.items,
+            });
         }
 
         return self;
@@ -311,6 +406,8 @@ pub const Forwarder = struct {
     ) PortError!void {
         const total: usize = ip.total_len;
         const now = nowMs(io);
+        if (try self.handleDhcp(io, ip, ingress, now)) return;
+        if (try self.translateIcmpError(io, ip, ingress, now)) return;
         const is_local = self.isLocal(ip.dst);
         const flow_key = flowKey(ip, ingress.value);
 
@@ -328,13 +425,19 @@ pub const Forwarder = struct {
             }
         }
 
-        // A reply to a NAT address is destined to a local IP but must be
-        // reverse-translated and forwarded, not delivered to the router.
+        var dnat_rule: ?nat_mod.ForwardRule = null;
+        if (entry == null and is_local) {
+            if (flow_key) |key| dnat_rule = self.dnatRuleFor(key);
+        }
+
+        // Replies to a NAT address and new port-forwarded flows are
+        // destined to a local IP but must be translated and forwarded.
         if (is_local) {
-            const forwardable = if (entry) |found|
-                direction == .reply and found.nat != null
-            else
-                false;
+            const forwardable = if (entry) |found| blk: {
+                const nat_info = found.nat orelse break :blk false;
+                if (direction == .reply) break :blk true;
+                break :blk nat_info.dnat_addr != null;
+            } else dnat_rule != null;
             if (!forwardable) {
                 try self.handleLocal(io, eth, ip, ingress);
                 return;
@@ -376,8 +479,31 @@ pub const Forwarder = struct {
         if (entry) |found| {
             updateFlow(found, ipm, now, direction == .reply);
             if (direction == .reply) {
-                if (found.nat != null) {
-                    if (!nat_mod.rewriteDestination(packet, found.original.src, found.original.sport)) {
+                if (found.nat) |nat_info| {
+                    if (nat_info.snat_addr != null) {
+                        if (!nat_mod.rewriteDestination(packet, found.original.src, found.original.sport)) {
+                            self.counters.dropped += 1;
+                            return;
+                        }
+                        ipm = ipv4.parse(packet) catch {
+                            self.counters.dropped += 1;
+                            return;
+                        };
+                    }
+                    if (nat_info.dnat_addr != null) {
+                        if (!nat_mod.rewriteSource(packet, found.original.dst, found.original.dport)) {
+                            self.counters.dropped += 1;
+                            return;
+                        }
+                        ipm = ipv4.parse(packet) catch {
+                            self.counters.dropped += 1;
+                            return;
+                        };
+                    }
+                }
+            } else if (found.nat) |nat_info| {
+                if (nat_info.dnat_addr) |dnat_addr| {
+                    if (!nat_mod.rewriteDestination(packet, dnat_addr, nat_info.dnat_port)) {
                         self.counters.dropped += 1;
                         return;
                     }
@@ -385,8 +511,19 @@ pub const Forwarder = struct {
                         self.counters.dropped += 1;
                         return;
                     };
+                    self.counters.dnat_packets += 1;
                 }
             }
+        } else if (dnat_rule) |rule| {
+            if (!nat_mod.rewriteDestination(packet, rule.to_addr, rule.to_port)) {
+                self.counters.dropped += 1;
+                return;
+            }
+            ipm = ipv4.parse(packet) catch {
+                self.counters.dropped += 1;
+                return;
+            };
+            self.counters.dnat_packets += 1;
         }
 
         const route = self.fib.lookup(ipm.dst) orelse {
@@ -425,19 +562,102 @@ pub const Forwarder = struct {
         if (entry) |found| {
             if (direction == .original) {
                 if (found.nat) |nat_info| {
-                    if (!nat_mod.rewriteSource(packet, nat_info.snat_addr, nat_info.snat_port)) {
+                    if (nat_info.snat_addr) |snat_addr| {
+                        if (!nat_mod.rewriteSource(packet, snat_addr, nat_info.snat_port)) {
+                            self.counters.dropped += 1;
+                            return;
+                        }
+                        ipm = ipv4.parse(packet) catch {
+                            self.counters.dropped += 1;
+                            return;
+                        };
+                        self.counters.snat_packets += 1;
+                    }
+                }
+            }
+        } else if (flow_key) |key| {
+            if (dnat_rule) |rule| {
+                var nat_info = conntrack_mod.Nat{
+                    .dnat_addr = rule.to_addr,
+                    .dnat_port = rule.to_port,
+                };
+                var reply_key: conntrack_mod.FlowKey = undefined;
+                var translated_key: conntrack_mod.FlowKey = undefined;
+                var hairpin_addr: ?types.Ipv4 = null;
+                var hairpin_port: u16 = 0;
+                if (route.port.eql(ingress)) {
+                    const local = self.localForPeer(route.port, ipm.dst) orelse {
+                        self.counters.dropped += 1;
+                        return;
+                    };
+                    const snat_port = self.conntrack.allocPort(ipm.protocol, local.prefix.addr, key.sport) catch {
+                        self.counters.dropped += 1;
+                        return;
+                    };
+                    hairpin_addr = local.prefix.addr;
+                    hairpin_port = snat_port;
+                    nat_info.snat_addr = local.prefix.addr;
+                    nat_info.snat_port = snat_port;
+                    reply_key = makeHairpinReplyKey(
+                        key,
+                        rule.to_addr,
+                        rule.to_port,
+                        local.prefix.addr,
+                        snat_port,
+                        route.port.value,
+                    );
+                    translated_key = makeTranslatedKey(
+                        key,
+                        local.prefix.addr,
+                        snat_port,
+                        rule.to_addr,
+                        rule.to_port,
+                        route.port.value,
+                    );
+                } else {
+                    reply_key = makeDnatReplyKey(
+                        key,
+                        rule.to_addr,
+                        rule.to_port,
+                        route.port.value,
+                    );
+                    translated_key = makeTranslatedKey(
+                        key,
+                        key.src,
+                        key.sport,
+                        rule.to_addr,
+                        rule.to_port,
+                        route.port.value,
+                    );
+                }
+
+                const created = self.conntrack.createMapped(
+                    key,
+                    reply_key,
+                    translated_key,
+                    nat_info,
+                    now,
+                    initialTimeout(ipm.protocol),
+                ) catch {
+                    if (hairpin_addr) |addr| self.conntrack.freePort(ipm.protocol, addr, hairpin_port);
+                    self.counters.dropped += 1;
+                    return;
+                };
+                updateFlow(created, ipm, now, false);
+                if (hairpin_addr) |addr| {
+                    if (!nat_mod.rewriteSource(packet, addr, hairpin_port)) {
+                        self.conntrack.remove(created);
                         self.counters.dropped += 1;
                         return;
                     }
                     ipm = ipv4.parse(packet) catch {
+                        self.conntrack.remove(created);
                         self.counters.dropped += 1;
                         return;
                     };
                     self.counters.snat_packets += 1;
                 }
-            }
-        } else if (flow_key) |key| {
-            if (self.snatAddrFor(route.port)) |nat_addr| {
+            } else if (self.snatAddrFor(route.port)) |nat_addr| {
                 if (ipm.src.eql(nat_addr)) {
                     const reply_key = makeReplyKey(key, key.src, key.sport, route.port.value);
                     const created = self.conntrack.create(
@@ -457,13 +677,22 @@ pub const Forwarder = struct {
                         return;
                     };
                     const reply_key = makeReplyKey(key, nat_addr, nat_port, route.port.value);
+                    const translated_key = makeTranslatedKey(
+                        key,
+                        nat_addr,
+                        nat_port,
+                        key.dst,
+                        key.dport,
+                        route.port.value,
+                    );
                     const nat_info = conntrack_mod.Nat{
                         .snat_addr = nat_addr,
                         .snat_port = nat_port,
                     };
-                    const created = self.conntrack.create(
+                    const created = self.conntrack.createMapped(
                         key,
                         reply_key,
+                        translated_key,
                         nat_info,
                         now,
                         initialTimeout(ipm.protocol),
@@ -556,6 +785,315 @@ pub const Forwarder = struct {
         fixTransportChecksum(out[hlen..][0..total]);
         try egress.port.write(io, out[0 .. hlen + total]);
         self.counters.forwarded += 1;
+    }
+
+    fn handleDhcp(
+        self: *Forwarder,
+        io: std.Io,
+        ip: ipv4.Header,
+        ingress: types.PortId,
+        now: i64,
+    ) PortError!bool {
+        if (ip.protocol != ipv4.Protocol.udp) return false;
+        if (ip.payload.len < 8) return false;
+        const udp_len = readU16(ip.payload, 4);
+        if (udp_len < 8 or udp_len > ip.payload.len) return false;
+        if (readU16(ip.payload, 2) != 67) return false;
+
+        const server = self.dhcpServerFor(ingress) orelse return false;
+        self.counters.dhcp_requests += 1;
+        const msg = dhcp_message.Message.parse(ip.payload[8..udp_len]) catch {
+            self.counters.dhcp_dropped += 1;
+            return true;
+        };
+
+        var reply_buf: [576]u8 = undefined;
+        const reply = (server.handle(msg, &reply_buf, now) catch {
+            self.counters.dhcp_dropped += 1;
+            return true;
+        }) orelse return true;
+
+        switch (reply.typ) {
+            .offer => self.counters.dhcp_offers += 1,
+            .ack => self.counters.dhcp_acks += 1,
+            .nak => self.counters.dhcp_naks += 1,
+            else => {},
+        }
+        self.sendDhcpReply(io, server.cfg.port, reply) catch {
+            self.counters.dhcp_dropped += 1;
+            return true;
+        };
+        return true;
+    }
+
+    fn dhcpServerFor(self: *Forwarder, ingress: types.PortId) ?*dhcp_server.Server {
+        for (self.dhcp_servers.items) |*server| {
+            if (server.cfg.port.eql(ingress)) return server;
+        }
+        return null;
+    }
+
+    fn sendDhcpReply(
+        self: *Forwarder,
+        io: std.Io,
+        port: types.PortId,
+        reply: dhcp_server.Reply,
+    ) PortError!void {
+        var udp: [576]u8 = undefined;
+        const udp_len = 8 + reply.payload.len;
+        if (udp_len > udp.len) return error.FrameTooLarge;
+        writeU16(&udp, 0, 67);
+        writeU16(&udp, 2, 68);
+        writeU16(&udp, 4, @intCast(udp_len));
+        writeU16(&udp, 6, 0);
+        @memcpy(udp[8..udp_len], reply.payload);
+
+        var ip_buf: [576]u8 = undefined;
+        const ip_len = ipv4.write(
+            &ip_buf,
+            self.dhcpServerAddress(port) orelse return error.NotFound,
+            reply.dst_ip,
+            ipv4.Protocol.udp,
+            64,
+            0,
+            udp[0..udp_len],
+        ) catch return error.FrameTooLarge;
+
+        const parsed = ipv4.parse(ip_buf[0..ip_len]) catch return error.InvalidArgument;
+        const udp_mut = ip_buf[parsed.header_len..ip_len];
+        var sum = transportChecksum(parsed.src, parsed.dst, ipv4.Protocol.udp, udp_mut);
+        if (sum == 0) sum = 0xffff;
+        writeU16(udp_mut, 6, sum);
+        writeU16(&ip_buf, 10, 0);
+        writeU16(&ip_buf, 10, ipv4.checksum(ip_buf[0..parsed.header_len]));
+
+        try self.sendL2(io, port, reply.dst_mac, ethernet.EtherType.ipv4, ip_buf[0..ip_len]);
+    }
+
+    fn dhcpServerAddress(self: *const Forwarder, port: types.PortId) ?types.Ipv4 {
+        for (self.dhcp_servers.items) |server| {
+            if (server.cfg.port.eql(port)) return server.cfg.server_ip;
+        }
+        return null;
+    }
+
+    /// Rewrites ICMP errors quoting a translated NAT flow. Returns true when
+    /// the packet was consumed (translated or dropped); false lets the normal
+    /// forwarding/local path handle unrelated ICMP.
+    fn translateIcmpError(
+        self: *Forwarder,
+        io: std.Io,
+        ip: ipv4.Header,
+        ingress: types.PortId,
+        now: i64,
+    ) PortError!bool {
+        if (ip.protocol != ipv4.Protocol.icmp) return false;
+        const msg = ip.payload;
+        if (msg.len < 8) return false;
+        const typ = msg[0];
+        if (typ != icmp.Type.destination_unreachable and
+            typ != icmp.Type.time_exceeded and typ != 12)
+        {
+            return false;
+        }
+        if (ipv4.checksum(msg) != 0) {
+            self.counters.dropped += 1;
+            return true;
+        }
+
+        const quoted = msg[8..];
+        const flow = parseQuoted(quoted) orelse {
+            self.counters.dropped += 1;
+            return true;
+        };
+        const translated_key = conntrack_mod.FlowKey{
+            .zone = ingress.value,
+            .proto = flow.proto,
+            .src = flow.src,
+            .sport = flow.sport,
+            .dst = flow.dst,
+            .dport = flow.dport,
+        };
+        const found = self.conntrack.lookupTranslated(translated_key) orelse return false;
+        const nat_info = found.nat orelse return false;
+
+        if (nat_info.snat_addr) |snat| {
+            if (!flow.src.eql(snat) or flow.sport != nat_info.snat_port) return false;
+            if (!ip.dst.eql(snat)) return false;
+        }
+        if (nat_info.dnat_addr) |dnat| {
+            if (!flow.dst.eql(dnat) or flow.dport != nat_info.dnat_port) return false;
+        }
+        if (ip.ttl <= 1) {
+            self.counters.dropped += 1;
+            return true;
+        }
+
+        var buf: [2048]u8 = undefined;
+        const total: usize = ip.total_len;
+        if (total > buf.len) {
+            self.counters.dropped += 1;
+            return true;
+        }
+        @memcpy(buf[0..total], ip.packet[0..total]);
+        const outer = ipv4.parse(buf[0..total]) catch {
+            self.counters.dropped += 1;
+            return true;
+        };
+        const msg_mut = buf[outer.header_len..outer.total_len];
+        const quoted_mut = msg_mut[8..];
+
+        var new_src = outer.src;
+        var new_dst = outer.dst;
+        if (nat_info.snat_addr != null) new_dst = found.original.src;
+        if (nat_info.dnat_addr != null) new_src = found.original.dst;
+        std.mem.writeInt(u32, buf[12..16], new_src.value, .big);
+        std.mem.writeInt(u32, buf[16..20], new_dst.value, .big);
+
+        var emb_src = flow.src;
+        var emb_dst = flow.dst;
+        var emb_sport = flow.sport;
+        var emb_dport = flow.dport;
+        if (nat_info.snat_addr != null) {
+            emb_src = found.original.src;
+            emb_sport = found.original.sport;
+        }
+        if (nat_info.dnat_addr != null) {
+            emb_dst = found.original.dst;
+            emb_dport = found.original.dport;
+        }
+        std.mem.writeInt(u32, quoted_mut[12..16], emb_src.value, .big);
+        std.mem.writeInt(u32, quoted_mut[16..20], emb_dst.value, .big);
+
+        const l4 = quoted_mut[flow.header_len..];
+        switch (flow.proto) {
+            ipv4.Protocol.tcp => {
+                writeU16(l4, 0, emb_sport);
+                writeU16(l4, 2, emb_dport);
+                if (l4.len >= 18) {
+                    const old_sum = readU16(l4, 16);
+                    if (old_sum != 0) {
+                        var new_sum = nat_mod.adjustL4Checksum(
+                            old_sum,
+                            flow.src,
+                            emb_src,
+                            flow.dst,
+                            emb_dst,
+                            flow.sport,
+                            emb_sport,
+                            flow.dport,
+                            emb_dport,
+                        );
+                        if (new_sum == 0) new_sum = 0xffff;
+                        writeU16(l4, 16, new_sum);
+                    }
+                }
+            },
+            ipv4.Protocol.udp => {
+                writeU16(l4, 0, emb_sport);
+                writeU16(l4, 2, emb_dport);
+                const old_sum = readU16(l4, 6);
+                if (old_sum != 0) {
+                    var new_sum = nat_mod.adjustL4Checksum(
+                        old_sum,
+                        flow.src,
+                        emb_src,
+                        flow.dst,
+                        emb_dst,
+                        flow.sport,
+                        emb_sport,
+                        flow.dport,
+                        emb_dport,
+                    );
+                    if (new_sum == 0) new_sum = 0xffff;
+                    writeU16(l4, 6, new_sum);
+                }
+            },
+            ipv4.Protocol.icmp => {
+                writeU16(l4, 4, emb_sport);
+                const old_sum = readU16(l4, 2);
+                writeU16(l4, 2, nat_mod.adjustWordChecksum(old_sum, flow.sport, emb_sport));
+            },
+            else => {},
+        }
+
+        writeU16(quoted_mut, 10, 0);
+        writeU16(quoted_mut, 10, ipv4.checksum(quoted_mut[0..flow.header_len]));
+        writeU16(msg_mut, 2, 0);
+        writeU16(msg_mut, 2, ipv4.checksum(msg_mut));
+        writeU16(&buf, 10, 0);
+        writeU16(&buf, 10, ipv4.checksum(buf[0..outer.header_len]));
+
+        const ipm = ipv4.parse(buf[0..total]) catch {
+            self.counters.dropped += 1;
+            return true;
+        };
+        const route = self.fib.lookup(ipm.dst) orelse {
+            self.counters.dropped += 1;
+            return true;
+        };
+        const egress = self.portById(route.port) orelse {
+            self.counters.dropped += 1;
+            return true;
+        };
+        const egress_info = egress.port.info();
+        if (ipm.total_len > egress_info.mtu) {
+            self.counters.dropped += 1;
+            return true;
+        }
+
+        found.last_seen_ms = now;
+        found.reply_packets += 1;
+        found.reply_bytes += total;
+        self.counters.icmp_translated += 1;
+
+        if (egress_info.kind == .tun) {
+            var out: [2048]u8 = undefined;
+            @memcpy(out[0..total], ipm.packet[0..total]);
+            ipv4.decrementTtl(out[0..total]) catch {
+                self.counters.dropped += 1;
+                return true;
+            };
+            fixTransportChecksum(out[0..total]);
+            try egress.port.write(io, out[0..total]);
+            self.counters.forwarded += 1;
+            return true;
+        }
+
+        const next_hop = route.next_hop orelse ipm.dst;
+        const arp_entry = self.arp.getFresh(next_hop, route.port, now, arp_ttl_ms) orelse {
+            try self.sendArpRequest(io, route.port, next_hop);
+            if (!self.enqueuePending(route.port, next_hop, ipm.packet[0..total], now)) {
+                self.counters.dropped += 1;
+                self.counters.pending_dropped += 1;
+            }
+            return true;
+        };
+
+        var out: [2048]u8 = undefined;
+        const hlen = ethernet.write(
+            &out,
+            arp_entry.mac,
+            egress_info.mac,
+            ethernet.EtherType.ipv4,
+            null,
+        ) catch {
+            self.counters.dropped += 1;
+            return true;
+        };
+        if (total > out.len - hlen) {
+            self.counters.dropped += 1;
+            return true;
+        }
+        @memcpy(out[hlen..][0..total], ipm.packet[0..total]);
+        ipv4.decrementTtl(out[hlen..][0..total]) catch {
+            self.counters.dropped += 1;
+            return true;
+        };
+        fixTransportChecksum(out[hlen..][0..total]);
+        try egress.port.write(io, out[0 .. hlen + total]);
+        self.counters.forwarded += 1;
+        return true;
     }
 
     fn handleLocal(
@@ -841,6 +1379,16 @@ pub const Forwarder = struct {
         return null;
     }
 
+    fn dnatRuleFor(
+        self: *const Forwarder,
+        key: conntrack_mod.FlowKey,
+    ) ?nat_mod.ForwardRule {
+        for (self.forward_rules.items) |rule| {
+            if (rule.proto == key.proto and rule.ext_port == key.dport) return rule;
+        }
+        return null;
+    }
+
     fn portById(self: *const Forwarder, id: types.PortId) ?PortEntry {
         for (self.ports) |entry| {
             if (entry.id.eql(id)) return entry;
@@ -978,6 +1526,107 @@ fn makeReplyKey(
         .sport = original.dport,
         .dst = nat_addr,
         .dport = nat_port,
+    };
+}
+
+const QuotedFlow = struct {
+    header_len: usize,
+    proto: u8,
+    src: types.Ipv4,
+    sport: u16,
+    dst: types.Ipv4,
+    dport: u16,
+};
+
+fn parseQuoted(quoted: []const u8) ?QuotedFlow {
+    if (quoted.len < 20) return null;
+    if (quoted[0] >> 4 != 4) return null;
+    const ihl = quoted[0] & 0x0f;
+    if (ihl < 5) return null;
+    const header_len: usize = @as(usize, ihl) * 4;
+    if (quoted.len < header_len + 8) return null;
+    if (ipv4.checksum(quoted[0..header_len]) != 0) return null;
+    const total_len = readU16(quoted, 2);
+    if (total_len < header_len + 8) return null;
+    if (readU16(quoted, 6) & 0x3fff != 0) return null;
+
+    const proto = quoted[9];
+    const src: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted[12..16], .big) };
+    const dst: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted[16..20], .big) };
+    const l4 = quoted[header_len..];
+    switch (proto) {
+        ipv4.Protocol.tcp, ipv4.Protocol.udp => return .{
+            .header_len = header_len,
+            .proto = proto,
+            .src = src,
+            .sport = readU16(l4, 0),
+            .dst = dst,
+            .dport = readU16(l4, 2),
+        },
+        ipv4.Protocol.icmp => {
+            if (l4[0] != icmp.Type.echo_request and l4[0] != icmp.Type.echo_reply) return null;
+            return .{
+                .header_len = header_len,
+                .proto = proto,
+                .src = src,
+                .sport = readU16(l4, 4),
+                .dst = dst,
+                .dport = 0,
+            };
+        },
+        else => return null,
+    }
+}
+
+fn makeTranslatedKey(
+    original: conntrack_mod.FlowKey,
+    src: types.Ipv4,
+    sport: u16,
+    dst: types.Ipv4,
+    dport: u16,
+    zone: u32,
+) conntrack_mod.FlowKey {
+    return .{
+        .zone = zone,
+        .proto = original.proto,
+        .src = src,
+        .sport = sport,
+        .dst = dst,
+        .dport = dport,
+    };
+}
+
+fn makeDnatReplyKey(
+    original: conntrack_mod.FlowKey,
+    target_addr: types.Ipv4,
+    target_port: u16,
+    reply_zone: u32,
+) conntrack_mod.FlowKey {
+    return .{
+        .zone = reply_zone,
+        .proto = original.proto,
+        .src = target_addr,
+        .sport = target_port,
+        .dst = original.src,
+        .dport = original.sport,
+    };
+}
+
+fn makeHairpinReplyKey(
+    original: conntrack_mod.FlowKey,
+    target_addr: types.Ipv4,
+    target_port: u16,
+    snat_addr: types.Ipv4,
+    snat_port: u16,
+    reply_zone: u32,
+) conntrack_mod.FlowKey {
+    return .{
+        .zone = reply_zone,
+        .proto = original.proto,
+        .src = target_addr,
+        .sport = target_port,
+        .dst = snat_addr,
+        .dport = snat_port,
     };
 }
 
@@ -1545,7 +2194,10 @@ test "forwarder builds state from config" {
         \\  "routes": [
         \\    { "dst": "0.0.0.0/0", "via": "10.0.1.254", "dev": "a", "metric": 100 }
         \\  ],
-        \\  "nat": { "masquerade": [ { "out": "lan-b" } ] }
+        \\  "nat": {
+        \\    "masquerade": [ { "out": "lan-b" } ],
+        \\    "port_forward": [ { "proto": "tcp", "ext_port": 8080, "to": "10.0.1.10:80" } ]
+        \\  }
         \\}
     ;
     var parsed = try config_parse.parse(testing.allocator, json);
@@ -1565,6 +2217,11 @@ test "forwarder builds state from config" {
     try testing.expectEqual(@as(usize, 1), fwd.snat_rules.items.len);
     try testing.expect(fwd.snat_rules.items[0].port.eql(port_b));
     try testing.expect(fwd.snat_rules.items[0].addr.eql(testIp("10.0.2.1")));
+    try testing.expectEqual(@as(usize, 1), fwd.forward_rules.items.len);
+    try testing.expectEqual(@as(u8, 6), fwd.forward_rules.items[0].proto);
+    try testing.expectEqual(@as(u16, 8080), fwd.forward_rules.items[0].ext_port);
+    try testing.expect(fwd.forward_rules.items[0].to_addr.eql(testIp("10.0.1.10")));
+    try testing.expectEqual(@as(u16, 80), fwd.forward_rules.items[0].to_port);
 }
 
 fn buildTcpSegment(buf: []u8) void {
@@ -1824,6 +2481,20 @@ fn wrapIpFrame(buf: []u8, eth_dst: types.Mac, eth_src: types.Mac, ip_packet: []c
     return hlen + ip_packet.len;
 }
 
+fn buildDhcpPayload(
+    buf: []u8,
+    typ: dhcp_message.MessageType,
+    xid: u32,
+    mac: types.Mac,
+    requested: ?types.Ipv4,
+    server_id: ?types.Ipv4,
+) ![]u8 {
+    var builder = try dhcp_message.Builder.init(buf, dhcp_message.op_request, typ, xid, mac, 0x8000);
+    if (requested) |ip| try builder.addIpv4(50, ip);
+    if (server_id) |ip| try builder.addIpv4(54, ip);
+    return builder.finish();
+}
+
 fn buildUdpFrame(
     buf: []u8,
     eth_dst: types.Mac,
@@ -1851,6 +2522,83 @@ fn buildUdpFrame(
     if (sum == 0) sum = 0xffff;
     writeU16(udp_payload, 6, sum);
     return wrapIpFrame(buf, eth_dst, eth_src, ip_buf[0..ip_len]);
+}
+
+fn buildUdpPacket(
+    buf: []u8,
+    src: types.Ipv4,
+    dst: types.Ipv4,
+    sport: u16,
+    dport: u16,
+    payload: []const u8,
+) ![]u8 {
+    var udp: [1024]u8 = undefined;
+    const udp_len = 8 + payload.len;
+    writeU16(&udp, 0, sport);
+    writeU16(&udp, 2, dport);
+    writeU16(&udp, 4, @intCast(udp_len));
+    writeU16(&udp, 6, 0);
+    @memcpy(udp[8..udp_len], payload);
+
+    const ip_len = try ipv4.write(buf, src, dst, ipv4.Protocol.udp, 64, 0x6666, udp[0..udp_len]);
+    const ip_h = try ipv4.parse(buf[0..ip_len]);
+    const udp_payload = buf[ip_h.header_len..ip_len];
+    var sum = transportChecksum(ip_h.src, ip_h.dst, ipv4.Protocol.udp, udp_payload);
+    if (sum == 0) sum = 0xffff;
+    writeU16(udp_payload, 6, sum);
+    return buf[0..ip_len];
+}
+
+fn buildTcpPacket(
+    buf: []u8,
+    src: types.Ipv4,
+    dst: types.Ipv4,
+    sport: u16,
+    dport: u16,
+    flags: u8,
+) ![]u8 {
+    var tcp: [20]u8 = [_]u8{0} ** 20;
+    writeU16(&tcp, 0, sport);
+    writeU16(&tcp, 2, dport);
+    tcp[12] = 0x50;
+    tcp[13] = flags;
+    writeU16(&tcp, 14, 0xffff);
+
+    const ip_len = try ipv4.write(buf, src, dst, ipv4.Protocol.tcp, 64, 0x6666, &tcp);
+    const ip_h = try ipv4.parse(buf[0..ip_len]);
+    const tcp_payload = buf[ip_h.header_len..ip_len];
+    writeU16(tcp_payload, 16, 0);
+    writeU16(
+        tcp_payload,
+        16,
+        transportChecksum(ip_h.src, ip_h.dst, ipv4.Protocol.tcp, tcp_payload),
+    );
+    return buf[0..ip_len];
+}
+
+fn buildIcmpErrorFrame(
+    buf: []u8,
+    eth_dst: types.Mac,
+    eth_src: types.Mac,
+    outer_src: types.Ipv4,
+    outer_dst: types.Ipv4,
+    quoted_packet: []const u8,
+    typ: u8,
+    code: u8,
+) !usize {
+    var msg: [1024]u8 = undefined;
+    const m = try icmp.writeError(&msg, typ, code, quoted_packet, 0);
+    var ip_buf: [1200]u8 = undefined;
+    const n = try ipv4.write(
+        &ip_buf,
+        outer_src,
+        outer_dst,
+        ipv4.Protocol.icmp,
+        64,
+        0x7777,
+        msg[0..m],
+    );
+    return wrapIpFrame(buf, eth_dst, eth_src, ip_buf[0..n]);
 }
 
 fn buildTcpFrame(
@@ -2161,6 +2909,478 @@ test "snat tracks tcp state and rewrites ports" {
         .dport = 80,
     };
     try testing.expectEqual(conntrack_mod.State.established, fwd.conntrack.lookup(key).?.state);
+}
+
+test "dnat forwards to an internal target and restores the reply" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addForwardRule(ipv4.Protocol.tcp, 8080, testIp("10.0.1.10"), 80);
+    const now = nowMs(testing.io);
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.10"), .{
+        .mac = host_a_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = now,
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildTcpFrame(
+        &frame,
+        port_b_mac,
+        host_b_mac,
+        testIp("10.0.2.2"),
+        testIp("10.0.2.1"),
+        40000,
+        8080,
+        0x02,
+    );
+    try fwd.handle(testing.io, frame[0..n], port_b);
+
+    var out: [512]u8 = undefined;
+    const m = (try a.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    try testing.expect(eth.dst.eql(host_a_mac));
+    try testing.expect(eth.src.eql(port_a_mac));
+    const ip_h = try ipv4.parse(eth.payload);
+    try testing.expect(ip_h.src.eql(testIp("10.0.2.2")));
+    try testing.expect(ip_h.dst.eql(testIp("10.0.1.10")));
+    try testing.expectEqual(@as(u8, 63), ip_h.ttl);
+    try testing.expectEqual(@as(u16, 40000), readU16(ip_h.payload, 0));
+    try testing.expectEqual(@as(u16, 80), readU16(ip_h.payload, 2));
+    try testing.expectEqual(@as(u16, 0), ipv4.checksum(ip_h.packet[0..ip_h.header_len]));
+    try testing.expectEqual(
+        @as(u16, 0),
+        transportChecksum(ip_h.src, ip_h.dst, ipv4.Protocol.tcp, ip_h.payload),
+    );
+
+    const rn = try buildTcpFrame(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.10"),
+        testIp("10.0.2.2"),
+        80,
+        40000,
+        0x12,
+    );
+    try fwd.handle(testing.io, frame[0..rn], port_a);
+
+    const rm = (try b.takeSent(&out)).?;
+    const reth = try ethernet.parse(out[0..rm]);
+    try testing.expect(reth.dst.eql(host_b_mac));
+    const rip = try ipv4.parse(reth.payload);
+    try testing.expect(rip.src.eql(testIp("10.0.2.1")));
+    try testing.expect(rip.dst.eql(testIp("10.0.2.2")));
+    try testing.expectEqual(@as(u16, 8080), readU16(rip.payload, 0));
+    try testing.expectEqual(@as(u16, 40000), readU16(rip.payload, 2));
+    try testing.expectEqual(
+        @as(u16, 0),
+        transportChecksum(rip.src, rip.dst, ipv4.Protocol.tcp, rip.payload),
+    );
+    try testing.expectEqual(@as(u32, 1), fwd.conntrack.count);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dnat_packets);
+    try testing.expectEqual(@as(u64, 0), fwd.counters.snat_packets);
+}
+
+test "hairpin dnat snats back out the ingress port" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addForwardRule(ipv4.Protocol.tcp, 8080, testIp("10.0.1.10"), 80);
+    const now = nowMs(testing.io);
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.10"), .{
+        .mac = host_b_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.2"), .{
+        .mac = host_a_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildTcpFrame(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.1.1"),
+        40000,
+        8080,
+        0x02,
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+
+    var out: [512]u8 = undefined;
+    const m = (try a.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    try testing.expect(eth.dst.eql(host_b_mac));
+    const ip_h = try ipv4.parse(eth.payload);
+    try testing.expect(ip_h.src.eql(testIp("10.0.1.1")));
+    try testing.expect(ip_h.dst.eql(testIp("10.0.1.10")));
+    try testing.expectEqual(@as(u16, 40000), readU16(ip_h.payload, 0));
+    try testing.expectEqual(@as(u16, 80), readU16(ip_h.payload, 2));
+
+    const rn = try buildTcpFrame(
+        &frame,
+        port_a_mac,
+        host_b_mac,
+        testIp("10.0.1.10"),
+        testIp("10.0.1.1"),
+        80,
+        40000,
+        0x12,
+    );
+    try fwd.handle(testing.io, frame[0..rn], port_a);
+
+    const rm = (try a.takeSent(&out)).?;
+    const reth = try ethernet.parse(out[0..rm]);
+    try testing.expect(reth.dst.eql(host_a_mac));
+    const rip = try ipv4.parse(reth.payload);
+    try testing.expect(rip.src.eql(testIp("10.0.1.1")));
+    try testing.expect(rip.dst.eql(testIp("10.0.1.2")));
+    try testing.expectEqual(@as(u16, 8080), readU16(rip.payload, 0));
+    try testing.expectEqual(@as(u16, 40000), readU16(rip.payload, 2));
+    try testing.expectEqual(
+        @as(u16, 0),
+        transportChecksum(rip.src, rip.dst, ipv4.Protocol.tcp, rip.payload),
+    );
+    try testing.expectEqual(@as(u32, 1), fwd.conntrack.count);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dnat_packets);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.snat_packets);
+}
+
+test "dnat translates udp port forwards" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addForwardRule(ipv4.Protocol.udp, 5353, testIp("10.0.1.10"), 9999);
+    const now = nowMs(testing.io);
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.10"), .{
+        .mac = host_a_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = now,
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildUdpFrame(
+        &frame,
+        port_b_mac,
+        host_b_mac,
+        testIp("10.0.2.2"),
+        testIp("10.0.2.1"),
+        40000,
+        5353,
+        64,
+        "dns?",
+    );
+    try fwd.handle(testing.io, frame[0..n], port_b);
+
+    var out: [512]u8 = undefined;
+    const m = (try a.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    const ip_h = try ipv4.parse(eth.payload);
+    try testing.expect(ip_h.src.eql(testIp("10.0.2.2")));
+    try testing.expect(ip_h.dst.eql(testIp("10.0.1.10")));
+    try testing.expectEqual(@as(u16, 40000), readU16(ip_h.payload, 0));
+    try testing.expectEqual(@as(u16, 9999), readU16(ip_h.payload, 2));
+
+    const rn = try buildUdpFrame(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.10"),
+        testIp("10.0.2.2"),
+        9999,
+        40000,
+        64,
+        "answer",
+    );
+    try fwd.handle(testing.io, frame[0..rn], port_a);
+
+    const rm = (try b.takeSent(&out)).?;
+    const reth = try ethernet.parse(out[0..rm]);
+    const rip = try ipv4.parse(reth.payload);
+    try testing.expect(rip.src.eql(testIp("10.0.2.1")));
+    try testing.expect(rip.dst.eql(testIp("10.0.2.2")));
+    try testing.expectEqual(@as(u16, 5353), readU16(rip.payload, 0));
+    try testing.expectEqual(@as(u16, 40000), readU16(rip.payload, 2));
+    try testing.expectEqual(@as(u32, 1), fwd.conntrack.count);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dnat_packets);
+}
+
+test "snat translates icmp errors quoting the translated flow" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addSnatRule(port_b, testIp("10.0.2.1"));
+    const now = nowMs(testing.io);
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = now,
+    });
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.2"), .{
+        .mac = host_a_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildUdpFrame(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.2.2"),
+        40000,
+        9999,
+        64,
+        "hello",
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+
+    var quoted_buf: [512]u8 = undefined;
+    const quoted = try buildUdpPacket(
+        &quoted_buf,
+        testIp("10.0.2.1"),
+        testIp("10.0.2.2"),
+        40000,
+        9999,
+        "",
+    );
+    const en = try buildIcmpErrorFrame(
+        &frame,
+        port_b_mac,
+        host_b_mac,
+        testIp("10.0.2.2"),
+        testIp("10.0.2.1"),
+        quoted,
+        icmp.Type.destination_unreachable,
+        icmp.Code.frag_needed,
+    );
+    try fwd.handle(testing.io, frame[0..en], port_b);
+
+    var out: [512]u8 = undefined;
+    const m = (try a.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    const ip_h = try ipv4.parse(eth.payload);
+    try testing.expect(ip_h.src.eql(testIp("10.0.2.2")));
+    try testing.expect(ip_h.dst.eql(testIp("10.0.1.2")));
+    try testing.expectEqual(@as(u8, 63), ip_h.ttl);
+    try testing.expectEqual(@as(u16, 0), ipv4.checksum(ip_h.packet[0..ip_h.header_len]));
+    try testing.expectEqual(@as(u16, 0), ipv4.checksum(ip_h.payload));
+    try testing.expectEqual(icmp.Type.destination_unreachable, ip_h.payload[0]);
+    try testing.expectEqual(icmp.Code.frag_needed, ip_h.payload[1]);
+
+    const quoted_out = ip_h.payload[8..];
+    const quoted_hl: usize = @as(usize, quoted_out[0] & 0x0f) * 4;
+    const quoted_src: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted_out[12..16], .big) };
+    const quoted_dst: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted_out[16..20], .big) };
+    const quoted_l4 = quoted_out[quoted_hl..];
+    try testing.expect(quoted_src.eql(testIp("10.0.1.2")));
+    try testing.expect(quoted_dst.eql(testIp("10.0.2.2")));
+    try testing.expectEqual(@as(u16, 40000), readU16(quoted_l4, 0));
+    try testing.expectEqual(@as(u16, 9999), readU16(quoted_l4, 2));
+    try testing.expectEqual(@as(u16, 0), ipv4.checksum(quoted_out[0..quoted_hl]));
+    try testing.expectEqual(
+        @as(u16, 0),
+        transportChecksum(quoted_src, quoted_dst, ipv4.Protocol.udp, quoted_l4),
+    );
+    try testing.expectEqual(@as(u64, 1), fwd.counters.icmp_translated);
+}
+
+test "dnat translates icmp errors quoting the translated flow" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addForwardRule(ipv4.Protocol.tcp, 8080, testIp("10.0.1.10"), 80);
+    const now = nowMs(testing.io);
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.10"), .{
+        .mac = host_a_mac,
+        .port = port_a,
+        .updated_ms = now,
+    });
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = now,
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildTcpFrame(
+        &frame,
+        port_b_mac,
+        host_b_mac,
+        testIp("10.0.2.2"),
+        testIp("10.0.2.1"),
+        40000,
+        8080,
+        0x02,
+    );
+    try fwd.handle(testing.io, frame[0..n], port_b);
+
+    var quoted_buf: [512]u8 = undefined;
+    const quoted = try buildTcpPacket(
+        &quoted_buf,
+        testIp("10.0.2.2"),
+        testIp("10.0.1.10"),
+        40000,
+        80,
+        0x02,
+    );
+    const en = try buildIcmpErrorFrame(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.10"),
+        testIp("10.0.2.2"),
+        quoted,
+        icmp.Type.destination_unreachable,
+        icmp.Code.host_unreachable,
+    );
+    try fwd.handle(testing.io, frame[0..en], port_a);
+
+    var out: [512]u8 = undefined;
+    const m = (try b.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    const ip_h = try ipv4.parse(eth.payload);
+    try testing.expect(ip_h.src.eql(testIp("10.0.2.1")));
+    try testing.expect(ip_h.dst.eql(testIp("10.0.2.2")));
+    try testing.expectEqual(@as(u16, 0), ipv4.checksum(ip_h.payload));
+
+    const quoted_out = ip_h.payload[8..];
+    const quoted_hl: usize = @as(usize, quoted_out[0] & 0x0f) * 4;
+    const quoted_src: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted_out[12..16], .big) };
+    const quoted_dst: types.Ipv4 = .{ .value = std.mem.readInt(u32, quoted_out[16..20], .big) };
+    const quoted_l4 = quoted_out[quoted_hl..];
+    try testing.expect(quoted_src.eql(testIp("10.0.2.2")));
+    try testing.expect(quoted_dst.eql(testIp("10.0.2.1")));
+    try testing.expectEqual(@as(u16, 40000), readU16(quoted_l4, 0));
+    try testing.expectEqual(@as(u16, 8080), readU16(quoted_l4, 2));
+    try testing.expectEqual(@as(u64, 1), fwd.counters.icmp_translated);
+}
+
+test "dhcp server offers and acks a lease" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addDhcpServer(.{
+        .port = port_a,
+        .server_ip = testIp("10.0.1.1"),
+        .prefix = testPrefix("10.0.1.1/24"),
+        .pool = types.parseIpRange("10.0.1.100-10.0.1.101") catch unreachable,
+        .lease_seconds = 3600,
+        .dns = testIp("10.0.1.1"),
+    });
+
+    var payload_buf: [512]u8 = undefined;
+    const discover = try buildDhcpPayload(&payload_buf, .discover, 7, host_a_mac, null, null);
+    var frame: [512]u8 = undefined;
+    const n = try buildUdpFrame(
+        &frame,
+        types.Mac.broadcast,
+        host_a_mac,
+        types.Ipv4.unspecified,
+        types.Ipv4.limited_broadcast,
+        68,
+        67,
+        64,
+        discover,
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+
+    var out: [512]u8 = undefined;
+    const m = (try a.takeSent(&out)).?;
+    const eth = try ethernet.parse(out[0..m]);
+    const ip_h = try ipv4.parse(eth.payload);
+    const offer = try dhcp_message.Message.parse(ip_h.payload[8..]);
+    try testing.expectEqual(dhcp_message.MessageType.offer, offer.messageType().?);
+    try testing.expectEqual(@as(u32, 0x0a000164), offer.yiaddr.value);
+    try testing.expectEqual(@as(u32, 0x0a000101), offer.options.serverId().?.value);
+
+    const request = try buildDhcpPayload(
+        &payload_buf,
+        .request,
+        7,
+        host_a_mac,
+        .{ .value = 0x0a000164 },
+        testIp("10.0.1.1"),
+    );
+    const rn = try buildUdpFrame(
+        &frame,
+        types.Mac.broadcast,
+        host_a_mac,
+        types.Ipv4.unspecified,
+        types.Ipv4.limited_broadcast,
+        68,
+        67,
+        64,
+        request,
+    );
+    try fwd.handle(testing.io, frame[0..rn], port_a);
+
+    const am = (try a.takeSent(&out)).?;
+    const ack_eth = try ethernet.parse(out[0..am]);
+    const ack_ip = try ipv4.parse(ack_eth.payload);
+    const ack = try dhcp_message.Message.parse(ack_ip.payload[8..]);
+    try testing.expectEqual(dhcp_message.MessageType.ack, ack.messageType().?);
+    try testing.expectEqual(@as(u32, 0x0a000164), ack.yiaddr.value);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dhcp_offers);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dhcp_acks);
 }
 
 test "forwarder tracks non-nat flows without rewriting" {

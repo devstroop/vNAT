@@ -78,7 +78,8 @@ Always run `zig build test`. For port/forwarding changes, also run
 - The data plane reads immutable snapshots (FIB, bridge table, ruleset) swapped
   by the control plane; no locks on lookup.
 - A port belongs to at most one bridge or router zone.
-- No packet is forwarded back out of its ingress port (bridge flood excepted).
+- No packet is forwarded back out of its ingress port (bridge flood and
+  hairpin NAT excepted).
 - Forwarded IPv4 packets are re-checksummed in software; never trust offload
   metadata across ports (ADR-007).
 - Default inbound/forward policy is drop.

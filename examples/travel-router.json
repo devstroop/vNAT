@@ -2,6 +2,7 @@
   "version": 1,
   "instance": "travel-router",
   "log": { "level": "info", "format": "text" },
+  "lease_db": "/var/lib/vnat/leases.json",
   "ports": {
     "wan": { "kind": "l3", "device": "eth0" },
     "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 },

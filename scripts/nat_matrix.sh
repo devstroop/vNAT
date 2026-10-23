@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NAT matrix: SNAT/masquerade for UDP, ICMP echo and TCP, including source
-# port preservation and collision allocation. DNAT/hairpin land in the next
-# R3 increment.
+# port preservation and collision allocation; DNAT/port forwarding and
+# hairpin NAT.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,19 +31,24 @@ CFG="$WORK/vnat-nat.json"
 LOG="$WORK/vnatd.log"
 UDP_LOG="$WORK/udp.log"
 HTTP_LOG="$WORK/http.log"
+HTTP2_LOG="$WORK/http2.log"
 
 vpid=""
 udp_pid=""
 http_pid=""
+http2_pid=""
 pidA=""
 pidB=""
+pidC=""
 
 cleanup() {
+    [ -n "$http2_pid" ] && kill "$http2_pid" 2>/dev/null || true
     [ -n "$http_pid" ] && kill "$http_pid" 2>/dev/null || true
     [ -n "$udp_pid" ] && kill "$udp_pid" 2>/dev/null || true
     [ -n "$vpid" ] && kill -TERM "$vpid" 2>/dev/null || true
     [ -n "$pidA" ] && kill "$pidA" 2>/dev/null || true
     [ -n "$pidB" ] && kill "$pidB" 2>/dev/null || true
+    [ -n "$pidC" ] && kill "$pidC" 2>/dev/null || true
     wait 2>/dev/null || true
     rm -rf "$WORK"
 }
@@ -68,22 +73,39 @@ cat > "$CFG" <<'EOF'
   "version": 1,
   "instance": "nat-test",
   "ports": {
-    "lan": { "kind": "l2", "device": "ra" },
+    "lan": { "kind": "l2", "device": "lan0" },
     "wan": { "kind": "l2", "device": "rb" }
   },
   "interfaces": {
     "lan0": { "port": "lan", "address": "10.0.1.1/24" },
     "wan0": { "port": "wan", "address": "10.0.2.1/24" }
   },
-  "nat": { "masquerade": [ { "out": "wan0" } ] }
+  "nat": {
+    "masquerade": [ { "out": "wan0" } ],
+    "port_forward": [
+      { "proto": "tcp", "ext_port": 8080, "to": "10.0.1.10:8000" },
+      { "proto": "tcp", "ext_port": 8081, "to": "10.0.1.10:8000" },
+      { "proto": "udp", "ext_port": 8082, "to": "10.0.1.10:8001" }
+    ]
+  }
 }
 EOF
 
 log "topology"
 ip link set lo up
-ip link add ra type veth peer name a0 || die "create veth pair ra/a0"
+ip link add lan-br type veth peer name lan0 || die "create veth pair lan-br/lan0"
+ip link add a-br type veth peer name a0 || die "create veth pair a-br/a0"
 ip link add rb type veth peer name b0 || die "create veth pair rb/b0"
-ip link set ra up
+ip link add c-br type veth peer name c0 || die "create veth pair c-br/c0"
+ip link add br-lan type bridge || die "create lan bridge"
+ip link set lan-br master br-lan || die "attach lan-br to lan bridge"
+ip link set a-br master br-lan || die "attach a-br to lan bridge"
+ip link set c-br master br-lan || die "attach c-br to lan bridge"
+ip link set br-lan up
+ip link set lan-br up
+ip link set a-br up
+ip link set c-br up
+ip link set lan0 up
 ip link set rb up
 
 start_host() {
@@ -104,20 +126,23 @@ start_host() {
 
 pidA="$(start_host a0 10.0.1.2 10.0.1.1 "$WORK/a.ready")"
 pidB="$(start_host b0 10.0.2.2 10.0.2.1 "$WORK/b.ready")"
+pidC="$(start_host c0 10.0.1.10 10.0.1.1 "$WORK/c.ready")"
 
 ip link set a0 netns "$pidA" || die "move a0 into client"
 ip link set b0 netns "$pidB" || die "move b0 into server"
+ip link set c0 netns "$pidC" || die "move c0 into target"
 
 for i in $(seq 1 250); do
-    [ -f "$WORK/a.ready" ] && [ -f "$WORK/b.ready" ] && break
+    [ -f "$WORK/a.ready" ] && [ -f "$WORK/b.ready" ] && [ -f "$WORK/c.ready" ] && break
     sleep 0.02
 done
 [ -f "$WORK/a.ready" ] || die "client did not configure"
 [ -f "$WORK/b.ready" ] || die "server did not configure"
+[ -f "$WORK/c.ready" ] || die "target did not configure"
 
 # A second address on the client exercises colliding source ports behind SNAT.
 nsenter -t "$pidA" -n ip addr add 10.0.1.3/24 dev eth0 || die "add second client address"
-ok "client 10.0.1.2/.3 and server 10.0.2.2"
+ok "client 10.0.1.2/.3, target 10.0.1.10 and server 10.0.2.2"
 
 log "vnatd"
 "$BIN/vnatd" -c "$CFG" >"$LOG" 2>&1 &
@@ -237,6 +262,106 @@ done
 }
 ok "tcp 10.0.1.2 -> 10.0.2.2:8080 (http 200)"
 
+icmp_error_probe() {
+    local ns_pid="$1" src="$2" dst="$3" dport="$4"
+    nsenter -t "$ns_pid" -n python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 0))
+s.settimeout(4)
+s.connect((sys.argv[2], int(sys.argv[3])))
+s.send(b"probe")
+try:
+    s.recv(2048)
+    print("no-error")
+except ConnectionRefusedError:
+    print("refused")
+except OSError as e:
+    print("error:%s" % e.errno)
+' "$src" "$dst" "$dport"
+}
+
+log "snat icmp error"
+snat_err="$(icmp_error_probe "$pidA" 10.0.1.2 10.0.2.2 9998)" || {
+    cat "$LOG"
+    die "snat icmp error probe failed"
+}
+case "$snat_err" in
+    refused|error:111) ;;
+    *) die "snat icmp error not translated: $snat_err" ;;
+esac
+ok "icmp error 10.0.2.2 -> 10.0.1.2 (snat reverse)"
+
+log "dnat icmp error"
+dnat_err="$(icmp_error_probe "$pidB" 10.0.2.2 10.0.2.1 8082)" || {
+    cat "$LOG"
+    die "dnat icmp error probe failed"
+}
+case "$dnat_err" in
+    refused|error:111) ;;
+    *) die "dnat icmp error not translated: $dnat_err" ;;
+esac
+ok "icmp error 10.0.1.10 -> 10.0.2.2 (dnat reverse)"
+
+log "internal http server"
+nsenter -t "$pidC" -n python3 -m http.server 8000 --bind 10.0.1.10 >"$HTTP2_LOG" 2>&1 &
+http2_pid=$!
+
+for i in $(seq 1 100); do
+    nsenter -t "$pidC" -n ss -ltn 2>/dev/null | grep -q ':8000' && break
+    if ! kill -0 "$http2_pid" 2>/dev/null; then
+        cat "$HTTP2_LOG"
+        die "internal http server exited"
+    fi
+    sleep 0.02
+done
+nsenter -t "$pidC" -n ss -ltn 2>/dev/null | grep -q ':8000' || {
+    cat "$HTTP2_LOG"
+    die "internal http server did not bind"
+}
+
+http_probe() {
+    local ns_pid="$1" host="$2" port="$3"
+    timeout 5 nsenter -t "$ns_pid" -n bash -c '
+        exec 3<>/dev/tcp/"$1"/"$2" || exit 1
+        printf "GET / HTTP/1.0\r\n\r\n" >&3
+        IFS= read -r -t 3 line <&3 || exit 1
+        case "$line" in HTTP/1.*200*) exit 0;; *) exit 1;; esac
+    ' _ "$host" "$port" 2>/dev/null
+}
+
+log "dnat wan -> internal"
+dnat_ok=0
+for i in $(seq 1 10); do
+    if http_probe "$pidB" 10.0.2.1 8081; then
+        dnat_ok=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$dnat_ok" = "1" ] || {
+    cat "$HTTP2_LOG"
+    tail -20 "$LOG"
+    die "dnat request failed"
+}
+ok "dnat 10.0.2.2 -> 10.0.2.1:8081 -> 10.0.1.10:8000 (http 200)"
+
+log "hairpin dnat"
+hairpin_ok=0
+for i in $(seq 1 10); do
+    if http_probe "$pidA" 10.0.2.1 8080; then
+        hairpin_ok=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$hairpin_ok" = "1" ] || {
+    cat "$HTTP2_LOG"
+    tail -20 "$LOG"
+    die "hairpin request failed"
+}
+ok "hairpin 10.0.1.2 -> 10.0.2.1:8080 -> 10.0.1.10:8000 (http 200)"
+
 kill -0 "$vpid" 2>/dev/null || die "vnatd exited during test"
 kill -TERM "$vpid"
 for i in $(seq 1 100); do
@@ -255,4 +380,12 @@ grep -q "snat=[1-9]" "$LOG" || {
     cat "$LOG"
     die "snat did not translate packets"
 }
-ok "conntrack and snat counters: $(grep 'stopping instance' "$LOG" | tail -1)"
+grep -q "dnat=[1-9]" "$LOG" || {
+    cat "$LOG"
+    die "dnat did not translate packets"
+}
+grep -q "icmp=[1-9]" "$LOG" || {
+    cat "$LOG"
+    die "icmp errors were not translated"
+}
+ok "conntrack, snat, dnat and icmp counters: $(grep 'stopping instance' "$LOG" | tail -1)"

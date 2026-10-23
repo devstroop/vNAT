@@ -261,13 +261,27 @@ vnat nat add port-forward --proto udp --ext-port 51820 --to 10.10.0.7:51820
 - SNAT/masquerade applies to TCP, UDP and ICMP echo. The original source port
   is preserved when free; collisions use a deterministic hash/probe from
   1024–65535. Mapping is per flow (endpoint-independent mapping is deferred).
-- ICMP echo identifiers are translated; ICMP errors are not translated yet.
+- ICMP echo identifiers are translated. ICMP errors quoting a tracked NAT
+  flow are translated on the reverse path: outer and quoted IP addresses and
+  L4 ports are restored, and the quoted IP/L4 checksums are adjusted
+  incrementally (RFC 1624) so the ICMP payload remains valid.
 - Masquerade `out` must resolve to a static interface address. DHCP uplinks
   fail with `InvalidArgument` until R4.
-- Fragments and non-echo ICMP on an egress with masquerade are dropped and
-  counted (`nat_unsupported`) rather than leaking private sources.
-- Checksums are recomputed in full after NAT; incremental updates are pending.
-- DNAT/port forwarding and hairpin are not implemented yet.
+- Fragments and unrelated or non-echo ICMP on an egress with masquerade are
+  dropped and counted (`nat_unsupported`) rather than leaking private sources.
+  Translated ICMP errors are matched by a separate translated-key index.
+- DNAT/port forwarding matches TCP/UDP on a local destination address and the
+  configured external port; it rewrites the destination and records a reverse
+  key. ICMP port forwards are rejected by validation.
+- Hairpin NAT is applied when the DNAT target routes back out the ingress port:
+  the source is rewritten to the egress local address and the reply reverses
+  both translations. This is the one intentional exception to "never forward
+  back out the ingress port".
+- Port forwards apply to any local address (the config has no `out` field);
+  firewall policy must keep this from shadowing router-local services.
+- Checksums are recomputed in full after ordinary NAT rewrites; ICMP-error
+  quoted IP/L4 checksums use incremental adjustment because only the quoted
+  header is present.
 
 ### 5.5 Out of scope
 
@@ -302,6 +316,16 @@ Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
 - DHCP relay: out of scope v1.
 - DHCPv6/RA: v1.1.
 
+### 7.1 R4 implementation notes (current)
+
+- Implemented: pool allocation, MAC reservations, options 1/3/6/15/26/28/42,
+  OFFER/ACK/NAK/DECLINE/RELEASE/INFORM, offer/decline timers and optional
+  `lease_db` persistence (atomic JSON, restored on start).
+- The server is userspace-only: `vnatd` intercepts UDP/67 on configured ports
+  and sends replies through the L2 egress path.
+- Not yet implemented: ARP conflict probe before OFFER, client-id lease
+  identity, DHCP relay, DHCP client on the uplink.
+
 ## 8. DNS
 
 - Forwarder over UDP (TCP fallback), per-network upstreams.
@@ -310,6 +334,16 @@ Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
 - Split DNS by domain suffix.
 - DoH/DoT: later.
 - Serves DHCP-advertised DNS; binds to router addresses only.
+
+### 8.1 R4 implementation notes (current)
+
+- Implemented: UDP listener, upstream pool with per-query retry, positive TTL
+  cache, basic negative caching, `max_entries`, SERVFAIL on upstream failure.
+- The listener is a kernel UDP socket bound to `dns.listen`; `vnatd` does not
+  assign interface addresses itself, so the address must already exist
+  (`vnat iface set <dev> <cidr>` or the host network manager).
+- Not yet implemented: client TCP listener, upstream TCP fallback, split
+  zones, local `vnat.`/`router.vnat.` status zone, DoH/DoT.
 
 ## 9. Control plane
 
@@ -323,6 +357,7 @@ machine-checked configs live in `examples/`):
   "version": 1,
   "instance": "travel-router",
   "log": { "level": "info", "format": "json" },
+  "lease_db": "/var/lib/vnat/leases.json",
   "ports": {
     "uplink":  { "kind": "l2", "device": "wlan0" },
     "lan":     { "kind": "l2", "device": "usb0" },
@@ -345,9 +380,23 @@ machine-checked configs live in `examples/`):
     ]
   },
   "dhcp": [
-    { "iface": "lan0", "pool": "10.10.0.100-10.10.0.200", "lease": "12h" }
+    {
+      "iface": "lan0",
+      "pool": "10.10.0.100-10.10.0.200",
+      "lease": "12h",
+      "domain": "lan.example",
+      "mtu": 1400,
+      "reservations": [
+        { "mac": "02:00:00:00:00:10", "ip": "10.10.0.50" }
+      ]
+    }
   ],
-  "dns": { "upstreams": ["1.1.1.1", "9.9.9.9"], "cache": true },
+  "dns": {
+    "upstreams": ["1.1.1.1", "9.9.9.9"],
+    "cache": true,
+    "listen": "10.10.0.1",
+    "max_entries": 1024
+  },
   "firewall": { "default_in": "drop", "default_forward": "drop" }
 }
 ```

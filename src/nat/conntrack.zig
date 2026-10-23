@@ -42,13 +42,16 @@ pub const FlowKey = struct {
 };
 
 pub const Nat = struct {
-    snat_addr: types.Ipv4,
-    snat_port: u16,
+    snat_addr: ?types.Ipv4 = null,
+    snat_port: u16 = 0,
+    dnat_addr: ?types.Ipv4 = null,
+    dnat_port: u16 = 0,
 };
 
 pub const Entry = struct {
     original: FlowKey,
     reply: FlowKey,
+    translated: ?FlowKey = null,
     nat: ?Nat = null,
     state: State = .new,
     created_ms: i64,
@@ -104,6 +107,7 @@ pub const Conntrack = struct {
     entries: std.ArrayListUnmanaged(?Entry) = .empty,
     free: std.ArrayListUnmanaged(u32) = .empty,
     keys: std.AutoHashMapUnmanaged(u192, u32) = .empty,
+    translated_keys: std.AutoHashMapUnmanaged(u192, u32) = .empty,
     ports: std.AutoHashMapUnmanaged(u64, void) = .empty,
     max_entries: u32,
     count: u32 = 0,
@@ -118,6 +122,7 @@ pub const Conntrack = struct {
         try self.entries.ensureTotalCapacity(gpa, max_entries);
         try self.free.ensureTotalCapacity(gpa, max_entries);
         try self.keys.ensureTotalCapacity(gpa, max_entries * 2);
+        try self.translated_keys.ensureTotalCapacity(gpa, max_entries);
         try self.ports.ensureTotalCapacity(gpa, max_entries);
         return self;
     }
@@ -126,6 +131,7 @@ pub const Conntrack = struct {
         self.entries.deinit(self.gpa);
         self.free.deinit(self.gpa);
         self.keys.deinit(self.gpa);
+        self.translated_keys.deinit(self.gpa);
         self.ports.deinit(self.gpa);
     }
 
@@ -146,6 +152,18 @@ pub const Conntrack = struct {
         now_ms: i64,
         timeout_ms: i64,
     ) Error!*Entry {
+        return self.createMapped(original, reply, null, nat, now_ms, timeout_ms);
+    }
+
+    pub fn createMapped(
+        self: *Conntrack,
+        original: FlowKey,
+        reply: FlowKey,
+        translated: ?FlowKey,
+        nat: ?Nat,
+        now_ms: i64,
+        timeout_ms: i64,
+    ) Error!*Entry {
         if (self.count >= self.max_entries) {
             self.counters.table_full += 1;
             return error.TableFull;
@@ -156,6 +174,15 @@ pub const Conntrack = struct {
         if (self.keys.contains(original_packed) or self.keys.contains(reply_packed)) {
             self.counters.key_conflict += 1;
             return error.KeyConflict;
+        }
+        if (translated) |key| {
+            const translated_packed = pack(key);
+            if (self.keys.contains(translated_packed) or
+                self.translated_keys.contains(translated_packed))
+            {
+                self.counters.key_conflict += 1;
+                return error.KeyConflict;
+            }
         }
 
         const index: u32 = if (self.free.items.len > 0)
@@ -169,10 +196,12 @@ pub const Conntrack = struct {
 
         self.keys.putAssumeCapacity(original_packed, index);
         self.keys.putAssumeCapacity(reply_packed, index);
+        if (translated) |key| self.translated_keys.putAssumeCapacity(pack(key), index);
 
         self.entries.items[index] = .{
             .original = original,
             .reply = reply,
+            .translated = translated,
             .nat = nat,
             .state = if (original.proto == 6) .new else .established,
             .created_ms = now_ms,
@@ -182,6 +211,11 @@ pub const Conntrack = struct {
         self.count += 1;
         self.counters.created += 1;
         return &self.entries.items[index].?;
+    }
+
+    pub fn lookupTranslated(self: *Conntrack, key: FlowKey) ?*Entry {
+        const index = self.translated_keys.get(pack(key)) orelse return null;
+        return if (self.entries.items[index]) |*entry| entry else null;
     }
 
     pub fn touch(self: *Conntrack, entry: *Entry, now_ms: i64, timeout_ms: i64) void {
@@ -247,7 +281,10 @@ pub const Conntrack = struct {
         const entry = if (self.entries.items[index]) |*value| value else return;
         _ = self.keys.remove(pack(entry.original));
         _ = self.keys.remove(pack(entry.reply));
-        if (entry.nat) |nat| self.freePort(entry.original.proto, nat.snat_addr, nat.snat_port);
+        if (entry.translated) |key| _ = self.translated_keys.remove(pack(key));
+        if (entry.nat) |nat| {
+            if (nat.snat_addr) |addr| self.freePort(entry.original.proto, addr, nat.snat_port);
+        }
         self.entries.items[index] = null;
         self.free.appendAssumeCapacity(index);
         self.count -= 1;
@@ -363,4 +400,24 @@ test "zone separates otherwise identical tuples" {
     var wrong = original;
     wrong.zone = 2;
     try testing.expect(ct.lookup(wrong) == null);
+}
+
+test "translated lookup maps post-nat packets" {
+    var ct = try Conntrack.init(testing.allocator, 4);
+    defer ct.deinit();
+
+    const original = tcpKey("10.0.1.2", 40000, "10.0.2.2", 80);
+    const reply = tcpKey("10.0.2.2", 80, "10.0.2.1", 40000);
+    const translated = tcpKey("10.0.2.1", 40000, "10.0.2.2", 80);
+    const entry = try ct.createMapped(original, reply, translated, .{
+        .snat_addr = testIp("10.0.2.1"),
+        .snat_port = 40000,
+    }, 1_000, tcp_established_ms);
+
+    try testing.expectEqual(entry, ct.lookupTranslated(translated).?);
+    try testing.expect(ct.lookup(translated) == null);
+    try testing.expect(ct.lookup(original) != null);
+
+    ct.remove(entry);
+    try testing.expect(ct.lookupTranslated(translated) == null);
 }

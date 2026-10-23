@@ -1,6 +1,6 @@
 # ADR-005 — Conntrack and NAT design
 
-- **Status:** Accepted (R3 subset; DNAT/hairpin/ICMP errors follow)
+- **Status:** Accepted (R3 subset; full TCP FSM and sharding follow)
 - **Date:** 2026-10-22
 - **Depends on:** ADR-002 (userspace reference datapath)
 
@@ -94,11 +94,18 @@ GC runs every second; a sweep is O(expired), not O(table).
 - SNAT covers TCP, UDP and ICMP echo. Source ports are preserved when free and
   allocated by hash/probe otherwise. Mapping is per flow, not yet
   endpoint-independent.
-- ICMP echo identifiers are translated; ICMP errors are not.
+- ICMP echo identifiers are translated. ICMP errors quoting a tracked NAT flow
+  are reverse-translated: the outer and quoted IP/L4 tuples are restored and
+  the quoted IP/L4 checksums are adjusted incrementally (RFC 1624). A separate
+  translated-key index avoids confusing post-NAT packets with original flows.
 - Masquerade requires a static egress address until DHCP lands (R4).
 - Fragments and non-echo ICMP on a SNAT egress are dropped and counted.
-- Checksums are recomputed in full; incremental updates are pending.
-- DNAT, port forwarding and hairpin are next.
+- DNAT/port forwarding covers TCP/UDP and matches a local destination address
+  plus external port; ICMP port forwards are rejected.
+- Hairpin NAT rewrites the source to the egress local address when the DNAT
+  target routes back out the ingress port and reverses both translations.
+- Ordinary NAT rewrites recompute checksums in full; ICMP-error quoted
+  checksums use incremental adjustment. Full incremental updates are pending.
 
 ## Consequences
 

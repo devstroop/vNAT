@@ -143,7 +143,12 @@ fn validateNat(cfg: *const schema.Config) ConfigError!void {
     for (cfg.nat.port_forward) |f| {
         if (f.proto == .icmp) return error.InvalidValue;
         if (f.ext_port == 0) return error.InvalidValue;
-        _ = types.parseIpPort(f.to) catch return error.InvalidValue;
+        const to = types.parseIpPort(f.to) catch return error.InvalidValue;
+        if (to.ip.isUnspecified() or to.ip.isMulticast() or
+            to.ip.eql(types.Ipv4.limited_broadcast))
+        {
+            return error.InvalidValue;
+        }
     }
 }
 
@@ -171,6 +176,35 @@ fn validateDhcp(cfg: *const schema.Config) ConfigError!void {
         if (d.dns) |dns| {
             _ = types.Ipv4.parse(dns) catch return error.InvalidValue;
         }
+        if (d.domain) |domain| {
+            if (domain.len == 0 or domain.len > 255) return error.InvalidValue;
+            for (domain) |c| {
+                if (c == 0 or c == ' ') return error.InvalidValue;
+            }
+        }
+        if (d.mtu) |mtu| {
+            if (mtu < 576 or mtu > 9000) return error.InvalidValue;
+        }
+        if (d.ntp) |ntp| {
+            _ = types.Ipv4.parse(ntp) catch return error.InvalidValue;
+        }
+
+        for (d.reservations, 0..) |reservation, i| {
+            const mac = types.Mac.parse(reservation.mac) catch return error.InvalidValue;
+            const ip = types.Ipv4.parse(reservation.ip) catch return error.InvalidValue;
+            if (mac.isZero() or mac.isMulticast() or mac.isBroadcast()) return error.InvalidValue;
+            if (!prefix.contains(ip)) return error.InvalidValue;
+            if (ip.eql(prefix.addr)) return error.InvalidValue;
+            if (prefix.len < 31) {
+                const network = prefix.network().value;
+                const broadcast = network | ~prefix.mask();
+                if (ip.value == network or ip.value == broadcast) return error.InvalidValue;
+            }
+            for (d.reservations[0..i]) |other| {
+                if (std.mem.eql(u8, reservation.mac, other.mac)) return error.InvalidValue;
+                if (std.mem.eql(u8, reservation.ip, other.ip)) return error.InvalidValue;
+            }
+        }
     }
 }
 
@@ -180,6 +214,16 @@ fn validateDns(cfg: *const schema.Config) ConfigError!void {
     }
     if (cfg.dns.listen) |listen| {
         _ = types.Ipv4.parse(listen) catch return error.InvalidValue;
+    } else if (cfg.dns.upstreams.len != 0) {
+        return error.InvalidValue;
+    }
+    if (cfg.dns.max_entries == 0 or cfg.dns.max_entries > 1_000_000) {
+        return error.InvalidValue;
+    }
+    if (cfg.lease_db) |path| {
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) {
+            return error.InvalidValue;
+        }
     }
 }
 
@@ -311,6 +355,74 @@ test "rejects cross-map duplicate name" {
 test "rejects path separators in instance" {
     const input =
         \\{ "version": 1, "instance": "a/b" }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "accepts dhcp reservations and options" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "interfaces": { "lan0": { "port": "lan", "address": "10.10.0.1/24" } },
+        \\  "dhcp": [ {
+        \\    "iface": "lan0", "pool": "10.10.0.100-10.10.0.200",
+        \\    "domain": "lan.example", "mtu": 1400, "ntp": "10.10.0.1",
+        \\    "reservations": [
+        \\      { "mac": "02:00:00:00:00:02", "ip": "10.10.0.50" }
+        \\    ] } ] }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try validate(&parsed.config);
+}
+
+test "rejects duplicate dhcp reservations" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "interfaces": { "lan0": { "port": "lan", "address": "10.10.0.1/24" } },
+        \\  "dhcp": [ {
+        \\    "iface": "lan0", "pool": "10.10.0.100-10.10.0.200",
+        \\    "reservations": [
+        \\      { "mac": "02:00:00:00:00:02", "ip": "10.10.0.50" },
+        \\      { "mac": "02:00:00:00:00:02", "ip": "10.10.0.51" }
+        \\    ] } ] }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects dhcp reservation outside subnet" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "interfaces": { "lan0": { "port": "lan", "address": "10.10.0.1/24" } },
+        \\  "dhcp": [ {
+        \\    "iface": "lan0", "pool": "10.10.0.100-10.10.0.200",
+        \\    "reservations": [
+        \\      { "mac": "02:00:00:00:00:02", "ip": "10.20.0.50" }
+        \\    ] } ] }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "accepts a lease database path" {
+    const input =
+        \\{ "version": 1, "instance": "x", "lease_db": "/var/lib/vnat/leases.json" }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try validate(&parsed.config);
+}
+
+test "rejects an empty lease database path" {
+    const input =
+        \\{ "version": 1, "instance": "x", "lease_db": "" }
     ;
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();

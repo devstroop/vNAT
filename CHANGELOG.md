@@ -48,7 +48,24 @@ All notable changes to vNAT are documented here. The format follows
 - `scripts/test_journal.sh`: address/route/link mutations, duplicate no-ops,
   unmanaged-delete rejection, pre-existing state preservation and rollback.
 
-### R3 — NAT and conntrack (in progress)
+### R4 — DHCP and DNS (in progress)
+
+- DHCPv4 server in the forwarding path: pool allocation, MAC reservations,
+  OFFER/ACK/NAK, DECLINE quarantine, RELEASE/INFORM, configurable lease time,
+  domain, MTU, NTP and DNS options.
+- Optional atomic lease database (`lease_db`): active bindings are restored
+  on start, expired/conflicting records are ignored, and the file is rewritten
+  every 60 s and on shutdown.
+- UDP DNS forwarder with upstream retry, TTL cache, basic negative caching,
+  configurable cache size (`dns.max_entries`) and counters.
+- `scripts/test_dhcp.sh`: raw Ethernet DHCP client obtains a lease, pings the
+  router and verifies persistence across a daemon restart.
+- `scripts/test_dns.sh`: query through `vnatd`, answer from the fake upstream,
+  then a cache hit; both tests run in CI.
+- Not yet: DHCP ARP conflict probe, DHCP client on the uplink, DNS over TCP,
+  split zones, local status zone, and DHCP/DNS CLI verbs.
+
+### R3 — NAT and conntrack
 
 - Userspace conntrack table: both-direction 5-tuple keys, TCP new/established/
   closing timeouts, UDP/ICMP/generic timeouts, 1 s GC, 65,536-entry cap and
@@ -58,11 +75,18 @@ All notable changes to vNAT are documented here. The format follows
   translation and full IP/L4 checksum recompute.
 - Forwarded TCP/UDP/ICMP-echo flows are tracked even without NAT; replies to a
   NAT address are reverse-translated before local delivery.
-- `scripts/nat_matrix.sh`: UDP source-port preservation and collision,
-  ICMP echo, and TCP HTTP through masquerade.
+- DNAT/port forwarding for TCP/UDP with reverse translation; hairpin NAT SNATs
+  back out the ingress port when the target is on the same segment.
+- ICMP-error translation for tracked NAT flows: outer and quoted tuples are
+  restored and quoted IP/L4 checksums are adjusted incrementally (RFC 1624).
+- A translated-key conntrack index maps post-NAT packets back to their flow
+  without colliding with original/reply keys.
+- `scripts/nat_matrix.sh`: UDP source-port preservation and collision, ICMP
+  echo, TCP HTTP through masquerade, WAN-to-internal DNAT, hairpin DNAT and
+  SNAT/DNAT ICMP-error translation.
 - Masquerade currently requires a static egress address (DHCP in R4); fragments
   and non-echo ICMP on SNAT egress are dropped and counted until translation
-  lands. DNAT, port forwarding and hairpin are next.
+  lands. Full incremental checksum updates for ordinary rewrites are next.
 
 ### R1 — Linux ports
 

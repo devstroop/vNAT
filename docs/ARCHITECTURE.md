@@ -78,13 +78,14 @@ vnat/
 │   │   └── mtu.zig              MSS clamp, PMTU errors
 │   ├── nat/
 │   │   ├── conntrack.zig        5-tuple table, timeouts, GC, port allocator (R3)
-│   │   ├── nat.zig              SNAT rewrite + checksum recompute (R3)
-│   │   ├── dnat.zig             port forwarding, hairpin (R3 next)
-│   │   └── checksum.zig         incremental checksum updates (R3 next)
+│   │   ├── nat.zig              SNAT/DNAT rewrite, ICMP-error checksum adjust (R3)
+│   │   └── checksum.zig         incremental checksum updates (planned)
 │   ├── services/
-│   │   ├── dhcp/server.zig      pool, leases, options, persistence
-│   │   ├── dhcp/client.zig      uplink (optional v1)
-│   │   └── dns/                 forwarder, cache, split zones
+│   │   ├── dhcp/message.zig     wire parser/builder
+│   │   ├── dhcp/server.zig      pool, reservations, options, DECLINE
+│   │   ├── dhcp/leases.zig      atomic JSON lease persistence
+│   │   ├── dhcp/client.zig      uplink (planned)
+│   │   └── dns/                 message, cache, UDP forwarder
 │   ├── firewall/
 │   │   ├── rules.zig            ordered rules, match/actions
 │   │   └── compile.zig          rule set → fast matcher
@@ -198,9 +199,10 @@ egress port write
 **R2 status.** The implemented path is Ethernet (L2) or bare IPv4 (TUN) →
 ARP/IPv4 → FIB → TTL/MTU → neighbor cache/pending queue → egress. It generates
 ICMP errors, writes bare IP back to TUN ports, and repairs TCP/UDP checksums
-in software (ADR-007). R3 adds conntrack before routing, reverse translation
-for replies (including replies addressed to a local NAT IP), and SNAT after
-the FIB/MTU checks. Bridge, firewall and MSS clamping are not yet in the loop.
+in software (ADR-007). R3 adds conntrack before routing, DNAT before the FIB,
+reverse translation for replies (including replies addressed to a local NAT
+IP), and SNAT after the FIB/MTU checks. Hairpin flows SNAT back out the ingress
+port. Bridge, firewall and MSS clamping are not yet in the loop.
 
 ### 3.3 Bridge
 
@@ -263,8 +265,10 @@ pub const CtEntry = struct {
   probes 1024–65535. Ports are released by GC.
 - NAT rewrites recompute IPv4/TCP/UDP/ICMP checksums from scratch (ADR-005
   allows this); incremental updates are an R3 optimization.
-- DNAT/hairpin and ICMP-error translation are not implemented yet; fragments
-  and non-echo ICMP on a SNAT egress are dropped and counted.
+- DNAT/port forwarding and hairpin are implemented for TCP/UDP; ICMP port
+  forwards are rejected. ICMP errors quoting a tracked NAT flow are translated
+  (outer and quoted tuple, RFC 1624 quoted-L4 checksum adjustment); fragments
+  and unrelated or non-echo ICMP on a SNAT egress are dropped and counted.
 
 ### 3.6 Services
 
@@ -406,7 +410,7 @@ Wintun/Npcap, IP Helper, WFP/New-NetNat.
 | Forwarding | Two-host netns ping + TCP (`scripts/test_route.sh`) |
 | TUN | Kernel TUN peer ↔ veth host, ICMP + TCP (`scripts/test_tun.sh`) |
 | Journal | iface/route mutations + `vnat down` (`scripts/test_journal.sh`) |
-| NAT/conntrack | SNAT UDP/ICMP/TCP, port preservation + collision (`scripts/nat_matrix.sh`) |
+| NAT/conntrack | SNAT UDP/ICMP/TCP, DNAT/hairpin (`scripts/nat_matrix.sh`) |
 | NAT matrix | Emulated EIM/EDM, hairpin, port-forward, exhaustion |
 | DHCP/DNS | Client emulators; lease persistence across restart |
 | Crash safety | kill -9, reboot simulation, `vnat doctor` |

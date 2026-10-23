@@ -64,17 +64,27 @@ pub const NatConfig = struct {
     port_forward: []const PortForwardConfig = &.{},
 };
 
+pub const DhcpReservation = struct {
+    mac: []const u8,
+    ip: []const u8,
+};
+
 pub const DhcpConfig = struct {
     iface: []const u8,
     pool: []const u8,
     lease: []const u8 = "12h",
     dns: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    mtu: ?u16 = null,
+    ntp: ?[]const u8 = null,
+    reservations: []const DhcpReservation = &.{},
 };
 
 pub const DnsConfig = struct {
     upstreams: []const []const u8 = &.{},
     cache: bool = true,
     listen: ?[]const u8 = null,
+    max_entries: u32 = 1024,
 };
 
 pub const FirewallAction = enum { accept, drop, reject };
@@ -101,4 +111,6 @@ pub const Config = struct {
     dhcp: []const DhcpConfig = &.{},
     dns: DnsConfig = .{},
     firewall: FirewallConfig = .{},
+    /// Optional path for the persistent DHCP lease database.
+    lease_db: ?[]const u8 = null,
 };

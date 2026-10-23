@@ -82,30 +82,42 @@ ICMP frag-needed is implemented). None block the exit criterion.
       counters (single shard; full FSM and sharding later).
 - [x] SNAT/masquerade with source-port preservation, collision allocation and
       ICMP echo identifier translation.
-- [ ] DNAT/port forwarding + hairpin.
-- [ ] Incremental checksum updates (full recompute is correct but slower).
+- [x] DNAT/port forwarding + hairpin (TCP/UDP; ICMP port forwards rejected).
+- [x] ICMP-error translation for tracked NAT flows (outer + quoted tuple,
+      RFC 1624 quoted-L4 checksum adjustment).
+- [ ] Incremental checksum updates for ordinary NAT rewrites (full recompute
+      is correct but slower).
 - [ ] `vnat nat …`, `vnat conntrack …` (needs the R7 control socket).
 - [x] Exhaustion/limit behavior + counters.
-- [ ] netns matrix: SNAT TCP/UDP/ICMP is covered by `scripts/nat_matrix.sh`;
-      port forwarding and hairpin remain.
+- [x] netns matrix: SNAT TCP/UDP/ICMP, DNAT/hairpin and SNAT/DNAT ICMP-error
+      translation are covered by `scripts/nat_matrix.sh`.
 
-**Status: IN PROGRESS.** Conntrack and SNAT/masquerade are in the datapath
-(`src/nat/`). Masquerade requires a static egress address until R4 DHCP.
-Fragments and non-echo ICMP on SNAT egress are dropped (counted) rather than
-leaked; DNAT/hairpin and ICMP-error translation are next.
+**Status: IN PROGRESS.** Conntrack, SNAT/masquerade, DNAT/port forwarding and
+hairpin NAT are in the datapath (`src/nat/`, `src/l3/forward.zig`). Masquerade
+requires a static egress address until R4 DHCP. Fragments and unrelated or
+non-echo ICMP on SNAT egress are dropped (counted) rather than leaked; full
+incremental checksum updates for ordinary rewrites remain.
 
 **Exit:** LAN hosts reach an external network through vNAT's NAT; inbound port
 forward works; conntrack survives 1 h churn.
 
 ### R4 — DHCP + DNS services (3–4 weeks)
 
-- [ ] DHCPv4 server: pool, reservations, options, lease DB persistence,
-      conflict probe, DECLINE.
+- [x] DHCPv4 server: pool, MAC reservations, options, DECLINE, lease DB
+      persistence and restore.
+- [ ] DHCP conflict probe (ARP before OFFER).
 - [ ] DHCP client on uplink (optional but useful).
-- [ ] DNS forwarder: UDP/TCP, cache, negative cache, upstream pool, split
-      zones, local status zone.
+- [x] DNS forwarder: UDP, TTL cache, negative cache, upstream pool.
+- [ ] DNS TCP listener/upstream fallback, split zones, local status zone.
 - [ ] `vnat dhcp …`, `vnat dns query/stats`.
-- [ ] netns test: client obtains lease + DNS resolution through the router.
+- [x] netns tests: `scripts/test_dhcp.sh` (lease, ping, persistence) and
+      `scripts/test_dns.sh` (query + cache hit).
+
+**Status: IN PROGRESS.** The DHCP server is integrated into the forwarding
+path (no kernel socket) and persists leases when `lease_db` is configured.
+DNS is a UDP forwarder bound to `dns.listen`; it does not yet serve TCP or a
+local status zone. `vnatd` does not apply interface addresses, so DNS requires
+the listen address to exist (use `vnat iface set` first).
 
 **Exit:** `vnat` is a usable travel/home router on Linux: uplink DHCP, LAN
 DHCP + DNS + NAT.

@@ -52,8 +52,14 @@ bash scripts/test_tun.sh
 # Journal/rollback for vnat iface/route mutations
 bash scripts/test_journal.sh
 
-# SNAT/conntrack matrix: UDP, ICMP echo and TCP through masquerade
+# NAT matrix: SNAT UDP/ICMP/TCP, DNAT/port forwarding and hairpin
 bash scripts/nat_matrix.sh
+
+# DHCP server: client lease + ping through the router
+bash scripts/test_dhcp.sh
+
+# DNS forwarder: query, answer and cache hit through vnatd
+bash scripts/test_dns.sh
 ```
 
 ## Read in this order
@@ -87,9 +93,12 @@ QoS shaping, macOS/Windows.
 ## Status
 
 R2 is complete for the IPv4 path (L2 and TUN), including journaled
-`vnat iface`/`vnat route` mutations and `vnat down` rollback. R3 is in progress:
-a userspace conntrack table and SNAT/masquerade for TCP, UDP and ICMP echo are
-in the datapath, with source-port preservation and collision allocation.
-`scripts/test_route.sh`, `test_tun.sh`, `test_journal.sh` and `nat_matrix.sh`
-cover forwarding, TUN, rollback and SNAT. DNAT/port forwarding and hairpin are
-next. See [docs/PLAN.md](docs/PLAN.md).
+`vnat iface`/`vnat route` mutations and `vnat down` rollback. R3 is complete
+for conntrack, SNAT/masquerade, DNAT/port forwarding with hairpin NAT, and
+ICMP-error translation. R4 is in progress: the userspace DHCPv4 server
+(reservations, options, DECLINE, optional lease DB) and a UDP DNS forwarder
+with a TTL cache are integrated into `vnatd`; uplink DHCP, DNS TCP/split
+zones and the DHCP/DNS CLI verbs are still open.
+`scripts/test_route.sh`, `test_tun.sh`, `test_journal.sh`, `nat_matrix.sh`,
+`test_dhcp.sh` and `test_dns.sh` cover forwarding, TUN, rollback, NAT,
+DHCP and DNS. See [docs/PLAN.md](docs/PLAN.md).

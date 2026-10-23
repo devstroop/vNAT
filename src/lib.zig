@@ -33,6 +33,12 @@ pub const conntrack = @import("nat/conntrack.zig");
 pub const nat = @import("nat/nat.zig");
 pub const icmp = @import("l3/icmp.zig");
 pub const forward = @import("l3/forward.zig");
+pub const dhcp_message = @import("services/dhcp/message.zig");
+pub const dhcp_server = @import("services/dhcp/server.zig");
+pub const dhcp_leases = @import("services/dhcp/leases.zig");
+pub const dns_message = @import("services/dns/message.zig");
+pub const dns_cache = @import("services/dns/cache.zig");
+pub const dns_service = @import("services/dns/service.zig");
 
 pub const linux_ports = if (builtin.os.tag == .linux)
     @import("port/linux/root.zig")
@@ -70,6 +76,12 @@ test {
     _ = @import("nat/nat.zig");
     _ = @import("l3/icmp.zig");
     _ = @import("l3/forward.zig");
+    _ = @import("services/dhcp/message.zig");
+    _ = @import("services/dhcp/server.zig");
+    _ = @import("services/dhcp/leases.zig");
+    _ = @import("services/dns/message.zig");
+    _ = @import("services/dns/cache.zig");
+    _ = @import("services/dns/service.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("port/linux/root.zig");
         _ = @import("port/manager.zig");
