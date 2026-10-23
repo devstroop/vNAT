@@ -1134,7 +1134,6 @@ pub const Forwarder = struct {
         return null;
     }
 
-
     fn sendArpProbe(self: *Forwarder, io: std.Io, port: types.PortId, ip: types.Ipv4) PortError!void {
         const port_mac = self.portMac(port);
         var arp_buf: [28]u8 = undefined;

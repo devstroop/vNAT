@@ -4,6 +4,20 @@ const vnat = @import("vnat");
 const max_config_bytes = 4 * 1024 * 1024;
 const default_config = "/etc/vnat/vnat.json";
 
+const DhcpLeaseWire = struct {
+    server: []const u8,
+    port: u32,
+    ip: []const u8,
+    mac: []const u8,
+    state: []const u8,
+    expires_ms: i64,
+};
+
+const DhcpLeaseDbWire = struct {
+    version: u32,
+    leases: []const DhcpLeaseWire,
+};
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buf: [256]u8 = undefined;
@@ -92,6 +106,16 @@ fn run(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "selftest")) {
         const code = try selfTest(io, gpa, args[2..]);
         if (code != 0) std.process.exit(code);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "dhcp")) {
+        try dhcpCommand(init, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "dns")) {
+        try dnsCommand(init, args[2..]);
         return;
     }
 
@@ -642,6 +666,166 @@ fn readMatching(
 
 fn readConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes));
+}
+
+fn dhcpCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len < 1 or !std.mem.eql(u8, cfg.rest[0], "status")) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    const db_path = parsed.config.lease_db orelse {
+        try print(io, gpa, "no lease database configured\n", .{});
+        return;
+    };
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, db_path, gpa, .limited(8 * 1024 * 1024)) catch |err| {
+        try printErr(io, gpa, "cannot read {s}: {s}\n", .{ db_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer gpa.free(data);
+
+    var parsed_db = std.json.parseFromSlice(DhcpLeaseDbWire, gpa, data, .{}) catch |err| {
+        try printErr(io, gpa, "invalid lease db {s}: {s}\n", .{ db_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed_db.deinit();
+
+    if (parsed_db.value.leases.len == 0) {
+        try print(io, gpa, "no leases\n", .{});
+        return;
+    }
+    for (parsed_db.value.leases) |lease| {
+        try print(io, gpa, "{s} port={d} mac={s} state={s} expires_ms={d}\n", .{
+            lease.ip,
+            lease.port,
+            lease.mac,
+            lease.state,
+            lease.expires_ms,
+        });
+    }
+}
+
+fn dnsCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len < 2 or !std.mem.eql(u8, cfg.rest[0], "query")) {
+        try usage(io);
+        std.process.exit(2);
+    }
+    const name = cfg.rest[1];
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    const listen_text = parsed.config.dns.listen orelse "127.0.0.1";
+    const listen_ip = vnat.types.Ipv4.parse(listen_text) catch {
+        try printErr(io, gpa, "invalid dns listen address\n", .{});
+        std.process.exit(1);
+    };
+
+    var qbuf: [512]u8 = undefined;
+    @memset(qbuf[0..12], 0);
+    std.mem.writeInt(u16, qbuf[0..2], 0x1234, .big);
+    std.mem.writeInt(u16, qbuf[4..6], 1, .big);
+    var pos: usize = 12;
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |label| {
+        if (label.len == 0) continue;
+        if (pos + 1 + label.len + 4 > qbuf.len) {
+            try printErr(io, gpa, "name too long\n", .{});
+            std.process.exit(1);
+        }
+        qbuf[pos] = @intCast(label.len);
+        pos += 1;
+        @memcpy(qbuf[pos..][0..label.len], label);
+        pos += label.len;
+    }
+    qbuf[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u16, qbuf[pos..][0..2], 1, .big);
+    pos += 2;
+    std.mem.writeInt(u16, qbuf[pos..][0..2], 1, .big);
+    pos += 2;
+    const query = qbuf[0..pos];
+
+    const dest = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = listen_ip.toBytes(),
+        .port = 53,
+    } };
+    const local = std.Io.net.IpAddress{ .ip4 = .unspecified(0) };
+    var sock = local.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
+        try printErr(io, gpa, "bind: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer sock.close(io);
+    sock.send(io, &dest, query) catch |err| {
+        try printErr(io, gpa, "send: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var rbuf: [512]u8 = undefined;
+    const timeout = std.Io.Timeout{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(5000),
+        .clock = .awake,
+    } };
+    const incoming = sock.receiveTimeout(io, &rbuf, timeout) catch |err| {
+        try printErr(io, gpa, "receive: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const data = incoming.data;
+
+    if (data.len < 12) {
+        try printErr(io, gpa, "short response\n", .{});
+        std.process.exit(1);
+    }
+    const ancount = std.mem.readInt(u16, data[6..8], .big);
+    if (ancount == 0) {
+        try print(io, gpa, "no answer\n", .{});
+        return;
+    }
+
+    // Skip header and question.
+    var i: usize = 12;
+    while (i < data.len and data[i] != 0) : (i += 1 + data[i]) {}
+    i += 5; // null + qtype + qclass
+    if (i + 12 > data.len) {
+        try printErr(io, gpa, "truncated response\n", .{});
+        std.process.exit(1);
+    }
+    // Answer: name(2) type(2) class(2) ttl(4) rdlen(2) rdata
+    i += 2; // skip name pointer
+    const rtype = std.mem.readInt(u16, data[i..][0..2], .big);
+    i += 2;
+    i += 2; // class
+    const ttl = std.mem.readInt(u32, data[i..][0..4], .big);
+    i += 4;
+    const rdlen = std.mem.readInt(u16, data[i..][0..2], .big);
+    i += 2;
+    if (rtype == 1 and rdlen == 4 and i + 4 <= data.len) {
+        try print(io, gpa, "{d}.{d}.{d}.{d} (ttl={d})\n", .{
+            data[i],
+            data[i + 1],
+            data[i + 2],
+            data[i + 3],
+            ttl,
+        });
+    } else {
+        try print(io, gpa, "non-A answer\n", .{});
+    }
 }
 
 fn usage(io: std.Io) !void {
