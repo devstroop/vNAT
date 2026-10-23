@@ -391,6 +391,9 @@ Wintun/Npcap, IP Helper, WFP/New-NetNat.
 
 ## 9. Performance
 
+Performance targets are deferred to R9. `scripts/perf.sh` is a smoke test only;
+no throughput or latency claim is made before R9.
+
 - Batch reads/writes (`recvmmsg`/`sendmmsg`, AF_PACKET rings).
 - Per-core buffer pools; no allocation in `read → forward → write`.
 - Checksums: software, vectorized; offload only when negotiated.
@@ -427,5 +430,6 @@ Wintun/Npcap, IP Helper, WFP/New-NetNat.
 | [004](adr/004-overlay-deferred.md) | Overlay/P2P deferred to a future uplink module |
 | [005](adr/005-conntrack-nat.md) | Conntrack/NAT design (port allocation, timeouts) |
 | [006](adr/006-config-journal.md) | Config schema and R2 journal format |
-| 007 | Privilege model |
-| 008 | Threading model |
+| [007](adr/007-userspace-checksum-repair.md) | Repair transport checksums on forwarded IPv4 |
+| 008 (planned) | Privilege model |
+| 009 (planned) | Threading model |

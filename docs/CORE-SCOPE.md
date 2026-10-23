@@ -4,6 +4,17 @@
 > document, it is not in v1.
 > Platform detail: [ANDROID.md](./ANDROID.md). Design: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
+## 0. Status vocabulary
+
+- **implemented**: code exists in `src/`.
+- **tested**: covered by unit or netns tests.
+- **CI-verified**: the test runs in `.github/workflows/ci.yml`.
+- **planned**: specified but not implemented.
+- **deferred**: explicitly postponed to a later milestone.
+
+A capability is only promoted to **tested** or **CI-verified** when the
+corresponding evidence exists.
+
 ## 1. What "router" means here
 
 vNAT is a **userspace L2/L3 forwarding engine**. It opens interfaces directly,

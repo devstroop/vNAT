@@ -127,6 +127,13 @@ Always run `zig build test`. For port/forwarding changes, also run
 - Body explains *why*; reference the RFC/issue.
 - Never commit secrets, keystores, or build artifacts.
 
+## Branching
+
+- `main` is release-ready.
+- `develop` integrates completed work.
+- Feature work uses `feat/*`, fixes `fix/*`, maintenance `chore/*`.
+- Branches merge into `develop`, then `develop` into `main`.
+
 ## Skills available to agents
 
 Installed in `.opencode/skills/`:
