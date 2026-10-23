@@ -24,6 +24,7 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
+      - run: test "$(zig version)" = "0.16.0"
       - run: zig build test
       - run: zig build
       - run: for f in examples/*.json; do ./zig-out/bin/vnat validate "$f"; done
@@ -43,6 +44,7 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
+      - run: test "$(zig version)" = "0.16.0"
       - run: zig build -Dtarget=${{ matrix.target }}
 
   netns:
@@ -52,6 +54,7 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
+      - run: test "$(zig version)" = "0.16.0"
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_netns.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_route.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_tun.sh
