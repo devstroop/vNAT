@@ -1,32 +1,44 @@
 # vNAT
 
-Portable virtual router in Zig 0.16.x: L2/L3 forwarding, bridging, IPv4 routing,
-NAT, DHCP, DNS, and firewall for Linux and Android. No GUI. Daemon + CLI +
-local API.
+A portable, userspace virtual router written in Zig 0.16.x.
 
-## Status
+vNAT turns a Linux machine or Android device into an opt-in router: attach L2/L3
+interfaces, bridge or route between them, and provide NAT, DHCP, DNS, firewall,
+and port forwarding. The data plane is pure Zig; there is no GUI and no cloud
+dependency.
 
-- R0–R3: complete (ports, forwarding, journal, conntrack, SNAT/DNAT, hairpin,
-  ICMP-error translation).
-- R4: in progress (DHCP server/client, DNS forwarder, lease persistence, CLI
-  status/query; conflict probe done).
-- R5–R9: planned (bridge, firewall, control plane, Android, performance).
+## Features
 
-See `docs/PLAN.md` for milestones and `docs/CORE-SCOPE.md` for the v1 contract.
+- L2 ports via `AF_PACKET`; TUN/TAP L3 ports; netlink hotplug
+- Ethernet and IPv4 forwarding with ARP, ICMP errors, TTL handling, MTU
+  enforcement, and software checksum repair (ADR-007)
+- Userspace conntrack with TCP/UDP/ICMP timeouts and garbage collection
+- SNAT/masquerade, DNAT/port forwarding, hairpin NAT, ICMP-error translation
+- DHCPv4 server and client, reservations, options, and persistent lease database
+- DNS forwarder with UDP/TCP, caching, negative caching, split zones, and a
+  local status zone
+- Journaled host mutations with rollback (`vnat down`)
+- CLI, daemon, and local API surface
+- C ABI for Android/iOS/desktop hosts
+
+## Platforms
+
+- Linux: full feature set
+- Android: VpnService (no root) and root router modes
+- macOS/Windows: planned
 
 ## Build
 
 Requires Zig 0.16.x.
 
-```bash
+```sh
 zig build
 zig build --release=fast
-zig build test
 ```
 
-## Tests
+## Test
 
-```bash
+```sh
 zig build test
 bash scripts/test_netns.sh
 bash scripts/test_route.sh
@@ -37,9 +49,9 @@ bash scripts/test_dhcp.sh
 bash scripts/test_dns.sh
 ```
 
-Cross-build:
+Cross-compilation:
 
-```bash
+```sh
 zig build -Dtarget=x86_64-linux
 zig build -Dtarget=aarch64-linux
 zig build -Dtarget=aarch64-linux-android
@@ -48,13 +60,12 @@ zig build -Dtarget=arm-linux-androideabi
 
 ## Configuration
 
-```bash
+```sh
 ./zig-out/bin/vnat validate examples/minimal.json
-./zig-out/bin/vnat validate examples/travel-router.json
 ```
 
-`examples/minimal.json` is runnable. `examples/travel-router.json` is
-illustrative of target-state features. See `examples/README.md`.
+`examples/minimal.json` is runnable. `examples/travel-router.json` is an
+illustrative target-state configuration. See `examples/README.md`.
 
 ## Documentation
 
@@ -69,8 +80,13 @@ Read in this order:
 7. `docs/SOURCES.md`
 8. `docs/adr/`
 
-Agent/contributor rules: `AGENTS.md`.
+Contributor and agent rules: `AGENTS.md`.
 
-## License
+## Status
 
-Not specified.
+R0 through R3 are complete. R4 is in progress: DHCP server/client, DNS
+forwarder, lease persistence, and basic CLI verbs are implemented; the DHCP
+conflict probe and remaining CLI surface are in progress. R5 through R9 are
+planned.
+
+See `docs/PLAN.md` for milestones and `docs/CORE-SCOPE.md` for the v1 contract.
