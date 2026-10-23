@@ -27,6 +27,7 @@ else
     struct {};
 
 pub const ethernet = @import("l2/ethernet.zig");
+pub const stp = @import("l2/stp.zig");
 pub const ipv4 = @import("l3/ipv4.zig");
 pub const arp = @import("l3/arp.zig");
 pub const fib = @import("l3/fib.zig");
@@ -72,6 +73,7 @@ test {
     _ = @import("control/firewall_counters.zig");
     if (builtin.os.tag == .linux) _ = @import("control/host.zig");
     _ = @import("l2/ethernet.zig");
+    _ = @import("l2/stp.zig");
     _ = @import("l3/ipv4.zig");
     _ = @import("l3/arp.zig");
     _ = @import("l3/fib.zig");

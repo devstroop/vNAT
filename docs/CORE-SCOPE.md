@@ -135,8 +135,9 @@ pub const Frame = struct {
   on any member port. Router-routed traffic resolves neighbours across the
   bridge and preserves the bridge zone in conntrack.
 - STP: 802.1D basic (blocking/listening/learning/forwarding) **optional**;
-  default off for small trusted topologies. `bridge.stp = true` is rejected
-  until the implementation lands (R5).
+  default off for small trusted topologies. `bridge.stp = true` runs
+  userspace root election, BPDU exchange every 2s, and 15s forward-delay
+  transitions. RSTP and per-port STP tuning are future work.
 - Loop protection: per-port ingress flooded-frame rate limit (storm control).
   `ports.<name>.storm_control` caps broadcast/multicast/unknown-unicast
   frames per second (default 1000, `0` disables); excess is dropped and
@@ -424,7 +425,7 @@ machine-checked configs live in `examples/`):
     "vpn0":    { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
-    "lan-br": { "ports": ["lan"], "vlan_aware": true }
+    "lan-br": { "ports": ["lan"], "vlan_aware": true, "stp": true }
   },
   "interfaces": {
     "lan0": { "bridge": "lan-br", "address": "10.10.0.1/24", "vlan": 10 },
@@ -476,6 +477,8 @@ Rules for config:
   `vlan_aware` bridge; `interfaces.<name>.vlan` selects the SVI VLAN.
 - `ports.<name>.storm_control` caps flooded frames per second from that port
   (default 1000, `0` disables).
+- `bridges.<name>.stp` enables basic 802.1D root election and port-state
+  transitions; it is off by default. Kernel bridge offload is still rejected.
 - `firewall.rules` is evaluated in order before the default policy. Each rule
   may match `proto`, `src`/`dst` CIDRs, `sport`/`dport` (TCP/UDP only),
   `iif`/`oif` (port, interface or bridge name) and `ct_state`, and applies

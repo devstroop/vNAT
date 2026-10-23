@@ -254,7 +254,7 @@ fn run(init: std.process.Init) !void {
     }
 
     logger.info(
-        "stopping instance={s} forwarded={d} bridged={d} dropped={d} fw-drop={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d} storm-drop={d} rate-limit={d}/{d}/{d}",
+        "stopping instance={s} forwarded={d} bridged={d} dropped={d} fw-drop={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d} storm-drop={d} rate-limit={d}/{d}/{d} stp={d}/{d}/{d}/{d}",
         .{
             parsed.config.instance,
             forwarder.counters.forwarded,
@@ -276,6 +276,10 @@ fn run(init: std.process.Init) !void {
             forwarder.counters.dhcp_rate_limited,
             forwarder.counters.dhcp_client_bound,
             forwarder.counters.storm_dropped,
+            forwarder.counters.stp_bpdus_rx,
+            forwarder.counters.stp_bpdus_tx,
+            forwarder.counters.stp_filtered,
+            forwarder.counters.stp_invalid,
         },
     );
 }

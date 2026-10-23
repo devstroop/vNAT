@@ -43,6 +43,9 @@ All notable changes to vNAT are documented here. The format follows
   tri-state STP/offload and SVI addressing.
 - Per-port storm control (`ports.<name>.storm_control`, default 1000
   flooded frames/s, `0` disables) with a `storm_dropped` counter.
+- Optional userspace 802.1D STP for bridges: root election from received
+  BPDUs, 2 s hello transmission, blocking/listening/learning/forwarding
+  transitions, and STP-state filtering in the bridge datapath.
 - VLAN netns test covering access/trunk forwarding, SVI reachability and
   per-port VLAN isolation.
 
@@ -78,8 +81,8 @@ All notable changes to vNAT are documented here. The format follows
 - Enforce firewall default input/forward policies (`drop`/`reject`/`accept`)
   and ordered rules in the datapath. Explicit port forwards are treated as
   administrator allows, and `default_out` rejects non-accept values until
-  outbound policy is implemented. Reject bridge STP and kernel-offload
-  options until implemented instead of silently ignoring them.
+  outbound policy is implemented. Reject the kernel-offload bridge option
+  until implemented instead of silently ignoring it.
 - Keep bridge floods running when one member is down or its MTU is exceeded,
   rate-limit bridge-wide ARP resolution, and send valid ARP probes for DHCP
   conflict detection.

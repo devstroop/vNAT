@@ -132,7 +132,7 @@ DHCP + DNS + NAT.
 - [x] Reassemble 802.1Q tags stripped by `PACKET_AUXDATA` VLAN offload.
 - [x] Netns test with veth pairs and tagged traffic.
 - [x] Storm control and loop protection (per-port flooded-frame limit).
-- [ ] Optional STP 802.1D (port SoftEther `bridge/stp.zig`).
+- [x] Optional STP 802.1D (root election, BPDU exchange, port states).
 - [ ] Optional Linux kernel-bridge offload backend.
 - [x] `vnat bridge list` inspection CLI (membership, PVID/tagged, SVI).
 

@@ -10,6 +10,7 @@ const types = @import("../types.zig");
 const port_mod = @import("../port/port.zig");
 const schema = @import("../config/schema.zig");
 const ethernet = @import("../l2/ethernet.zig");
+const stp = @import("../l2/stp.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
 const icmp = @import("icmp.zig");
@@ -89,6 +90,10 @@ pub const Counters = struct {
     firewall_dropped: u64 = 0,
     firewall_spoofed: u64 = 0,
     storm_dropped: u64 = 0,
+    stp_bpdus_rx: u64 = 0,
+    stp_bpdus_tx: u64 = 0,
+    stp_filtered: u64 = 0,
+    stp_invalid: u64 = 0,
     icmp_rate_limited: u64 = 0,
     arp_rate_limited: u64 = 0,
     dhcp_rate_limited: u64 = 0,
@@ -99,11 +104,32 @@ pub const BridgePortVlan = struct {
     tagged: []const u16 = &.{},
 };
 
+pub const StpPortState = enum { blocking, listening, learning, forwarding };
+pub const StpPortRole = enum { disabled, root, designated, alternate };
+
+pub const StpPort = struct {
+    port_id: u16,
+    cost: u32 = stp.default_port_cost,
+    role: StpPortRole = .disabled,
+    state: StpPortState = .blocking,
+    rx: ?stp.Bpdu = null,
+    rx_at_ms: i64 = 0,
+    state_deadline_ms: i64 = 0,
+};
+
 pub const Bridge = struct {
     id: u32,
     members: []types.PortId,
     vlan_aware: bool = false,
     vlans: []BridgePortVlan = &.{},
+    stp: bool = false,
+    stp_ports: []StpPort = &.{},
+    stp_bridge_id: u64 = 0,
+    stp_root_id: u64 = 0,
+    stp_root_cost: u32 = 0,
+    stp_root_age_ms: u32 = 0,
+    stp_root_port: ?usize = null,
+    stp_last_hello_ms: i64 = -1,
 
     pub fn contains(self: Bridge, port: types.PortId) bool {
         for (self.members) |member| {
@@ -135,6 +161,119 @@ const FdbEntry = struct {
     port: types.PortId,
     updated_ms: i64,
 };
+
+fn stpPortIndex(bridge: Bridge, port: types.PortId) ?usize {
+    for (bridge.members, 0..) |member, i| {
+        if (member.eql(port)) return if (i < bridge.stp_ports.len) i else null;
+    }
+    return null;
+}
+
+fn stpPortState(bridge: Bridge, port: types.PortId) ?StpPortState {
+    const index = stpPortIndex(bridge, port) orelse return null;
+    return bridge.stp_ports[index].state;
+}
+
+fn stpRecompute(bridge: *Bridge, now: i64) void {
+    if (!bridge.stp) return;
+    var best_root = bridge.stp_bridge_id;
+    var best_cost: u32 = 0;
+    var best_bridge = bridge.stp_bridge_id;
+    var best_port: u16 = 0;
+    var best_index: ?usize = null;
+
+    for (bridge.stp_ports, 0..) |port, i| {
+        const rx = port.rx orelse continue;
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), now - port.rx_at_ms));
+        if (@as(u64, rx.message_age_ms) + elapsed > rx.max_age_ms) continue;
+        const cost = rx.root_cost +| port.cost;
+        if (best_index == null or stp.vectorLess(
+            rx.root_id,
+            cost,
+            rx.bridge_id,
+            rx.port_id,
+            best_root,
+            best_cost,
+            best_bridge,
+            best_port,
+        )) {
+            best_root = rx.root_id;
+            best_cost = cost;
+            best_bridge = rx.bridge_id;
+            best_port = rx.port_id;
+            best_index = i;
+        }
+    }
+    bridge.stp_root_id = best_root;
+    bridge.stp_root_cost = best_cost;
+    bridge.stp_root_port = best_index;
+    bridge.stp_root_age_ms = if (best_index) |i| blk: {
+        const port = bridge.stp_ports[i];
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), now - port.rx_at_ms));
+        const age = @as(u64, port.rx.?.message_age_ms) + elapsed;
+        break :blk @intCast(@min(age, std.math.maxInt(u32)));
+    } else 0;
+
+    for (bridge.stp_ports, 0..) |*port, i| {
+        if (port.rx) |rx| {
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), now - port.rx_at_ms));
+            if (@as(u64, rx.message_age_ms) + elapsed > rx.max_age_ms) port.rx = null;
+        }
+        const is_root = best_index == i;
+        var designated = true;
+        if (!is_root) {
+            if (port.rx) |rx| {
+                const elapsed: u64 = @intCast(@max(@as(i64, 0), now - port.rx_at_ms));
+                const age = @as(u64, rx.message_age_ms) + elapsed;
+                const our_cost = bridge.stp_root_cost +| port.cost;
+                if (age <= rx.max_age_ms and stp.vectorLess(
+                    rx.root_id,
+                    rx.root_cost,
+                    rx.bridge_id,
+                    rx.port_id,
+                    bridge.stp_root_id,
+                    our_cost,
+                    bridge.stp_bridge_id,
+                    port.port_id,
+                )) designated = false;
+            }
+        }
+
+        const next_role = if (is_root)
+            StpPortRole.root
+        else if (!designated)
+            StpPortRole.alternate
+        else
+            StpPortRole.designated;
+        const role_changed = port.role != next_role;
+        port.role = next_role;
+
+        if (port.role == .alternate) {
+            port.state = .blocking;
+            port.state_deadline_ms = 0;
+            continue;
+        }
+        if (role_changed and port.state != .blocking) {
+            port.state = .listening;
+            port.state_deadline_ms = now + stp.forward_delay_ms;
+        }
+        switch (port.state) {
+            .blocking => {
+                port.state = .listening;
+                port.state_deadline_ms = now + stp.forward_delay_ms;
+            },
+            .listening => if (now >= port.state_deadline_ms) {
+                port.state = .learning;
+                port.state_deadline_ms = now + stp.forward_delay_ms;
+            },
+            .learning => if (now >= port.state_deadline_ms) {
+                port.state = .forwarding;
+                port.state_deadline_ms = 0;
+            },
+            .forwarding => {},
+        }
+    }
+}
 
 const FirewallIface = union(enum) {
     port: types.PortId,
@@ -270,6 +409,7 @@ pub const Forwarder = struct {
             for (bridge.vlans) |vlan| self.gpa.free(vlan.tagged);
             self.gpa.free(bridge.vlans);
             self.gpa.free(bridge.members);
+            if (bridge.stp_ports.len != 0) self.gpa.free(bridge.stp_ports);
         }
         self.bridges.deinit(self.gpa);
         self.fdb.deinit(self.gpa);
@@ -400,6 +540,7 @@ pub const Forwarder = struct {
         for (self.dhcp_servers.items) |*server| server.gc(now);
         self.tickDhcpOffers(io, now);
         self.tickDhcpClients(io, now);
+        self.stpTick(io, now);
     }
 
     pub fn fromConfig(
@@ -429,11 +570,25 @@ pub const Forwarder = struct {
             errdefer gpa.free(members);
             const vlans = try gpa.alloc(BridgePortVlan, bridge_cfg.ports.len);
             errdefer gpa.free(vlans);
+            const stp_ports: []StpPort = if (bridge_cfg.stp)
+                try gpa.alloc(StpPort, bridge_cfg.ports.len)
+            else
+                &.{};
+            errdefer if (bridge_cfg.stp) gpa.free(stp_ports);
+            var bridge_mac = types.Mac{};
             var vlan_count: usize = 0;
             errdefer for (vlans[0..vlan_count]) |vlan| gpa.free(vlan.tagged);
             for (bridge_cfg.ports, 0..) |port_name, i| {
                 const port_entry = findPort(ports, port_name) orelse return error.NotFound;
                 members[i] = port_entry.id;
+                if (bridge_cfg.stp) {
+                    const mac = port_entry.port.info().mac;
+                    if (!mac.isZero() and
+                        (bridge_mac.isZero() or std.mem.order(u8, &mac.bytes, &bridge_mac.bytes) == .lt))
+                    {
+                        bridge_mac = mac;
+                    }
+                }
                 if (bridge_cfg.vlan_aware) {
                     const port_cfg = cfg.ports.getPtr(port_name) orelse return error.NotFound;
                     const tagged = try gpa.dupe(u16, port_cfg.tagged);
@@ -446,11 +601,34 @@ pub const Forwarder = struct {
                     vlans[i] = .{};
                 }
             }
+            if (bridge_cfg.stp) {
+                if (bridge_mac.isZero()) {
+                    bridge_mac = .{ .bytes = .{
+                        0x02,
+                        0,
+                        0,
+                        @truncate(bridge_id >> 16),
+                        @truncate(bridge_id >> 8),
+                        @truncate(bridge_id),
+                    } };
+                }
+                for (stp_ports, 0..) |*port, i| {
+                    port.* = .{ .port_id = @intCast((i + 1) << 8) };
+                }
+            }
+            const stp_bridge_id = if (bridge_cfg.stp)
+                stp.bridgeId(stp.default_priority, bridge_mac)
+            else
+                0;
             try self.bridges.append(gpa, .{
                 .id = bridge_id,
                 .members = members,
                 .vlan_aware = bridge_cfg.vlan_aware,
                 .vlans = vlans,
+                .stp = bridge_cfg.stp,
+                .stp_ports = stp_ports,
+                .stp_bridge_id = stp_bridge_id,
+                .stp_root_id = stp_bridge_id,
             });
             bridge_id += 1;
         }
@@ -771,8 +949,17 @@ pub const Forwarder = struct {
         frame: []const u8,
         ingress: types.PortId,
     ) PortError!void {
+        return self.handleAt(io, frame, ingress, nowMs(io));
+    }
+
+    fn handleAt(
+        self: *Forwarder,
+        io: std.Io,
+        frame: []const u8,
+        ingress: types.PortId,
+        now: i64,
+    ) PortError!void {
         self.counters.rx_frames += 1;
-        const now = nowMs(io);
         self.gcPending(now);
         if (now - self.conntrack.last_gc_ms >= conntrack_mod.gc_interval_ms) {
             self.conntrack.gc(now);
@@ -797,6 +984,12 @@ pub const Forwarder = struct {
         };
 
         const bridge = self.bridgeForPort(ingress);
+        if (eth.dst.eql(stp.multicast)) {
+            if (bridge) |b| {
+                if (b.stp) self.handleStp(b.id, ingress, eth.payload, now);
+            }
+            return;
+        }
         const vlan: u16 = if (bridge) |b|
             self.ingressVlan(b, ingress, eth.vlan) orelse {
                 self.counters.dropped += 1;
@@ -811,9 +1004,18 @@ pub const Forwarder = struct {
         };
 
         if (bridge) |b| {
+            if (b.stp) {
+                const state = stpPortState(b, ingress) orelse .blocking;
+                if (state != .learning and state != .forwarding) {
+                    self.counters.stp_filtered += 1;
+                    self.counters.dropped += 1;
+                    return;
+                }
+            }
             if (!eth.src.isMulticast() and !eth.src.isZero()) {
                 self.learnFdb(b.id, vlan, eth.src, ingress, now);
             }
+            if (b.stp and stpPortState(b, ingress) == .learning) return;
         }
 
         switch (eth.ethertype) {
@@ -895,6 +1097,77 @@ pub const Forwarder = struct {
         self.fdb.put(self.gpa, key, .{ .port = port, .updated_ms = now }) catch {};
     }
 
+    fn handleStp(
+        self: *Forwarder,
+        bridge_id: u32,
+        ingress: types.PortId,
+        payload: []const u8,
+        now: i64,
+    ) void {
+        const bridge: *Bridge = for (self.bridges.items) |*item| {
+            if (item.id == bridge_id) break item;
+        } else return;
+        if (!bridge.stp) return;
+        const index = stpPortIndex(bridge.*, ingress) orelse return;
+        const bpdu = stp.parse(payload) catch {
+            self.counters.stp_invalid += 1;
+            return;
+        };
+        if (bpdu.bridge_id == bridge.stp_bridge_id) return;
+        bridge.stp_ports[index].rx = bpdu;
+        bridge.stp_ports[index].rx_at_ms = now;
+        self.counters.stp_bpdus_rx += 1;
+        stpRecompute(bridge, now);
+    }
+
+    fn stpTick(self: *Forwarder, io: std.Io, now: i64) void {
+        for (self.bridges.items) |*bridge| {
+            if (!bridge.stp) continue;
+            stpRecompute(bridge, now);
+            if (bridge.stp_last_hello_ms >= 0 and
+                now - bridge.stp_last_hello_ms < stp.hello_ms) continue;
+            for (bridge.stp_ports, 0..) |port, i| {
+                if (port.role != .designated) continue;
+                self.sendStpBpdu(io, bridge, i);
+            }
+            bridge.stp_last_hello_ms = now;
+        }
+    }
+
+    fn sendStpBpdu(self: *Forwarder, io: std.Io, bridge: *const Bridge, index: usize) void {
+        const port = bridge.stp_ports[index];
+        const member = bridge.members[index];
+        const entry = self.portById(member) orelse return;
+        if (entry.port.info().kind == .tun) return;
+
+        var payload: [stp.payload_len]u8 = undefined;
+        _ = stp.write(&payload, .{
+            .root_id = bridge.stp_root_id,
+            .root_cost = bridge.stp_root_cost,
+            .bridge_id = bridge.stp_bridge_id,
+            .port_id = port.port_id,
+            .message_age_ms = bridge.stp_root_age_ms,
+            .max_age_ms = stp.max_age_ms,
+            .hello_ms = stp.hello_ms,
+            .forward_delay_ms = stp.forward_delay_ms,
+        }) catch return;
+
+        var frame: [64]u8 = undefined;
+        const hlen = ethernet.write(
+            &frame,
+            stp.multicast,
+            stp.idMac(bridge.stp_bridge_id),
+            @intCast(stp.payload_len),
+            null,
+        ) catch return;
+        @memcpy(frame[hlen..][0..stp.payload_len], &payload);
+        entry.port.write(io, frame[0 .. hlen + stp.payload_len]) catch {
+            self.counters.dropped += 1;
+            return;
+        };
+        self.counters.stp_bpdus_tx += 1;
+    }
+
     fn bridgeForward(
         self: *Forwarder,
         io: std.Io,
@@ -961,6 +1234,7 @@ pub const Forwarder = struct {
         eth: ethernet.Header,
         vlan: u16,
     ) PortError!void {
+        if (bridge.stp and stpPortState(bridge, member) != .forwarding) return;
         const tag: ?u16 = switch (egressVlan(bridge, member, vlan)) {
             .untagged => null,
             .tagged => |vid| vid,
@@ -3372,6 +3646,30 @@ const port_b_mac: types.Mac = .{ .bytes = .{ 0x02, 0, 0, 0, 0, 0x0b } };
 const host_a_mac: types.Mac = .{ .bytes = .{ 0x02, 0, 0, 0, 0, 0x02 } };
 const host_b_mac: types.Mac = .{ .bytes = .{ 0x02, 0, 0, 0, 0, 0x03 } };
 
+fn writeStpTestFrame(
+    buf: []u8,
+    root: u64,
+    cost: u32,
+    port_id: u16,
+) !usize {
+    var payload: [stp.payload_len]u8 = undefined;
+    _ = try stp.write(&payload, .{
+        .root_id = root,
+        .root_cost = cost,
+        .bridge_id = root,
+        .port_id = port_id,
+    });
+    const hlen = try ethernet.write(
+        buf,
+        stp.multicast,
+        host_a_mac,
+        @intCast(stp.payload_len),
+        null,
+    );
+    @memcpy(buf[hlen..][0..stp.payload_len], &payload);
+    return hlen + stp.payload_len;
+}
+
 fn testIp(comptime s: []const u8) types.Ipv4 {
     return types.Ipv4.parse(s) catch unreachable;
 }
@@ -4384,6 +4682,95 @@ test "bridge storm control drops excess flooded frames" {
     try fwd.handle(testing.io, frame[0 .. hlen + 4], port_a);
     try testing.expectEqual(@as(usize, 1), b.queuedTx());
     try testing.expectEqual(@as(u64, 1), fwd.counters.storm_dropped);
+}
+
+test "STP blocks an alternate port and forwards converged root ports" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    const port_c: types.PortId = .{ .value = 4 };
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+    var c = MemoryPort.init(testing.allocator, port_c, "c", 1500);
+    defer c.deinit();
+    c.mac = .{ .bytes = .{ 0x02, 0, 0, 0, 0, 0x0c } };
+
+    const entries = [3]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+        .{ .id = port_c, .config_name = "c", .port = c.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "stp",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a" },
+        \\    "b": { "kind": "l2", "device": "b" },
+        \\    "c": { "kind": "l2", "device": "c" }
+        \\  },
+        \\  "bridges": { "br0": { "ports": ["a", "b", "c"], "stp": true } }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+
+    const bridge = &fwd.bridges.items[0];
+    const root = stp.bridgeId(0x8000, .{ .bytes = .{ 0x02, 0, 0, 0, 0, 1 } });
+    var frame: [128]u8 = undefined;
+    const b_len = try writeStpTestFrame(&frame, root, 0, 0x0100);
+    try fwd.handleAt(testing.io, frame[0..b_len], port_b, 10_000);
+    const c_len = try writeStpTestFrame(&frame, root, 5, 0x0200);
+    try fwd.handleAt(testing.io, frame[0..c_len], port_c, 10_000);
+
+    try testing.expectEqual(StpPortRole.root, bridge.stp_ports[1].role);
+    try testing.expectEqual(StpPortRole.alternate, bridge.stp_ports[2].role);
+    try testing.expectEqual(StpPortState.blocking, bridge.stp_ports[2].state);
+    try testing.expectEqual(StpPortState.listening, bridge.stp_ports[0].state);
+    try testing.expectEqual(StpPortState.listening, bridge.stp_ports[1].state);
+
+    fwd.stpTick(testing.io, 24_000);
+    const b_len_2 = try writeStpTestFrame(&frame, root, 0, 0x0100);
+    try fwd.handleAt(testing.io, frame[0..b_len_2], port_b, 24_000);
+    const c_len_2 = try writeStpTestFrame(&frame, root, 5, 0x0200);
+    try fwd.handleAt(testing.io, frame[0..c_len_2], port_c, 24_000);
+    fwd.stpTick(testing.io, 38_000);
+    const b_len_3 = try writeStpTestFrame(&frame, root, 0, 0x0100);
+    try fwd.handleAt(testing.io, frame[0..b_len_3], port_b, 39_000);
+    const c_len_3 = try writeStpTestFrame(&frame, root, 5, 0x0200);
+    try fwd.handleAt(testing.io, frame[0..c_len_3], port_c, 39_000);
+    fwd.stpTick(testing.io, 54_000);
+
+    try testing.expectEqual(StpPortState.forwarding, bridge.stp_ports[0].state);
+    try testing.expectEqual(StpPortState.forwarding, bridge.stp_ports[1].state);
+    try testing.expectEqual(StpPortState.blocking, bridge.stp_ports[2].state);
+
+    const hlen = try ethernet.write(
+        &frame,
+        types.Mac.broadcast,
+        host_a_mac,
+        0x88b5,
+        null,
+    );
+    @memcpy(frame[hlen..][0..4], "stpd");
+    const a_before = a.queuedTx();
+    const b_before = b.queuedTx();
+    const c_before = c.queuedTx();
+    try fwd.handleAt(testing.io, frame[0 .. hlen + 4], port_c, 54_000);
+    try testing.expectEqual(a_before, a.queuedTx());
+    try testing.expectEqual(b_before, b.queuedTx());
+    try testing.expectEqual(c_before, c.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.stp_filtered);
+
+    try fwd.handleAt(testing.io, frame[0 .. hlen + 4], port_b, 54_000);
+    try testing.expectEqual(a_before + 1, a.queuedTx());
+    try testing.expectEqual(b_before, b.queuedTx());
+    try testing.expectEqual(c_before, c.queuedTx());
+    try testing.expectEqual(@as(u64, 6), fwd.counters.stp_bpdus_rx);
 }
 
 test "bridge forwards frames and serves dhcp on any member" {

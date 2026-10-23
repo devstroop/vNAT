@@ -113,7 +113,6 @@ fn validateBridges(cfg: *const schema.Config) ConfigError!void {
 
         const bridge = entry.value_ptr.*;
         if (bridge.ports.len == 0) return error.InvalidValue;
-        if (bridge.stp) return error.InvalidValue;
         if (bridge.offload != .none) return error.InvalidValue;
 
         for (bridge.ports, 0..) |port_name, i| {
@@ -395,7 +394,7 @@ test "rejects l3 port in bridge" {
     try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
 }
 
-test "rejects unsupported bridge options" {
+test "accepts STP but rejects kernel offload" {
     const input_stp =
         \\{ "version": 1, "instance": "x",
         \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
@@ -403,7 +402,7 @@ test "rejects unsupported bridge options" {
     ;
     var parsed_stp = try @import("parse.zig").parse(std.testing.allocator, input_stp);
     defer parsed_stp.deinit();
-    try std.testing.expectError(error.InvalidValue, validate(&parsed_stp.config));
+    try validate(&parsed_stp.config);
 
     const input_vlan =
         \\{ "version": 1, "instance": "x",
