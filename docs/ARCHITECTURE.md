@@ -416,6 +416,7 @@ no throughput or latency claim is made before R9.
 | NAT/conntrack | SNAT UDP/ICMP/TCP, DNAT/hairpin (`scripts/nat_matrix.sh`) |
 | NAT matrix | Emulated EIM/EDM, hairpin, port-forward, exhaustion |
 | DHCP/DNS | Client emulators; lease persistence across restart |
+| Security/privilege | Journal rollback, default-deny policy, netns isolation |
 | Crash safety | kill -9, reboot simulation, `vnat doctor` |
 | Android | Emulator (VPN mode), rooted device (root mode) |
 | Performance | `iperf3`, `pktgen`, 64 B and 1500 B, multi-flow |
