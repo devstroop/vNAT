@@ -131,6 +131,8 @@ pub const Manager = struct {
                                 .tap = true,
                                 .mtu = cfg.mtu,
                             });
+                            errdefer p.port().deinit(io);
+                            try p.port().setUp(io, true);
                             return p.port();
                         },
                         .tun => return error.InvalidArgument,
@@ -153,6 +155,8 @@ pub const Manager = struct {
                                 .tap = false,
                                 .mtu = cfg.mtu,
                             });
+                            errdefer p.port().deinit(io);
+                            try p.port().setUp(io, true);
                             return p.port();
                         },
                         .tap => return error.InvalidArgument,

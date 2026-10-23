@@ -81,6 +81,11 @@ pub const Entry = struct {
 };
 
 pub const Cache = struct {
+    /// Upper bound on neighbours learned from untrusted L2 traffic. Keeping
+    /// this finite is what stops a spoofed-source ARP flood from exhausting
+    /// memory.
+    pub const max_entries: usize = 1024;
+
     map: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
@@ -88,7 +93,8 @@ pub const Cache = struct {
     }
 
     pub fn reserve(self: *Cache, gpa: std.mem.Allocator, capacity: u32) !void {
-        try self.map.ensureTotalCapacity(gpa, capacity);
+        const limit: u32 = @intCast(max_entries);
+        try self.map.ensureTotalCapacity(gpa, @min(capacity, limit));
     }
 
     pub fn get(self: *const Cache, ip: types.Ipv4) ?Entry {
@@ -108,8 +114,31 @@ pub const Cache = struct {
         return entry;
     }
 
+    pub fn getFreshAny(self: *const Cache, ip: types.Ipv4, now_ms: i64, ttl_ms: i64) ?Entry {
+        const entry = self.map.get(ip.value) orelse return null;
+        if (now_ms - entry.updated_ms > ttl_ms) return null;
+        return entry;
+    }
+
     pub fn put(self: *Cache, gpa: std.mem.Allocator, ip: types.Ipv4, entry: Entry) !void {
+        if (self.map.getPtr(ip.value)) |slot| {
+            slot.* = entry;
+            return;
+        }
+        if (self.map.count() >= max_entries and !self.evictOldest()) {
+            return error.NoSpace;
+        }
         try self.map.put(gpa, ip.value, entry);
+    }
+
+    /// Drops entries that have not been refreshed within `ttl_ms`. Called from
+    /// the periodic tick so stale neighbours do not occupy the bounded cache.
+    pub fn prune(self: *Cache, now_ms: i64, ttl_ms: i64) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const age = now_ms - entry.value_ptr.updated_ms;
+            if (age > ttl_ms) self.map.removeByPtr(entry.key_ptr);
+        }
     }
 
     pub fn remove(self: *Cache, ip: types.Ipv4) bool {
@@ -118,6 +147,20 @@ pub const Cache = struct {
 
     pub fn count(self: *const Cache) usize {
         return self.map.count();
+    }
+
+    fn evictOldest(self: *Cache) bool {
+        var oldest_ip: ?u32 = null;
+        var oldest_ms: i64 = std.math.maxInt(i64);
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.updated_ms < oldest_ms) {
+                oldest_ms = entry.value_ptr.updated_ms;
+                oldest_ip = entry.key_ptr.*;
+            }
+        }
+        if (oldest_ip) |ip| return self.map.remove(ip);
+        return false;
     }
 };
 
@@ -212,4 +255,45 @@ test "arp cache freshness and port scoping" {
 
     try testing.expect(cache.remove(testIp("10.0.1.2")));
     try testing.expectEqual(@as(usize, 0), cache.count());
+}
+
+test "arp cache stays bounded and evicts the oldest entry" {
+    var cache: Cache = .{};
+    defer cache.deinit(testing.allocator);
+
+    const port: types.PortId = .{ .value = 1 };
+    var i: u32 = 0;
+    while (i <= Cache.max_entries) : (i += 1) {
+        try cache.put(testing.allocator, .{ .value = 0x0a000001 + i }, .{
+            .mac = mac_a,
+            .port = port,
+            .updated_ms = i,
+        });
+    }
+
+    try testing.expectEqual(Cache.max_entries, cache.count());
+    try testing.expect(cache.get(.{ .value = 0x0a000001 }) == null);
+    try testing.expect(cache.get(.{ .value = 0x0a000001 + @as(u32, @intCast(Cache.max_entries)) }) != null);
+}
+
+test "arp cache prune drops stale entries" {
+    var cache: Cache = .{};
+    defer cache.deinit(testing.allocator);
+
+    const port: types.PortId = .{ .value = 1 };
+    try cache.put(testing.allocator, testIp("10.0.1.2"), .{
+        .mac = mac_a,
+        .port = port,
+        .updated_ms = 1000,
+    });
+    try cache.put(testing.allocator, testIp("10.0.1.3"), .{
+        .mac = mac_b,
+        .port = port,
+        .updated_ms = 2000,
+    });
+
+    cache.prune(2500, 1000);
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expect(cache.get(testIp("10.0.1.2")) == null);
+    try testing.expect(cache.get(testIp("10.0.1.3")) != null);
 }

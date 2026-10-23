@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const types = @import("../types.zig");
 const ConfigError = @import("../errors.zig").ConfigError;
 
 pub const Parsed = struct {
@@ -47,7 +48,7 @@ const interface_keys = [_][]const u8{ "bridge", "port", "address" };
 const route_keys = [_][]const u8{ "dst", "via", "dev", "metric", "table" };
 const nat_keys = [_][]const u8{ "masquerade", "port_forward" };
 const masquerade_keys = [_][]const u8{"out"};
-const forward_keys = [_][]const u8{ "proto", "ext_port", "to" };
+const forward_keys = [_][]const u8{ "proto", "ext_port", "to", "in" };
 const dhcp_keys = [_][]const u8{
     "iface", "pool", "lease", "dns", "domain", "mtu", "ntp", "reservations",
 };
@@ -112,7 +113,7 @@ fn parsePort(value: *const std.json.Value) ConfigError!schema.PortConfig {
 
     const mtu: ?u16 = if (field(obj, "mtu")) |v| try asInt(u16, v) else null;
     if (mtu) |m| {
-        if (m < 576 or m > 9000) return error.InvalidValue;
+        if (m < 576 or m > types.max_supported_mtu) return error.InvalidValue;
     }
 
     const create: ?schema.PortCreate = if (field(obj, "create")) |v| blk: {
@@ -149,7 +150,7 @@ fn parseBridge(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!s
     return .{
         .ports = try reqStringArray(a, obj, "ports"),
         .stp = try optBool(obj, "stp", false),
-        .vlan_aware = try optBool(obj, "vlan_aware", true),
+        .vlan_aware = try optBool(obj, "vlan_aware", false),
         .offload = try optEnum(schema.BridgeOffload, obj, "offload", .none),
     };
 }
@@ -228,6 +229,7 @@ fn parseForwards(a: std.mem.Allocator, value: *const std.json.Value) ConfigError
             .proto = try reqEnum(schema.Proto, obj, "proto"),
             .ext_port = try reqInt(u16, obj, "ext_port"),
             .to = try reqString(obj, "to"),
+            .in_iface = try optString(obj, "in"),
         };
     }
     return out;
@@ -425,7 +427,7 @@ const example =
     \\  "instance": "travel-router",
     \\  "log": { "level": "debug", "format": "text" },
     \\  "ports": {
-    \\    "wan": { "kind": "l3", "device": "eth0" },
+    \\    "wan": { "kind": "l2", "device": "eth0" },
     \\    "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 }
     \\  },
     \\  "bridges": {
@@ -458,7 +460,7 @@ test "parses a full config" {
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqualStrings("travel-router", cfg.instance);
     try std.testing.expectEqual(@as(usize, 2), cfg.ports.count());
-    try std.testing.expectEqual(schema.PortKind.l3, cfg.ports.get("wan").?.kind);
+    try std.testing.expectEqual(schema.PortKind.l2, cfg.ports.get("wan").?.kind);
     try std.testing.expectEqual(@as(usize, 1), cfg.bridges.count());
     try std.testing.expectEqual(@as(usize, 1), cfg.routes.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.nat.masquerade.len);

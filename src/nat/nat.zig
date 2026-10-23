@@ -17,6 +17,7 @@ pub const ForwardRule = struct {
     ext_port: u16,
     to_addr: types.Ipv4,
     to_port: u16,
+    ingress: ?types.PortId = null,
 };
 
 pub fn rewriteSource(packet: []u8, addr: types.Ipv4, port: u16) bool {

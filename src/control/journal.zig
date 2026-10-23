@@ -299,7 +299,9 @@ pub fn ownsRoute(
 }
 
 fn matchesAddress(address: Address, dev: []const u8, prefix: types.Prefix4) bool {
-    return std.mem.eql(u8, address.dev, dev) and address.prefix.eql(prefix);
+    return std.mem.eql(u8, address.dev, dev) and
+        address.prefix.len == prefix.len and
+        address.prefix.addr.eql(prefix.addr);
 }
 
 fn matchesRoute(a: Route, b: Route) bool {
@@ -420,6 +422,7 @@ test "journal ownership ledger" {
         "{\"op\":\"addr_del\",\"dev\":\"ra\",\"cidr\":\"10.0.1.1/24\"}\n";
 
     try testing.expect(!(try ownsAddress(testing.allocator, contents, "ra", testPrefix("10.0.1.1/24"))));
+    try testing.expect(!(try ownsAddress(testing.allocator, contents, "ra", testPrefix("10.0.1.2/24"))));
     try testing.expect(try ownsAddress(testing.allocator, contents, "rb", testPrefix("10.0.2.1/24")));
     try testing.expect(!(try ownsAddress(testing.allocator, contents, "rc", testPrefix("10.0.3.1/24"))));
 

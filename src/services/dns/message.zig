@@ -88,6 +88,85 @@ pub fn minTtl(packet: []const u8) u32 {
     return smallest orelse 60;
 }
 
+/// TTL to use when caching a response. Negative answers use the SOA TTL and
+/// MINIMUM (RFC 2308 section 5); NXDOMAIN without an SOA must not be cached.
+pub fn cacheTtl(packet: []const u8) u32 {
+    const code = rcode(packet);
+    if (code != 0 and code != 3) return 0;
+    const header = parseHeader(packet) catch return 0;
+    if (code == 3) {
+        // NXDOMAIN may carry a CNAME in the answer section; the SOA still
+        // determines the negative TTL (RFC 2308 section 5).
+        if (negativeTtl(packet)) |ttl| return ttl;
+        return 0;
+    }
+    if (header.ancount == 0) {
+        if (negativeTtl(packet)) |ttl| return ttl;
+    }
+    return minTtl(packet);
+}
+
+/// Returns the negative-cache TTL from an SOA in the authority section, using
+/// the lower of the SOA record TTL and its MINIMUM field.
+pub fn negativeTtl(packet: []const u8) ?u32 {
+    const header = parseHeader(packet) catch return null;
+    if (header.nscount == 0) return null;
+    var pos = questionEnd(packet) catch return null;
+    const total = @as(usize, header.ancount) + header.nscount;
+    var smallest: ?u32 = null;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        pos = skipName(packet, pos, true) catch return smallest;
+        if (pos + 10 > packet.len) return smallest;
+        const typ = std.mem.readInt(u16, packet[pos..][0..2], .big);
+        const ttl = std.mem.readInt(u32, packet[pos + 4 ..][0..4], .big);
+        const rdlen = std.mem.readInt(u16, packet[pos + 8 ..][0..2], .big);
+        const rdata = pos + 10;
+        pos = rdata + rdlen;
+        if (pos > packet.len) return smallest;
+        if (i < @as(usize, header.ancount) or typ != 6 or rdlen < 20) continue;
+        var rpos = rdata;
+        rpos = skipName(packet, rpos, true) catch continue;
+        rpos = skipName(packet, rpos, true) catch continue;
+        if (rpos + 20 > pos) continue;
+        const minimum = std.mem.readInt(u32, packet[rpos + 16 ..][0..4], .big);
+        const candidate = @min(ttl, minimum);
+        if (smallest == null or candidate < smallest.?) smallest = candidate;
+    }
+    return smallest;
+}
+
+/// Subtracts elapsed seconds from every non-OPT record TTL. The cache uses
+/// this so a client never receives a TTL that was already consumed while the
+/// response sat in memory.
+pub fn ageTtls(packet: []u8, elapsed_seconds: u32) void {
+    if (elapsed_seconds == 0) return;
+    const header = parseHeader(packet) catch return;
+    var pos = questionEnd(packet) catch return;
+    const records = @as(usize, header.ancount) + header.nscount + header.arcount;
+    var i: usize = 0;
+    while (i < records) : (i += 1) {
+        pos = skipName(packet, pos, true) catch return;
+        if (pos + 10 > packet.len) return;
+        const typ = std.mem.readInt(u16, packet[pos..][0..2], .big);
+        const ttl = std.mem.readInt(u32, packet[pos + 4 ..][0..4], .big);
+        const rdlen = std.mem.readInt(u16, packet[pos + 8 ..][0..2], .big);
+        if (typ != 41) {
+            std.mem.writeInt(u32, packet[pos + 4 ..][0..4], ttl -| elapsed_seconds, .big);
+        }
+        pos += 10;
+        if (pos + rdlen > packet.len) return;
+        pos += rdlen;
+    }
+}
+
+/// Returns the qtype of a single-question query.
+pub fn questionType(packet: []const u8) ?u16 {
+    const end = questionEnd(packet) catch return null;
+    if (end < 4 or end > packet.len) return null;
+    return std.mem.readInt(u16, packet[end - 4 ..][0..2], .big);
+}
+
 /// Builds a minimal error response that echoes the query ID and question.
 pub fn buildError(out: []u8, query: []const u8, code: u4) Error![]u8 {
     const header = try parseHeader(query);
@@ -189,4 +268,105 @@ test "rejects compressed questions and computes record ttl" {
     std.mem.writeInt(u32, response[pos..][0..4], 0x7f000001, .big);
     pos += 4;
     try testing.expectEqual(@as(u32, 120), minTtl(response[0..pos]));
+}
+
+test "cache ttl uses the soa minimum for negative answers" {
+    var buf: [256]u8 = undefined;
+    const query = buildQuery(&buf, 7, "missing.example", 1);
+    var response: [512]u8 = undefined;
+    @memcpy(response[0..query.len], query);
+    std.mem.writeInt(u16, response[2..4], 0x8183, .big);
+    std.mem.writeInt(u16, response[6..8], 0, .big);
+    std.mem.writeInt(u16, response[8..10], 1, .big);
+    var pos = query.len;
+    response[pos] = 0xc0;
+    response[pos + 1] = 0x0c;
+    pos += 2;
+    std.mem.writeInt(u16, response[pos..][0..2], 6, .big);
+    std.mem.writeInt(u16, response[pos + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 300, .big);
+    std.mem.writeInt(u16, response[pos + 8 ..][0..2], 22, .big);
+    pos += 10;
+    response[pos] = 0;
+    pos += 1;
+    response[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u32, response[pos..][0..4], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 3600, .big);
+    std.mem.writeInt(u32, response[pos + 8 ..][0..4], 600, .big);
+    std.mem.writeInt(u32, response[pos + 12 ..][0..4], 86400, .big);
+    std.mem.writeInt(u32, response[pos + 16 ..][0..4], 60, .big);
+    pos += 20;
+
+    try testing.expectEqual(@as(u32, 60), negativeTtl(response[0..pos]).?);
+    try testing.expectEqual(@as(u32, 60), cacheTtl(response[0..pos]));
+}
+
+test "nxdomain with a cname still uses the soa negative ttl" {
+    var buf: [256]u8 = undefined;
+    const query = buildQuery(&buf, 11, "alias.example", 1);
+    var response: [512]u8 = undefined;
+    @memcpy(response[0..query.len], query);
+    std.mem.writeInt(u16, response[2..4], 0x8183, .big);
+    std.mem.writeInt(u16, response[6..8], 1, .big);
+    std.mem.writeInt(u16, response[8..10], 1, .big);
+    var pos = query.len;
+
+    response[pos] = 0xc0;
+    response[pos + 1] = 0x0c;
+    pos += 2;
+    std.mem.writeInt(u16, response[pos..][0..2], 5, .big);
+    std.mem.writeInt(u16, response[pos + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 300, .big);
+    std.mem.writeInt(u16, response[pos + 8 ..][0..2], 2, .big);
+    pos += 10;
+    response[pos] = 0xc0;
+    response[pos + 1] = 0x0c;
+    pos += 2;
+
+    response[pos] = 0xc0;
+    response[pos + 1] = 0x0c;
+    pos += 2;
+    std.mem.writeInt(u16, response[pos..][0..2], 6, .big);
+    std.mem.writeInt(u16, response[pos + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 300, .big);
+    std.mem.writeInt(u16, response[pos + 8 ..][0..2], 22, .big);
+    pos += 10;
+    response[pos] = 0;
+    pos += 1;
+    response[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u32, response[pos..][0..4], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 3600, .big);
+    std.mem.writeInt(u32, response[pos + 8 ..][0..4], 600, .big);
+    std.mem.writeInt(u32, response[pos + 12 ..][0..4], 86400, .big);
+    std.mem.writeInt(u32, response[pos + 16 ..][0..4], 60, .big);
+    pos += 20;
+
+    try testing.expectEqual(@as(u32, 60), cacheTtl(response[0..pos]));
+}
+
+test "aging records subtracts elapsed time from ttl fields" {
+    var buf: [256]u8 = undefined;
+    const query = buildQuery(&buf, 9, "example.com", 1);
+    var response: [256]u8 = undefined;
+    @memcpy(response[0..query.len], query);
+    std.mem.writeInt(u16, response[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, response[6..8], 1, .big);
+    var pos = query.len;
+    response[pos] = 0xc0;
+    response[pos + 1] = 0x0c;
+    pos += 2;
+    std.mem.writeInt(u16, response[pos..][0..2], 1, .big);
+    std.mem.writeInt(u16, response[pos + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, response[pos + 4 ..][0..4], 120, .big);
+    std.mem.writeInt(u16, response[pos + 8 ..][0..2], 4, .big);
+    pos += 10;
+    std.mem.writeInt(u32, response[pos..][0..4], 0x7f000001, .big);
+    pos += 4;
+
+    ageTtls(response[0..pos], 20);
+    try testing.expectEqual(@as(u32, 100), minTtl(response[0..pos]));
+    ageTtls(response[0..pos], 200);
+    try testing.expectEqual(@as(u32, 0), minTtl(response[0..pos]));
 }

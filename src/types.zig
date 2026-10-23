@@ -5,6 +5,9 @@
 
 const std = @import("std");
 
+/// Largest IP MTU the current userspace frame buffers can carry end to end.
+pub const max_supported_mtu: u16 = 1600;
+
 pub const Mac = struct {
     bytes: [6]u8 = .{0} ** 6,
 

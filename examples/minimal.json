@@ -2,8 +2,8 @@
   "version": 1,
   "instance": "minimal",
   "ports": {
-    "wan": { "kind": "l3", "device": "eth0" },
-    "lan": { "kind": "l3", "device": "eth1" }
+    "wan": { "kind": "l2", "device": "eth0" },
+    "lan": { "kind": "l2", "device": "eth1" }
   },
   "interfaces": {
     "wan0": { "port": "wan", "address": "dhcp" },
@@ -11,5 +11,10 @@
   },
   "dhcp": [
     { "iface": "lan0", "pool": "10.0.0.100-10.0.0.200" }
-  ]
+  ],
+  "firewall": {
+    "default_in": "accept",
+    "default_forward": "accept",
+    "default_out": "accept"
+  }
 }

@@ -72,7 +72,8 @@ cat > "$CFG" <<EOF
       "lease": "1h",
       "dns": "10.20.0.1"
     }
-  ]
+  ],
+  "firewall": { "default_in": "accept", "default_forward": "accept" }
 }
 EOF
 

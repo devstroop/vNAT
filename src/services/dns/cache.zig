@@ -2,9 +2,11 @@
 //! and expire from the smallest record TTL.
 
 const std = @import("std");
+const message = @import("message.zig");
 
 const Entry = struct {
     response: []u8,
+    stored_ms: i64,
     expires_ms: i64,
 };
 
@@ -40,6 +42,12 @@ pub const Cache = struct {
         const response = entry.value_ptr.response;
         if (response.len > out.len) return null;
         @memcpy(out[0..response.len], response);
+        const elapsed_ms = if (now_ms > entry.value_ptr.stored_ms)
+            now_ms - entry.value_ptr.stored_ms
+        else
+            0;
+        const elapsed_s = @min(@divTrunc(elapsed_ms, 1000), std.math.maxInt(u32));
+        message.ageTtls(out[0..response.len], @intCast(elapsed_s));
         return out[0..response.len];
     }
 
@@ -56,6 +64,7 @@ pub const Cache = struct {
             self.gpa.free(entry.value_ptr.response);
             entry.value_ptr.* = .{
                 .response = replacement,
+                .stored_ms = now_ms,
                 .expires_ms = now_ms + ttl_ms,
             };
             return;
@@ -70,6 +79,7 @@ pub const Cache = struct {
         errdefer self.gpa.free(owned_response);
         try self.map.put(self.gpa, owned_key, .{
             .response = owned_response,
+            .stored_ms = now_ms,
             .expires_ms = now_ms + ttl_ms,
         });
     }

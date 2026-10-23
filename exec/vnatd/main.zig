@@ -70,7 +70,7 @@ fn run(init: std.process.Init) !void {
         };
     }
 
-    var forwarder = try vnat.forward.Forwarder.fromConfig(gpa, &parsed.config, port_entries);
+    var forwarder = try vnat.forward.Forwarder.fromConfig(gpa, io, &parsed.config, port_entries);
     defer forwarder.deinit();
 
     var lease_store: ?vnat.dhcp_leases.Store = null;
@@ -212,20 +212,22 @@ fn run(init: std.process.Init) !void {
 
     if (dns_service) |service| {
         logger.info("dns stopping queries={d} responses={d} hits={d} errors={d} dropped={d}", .{
-            service.counters.queries,
-            service.counters.responses,
-            service.counters.cache_hits,
-            service.counters.upstream_errors,
-            service.counters.dropped,
+            service.counters.queries.load(.monotonic),
+            service.counters.responses.load(.monotonic),
+            service.counters.cache_hits.load(.monotonic),
+            service.counters.upstream_errors.load(.monotonic),
+            service.counters.dropped.load(.monotonic),
         });
     }
 
     logger.info(
-        "stopping instance={s} forwarded={d} dropped={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d}",
+        "stopping instance={s} forwarded={d} bridged={d} dropped={d} fw-drop={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d}",
         .{
             parsed.config.instance,
             forwarder.counters.forwarded,
+            forwarder.counters.bridged,
             forwarder.counters.dropped,
+            forwarder.counters.firewall_dropped,
             forwarder.counters.pending_queued,
             forwarder.counters.pending_flushed,
             forwarder.conntrack.counters.created,

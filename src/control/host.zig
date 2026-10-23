@@ -68,9 +68,9 @@ pub const Host = struct {
         if (!try journal.ownsAddress(self.gpa, contents, dev, prefix)) return error.NotManaged;
 
         try self.store.append(self.io, .{ .addr_del = .{ .dev = dev, .prefix = prefix } });
-        netlink.deleteAddress(self.io, dev, prefix) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
+        netlink.deleteAddress(self.io, dev, prefix) catch |err| {
+            self.store.removeLast(self.io) catch {};
+            return if (err == error.NotFound) .noop else err;
         };
         return .applied;
     }
@@ -80,7 +80,10 @@ pub const Host = struct {
         if (current == up) return .noop;
 
         try self.store.append(self.io, .{ .link = .{ .dev = dev, .up = up } });
-        try iface_mod.setUp(dev, up);
+        iface_mod.setUp(dev, up) catch |err| {
+            self.store.removeLast(self.io) catch {};
+            return err;
+        };
         return .applied;
     }
 
@@ -135,9 +138,9 @@ pub const Host = struct {
             .ifindex = ifindex,
             .metric = route.metric,
             .table = route.table,
-        }) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
+        }) catch |err| {
+            self.store.removeLast(self.io) catch {};
+            return if (err == error.NotFound) .noop else err;
         };
         return .applied;
     }

@@ -70,7 +70,8 @@ cat > "$CFG" <<'EOF'
   "interfaces": {
     "lan0": { "port": "lan", "address": "10.0.1.1/24" },
     "wan0": { "port": "wan", "address": "10.0.2.1/24" }
-  }
+  },
+  "firewall": { "default_in": "accept", "default_forward": "accept" }
 }
 EOF
 

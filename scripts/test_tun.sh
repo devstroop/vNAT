@@ -83,7 +83,8 @@ cat > "$CFG" <<'EOF'
   },
   "routes": [
     { "dst": "10.0.2.0/24", "via": "10.0.1.2", "dev": "lan0" }
-  ]
+  ],
+  "firewall": { "default_in": "accept", "default_forward": "accept" }
 }
 EOF
 

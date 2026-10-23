@@ -13,6 +13,8 @@ pub const Route = struct {
     prefix: types.Prefix4,
     next_hop: ?types.Ipv4 = null,
     port: types.PortId,
+    /// Set when `port` is the first member of a userspace bridge.
+    bridge: ?u32 = null,
     metric: u32 = 0,
     kind: Kind = .static,
 };

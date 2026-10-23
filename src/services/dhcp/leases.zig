@@ -27,6 +27,7 @@ const WireLease = struct {
 
 const Wire = struct {
     version: u32,
+    boot_ms: ?i64 = null,
     leases: []const WireLease,
 };
 
@@ -97,6 +98,20 @@ pub const Store = struct {
         defer parsed.deinit();
         if (parsed.value.version != 1) return error.InvalidLeaseDb;
 
+        // Pre-boot_ms databases cannot prove which boot their monotonic
+        // expiry timestamps belong to, so discard them rather than restoring
+        // leases that may already have expired.
+        const saved_boot_ms = parsed.value.boot_ms orelse return 0;
+        const real_now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        const mono_now = std.Io.Clock.now(.awake, self.io).toMilliseconds();
+        const current_boot_ms = real_now - mono_now;
+        if (@abs(saved_boot_ms - current_boot_ms) > 5_000) {
+            // Monotonic expiry timestamps are meaningless after a reboot.
+            // Expiring them forces clients to renew instead of trusting a
+            // stale binding from the previous boot.
+            return 0;
+        }
+
         var restored: usize = 0;
         for (parsed.value.leases) |record| {
             const server_ip = types.Ipv4.parse(record.server) catch continue;
@@ -127,7 +142,9 @@ pub const Store = struct {
     pub fn save(self: *Store, servers: []const server_mod.Server) !void {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
-        try out.writer.writeAll("{\"version\":1,\"leases\":[");
+        const real_now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        const mono_now = std.Io.Clock.now(.awake, self.io).toMilliseconds();
+        try out.writer.print("{{\"version\":1,\"boot_ms\":{d},\"leases\":[", .{real_now - mono_now});
         var first = true;
         for (servers) |*server| {
             var snapshots = try self.gpa.alloc(server_mod.LeaseSnapshot, server.leaseCapacity());
@@ -221,6 +238,44 @@ test "lease store ignores expired and malformed records" {
         \\{"version":1,"leases":[
         \\{"server":"10.0.1.1","port":7,"ip":"10.0.1.100","mac":"02:00:00:00:00:09","state":"bound","expires_ms":10},
         \\{"server":"10.0.1.1","port":7,"ip":"not-an-ip","mac":"02:00:00:00:00:09","state":"bound","expires_ms":9999999999999}
+        \\]}
+        ,
+    });
+    var store = Store.initDir(testing.allocator, testing.io, tmp.dir, "leases.json");
+    defer store.deinit();
+    var server = try testServer(testing.allocator);
+    defer server.deinit();
+    var servers = [_]server_mod.Server{server};
+    try testing.expectEqual(@as(usize, 0), try store.load(&servers, 100));
+}
+
+test "lease store discards databases without a boot marker" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "leases.json",
+        .data =
+        \\{"version":1,"leases":[
+        \\{"server":"10.0.1.1","port":7,"ip":"10.0.1.100","mac":"02:00:00:00:00:09","state":"bound","expires_ms":9999999999999}
+        \\]}
+        ,
+    });
+    var store = Store.initDir(testing.allocator, testing.io, tmp.dir, "leases.json");
+    defer store.deinit();
+    var server = try testServer(testing.allocator);
+    defer server.deinit();
+    var servers = [_]server_mod.Server{server};
+    try testing.expectEqual(@as(usize, 0), try store.load(&servers, 100));
+}
+
+test "lease store discards leases from another boot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "leases.json",
+        .data =
+        \\{"version":1,"boot_ms":0,"leases":[
+        \\{"server":"10.0.1.1","port":7,"ip":"10.0.1.100","mac":"02:00:00:00:00:09","state":"bound","expires_ms":9999999999999}
         \\]}
         ,
     });

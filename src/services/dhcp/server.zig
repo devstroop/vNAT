@@ -27,6 +27,7 @@ pub const Reservation = struct {
 
 pub const Config = struct {
     port: types.PortId,
+    bridge: ?u32 = null,
     server_ip: types.Ipv4,
     prefix: types.Prefix4,
     pool: types.IpRange,
@@ -86,6 +87,11 @@ pub const Server = struct {
         if (cfg.lease_seconds == 0) return error.InvalidArgument;
         if (cfg.pool.first.value > cfg.pool.last.value) return error.InvalidPool;
         if (!cfg.prefix.contains(cfg.pool.first) or !cfg.prefix.contains(cfg.pool.last)) {
+            return error.InvalidPool;
+        }
+        if (cfg.server_ip.value >= cfg.pool.first.value and
+            cfg.server_ip.value <= cfg.pool.last.value)
+        {
             return error.InvalidPool;
         }
         const pool_count = @as(u64, cfg.pool.last.value) - cfg.pool.first.value + 1;
@@ -336,6 +342,7 @@ pub const Server = struct {
     }
 
     fn commit(self: *Server, mac: types.Mac, ip: types.Ipv4, now_ms: i64) bool {
+        if (ip.eql(self.cfg.server_ip)) return false;
         self.gc(now_ms);
         if (self.reservationFor(mac)) |reservation| {
             if (!reservation.ip.eql(ip)) return false;
@@ -361,6 +368,7 @@ pub const Server = struct {
     }
 
     pub fn decline(self: *Server, mac: types.Mac, ip: types.Ipv4, now_ms: i64) void {
+        if (ip.eql(self.cfg.server_ip)) return;
         if (self.reservedForOther(ip, mac)) return;
         const lease = self.leaseForIp(ip) orelse return;
         if (lease.state != .free and !lease.mac.eql(mac)) return;
@@ -688,4 +696,10 @@ test "dynamic leases skip reserved addresses" {
     );
     const nak = (try server.handle(try message.Message.parse(conflict), &out, 1_000)).?;
     try testing.expectEqual(message.MessageType.nak, (try message.Message.parse(nak.payload)).messageType().?);
+}
+
+test "rejects a pool that contains the server address" {
+    var cfg = testConfig();
+    cfg.pool = types.parseIpRange("10.0.1.1-10.0.1.10") catch unreachable;
+    try testing.expectError(error.InvalidPool, Server.init(testing.allocator, cfg));
 }

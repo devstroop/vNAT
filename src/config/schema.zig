@@ -28,7 +28,7 @@ pub const BridgeOffload = enum { none, kernel };
 pub const BridgeConfig = struct {
     ports: []const []const u8,
     stp: bool = false,
-    vlan_aware: bool = true,
+    vlan_aware: bool = false,
     offload: BridgeOffload = .none,
 };
 
@@ -57,6 +57,7 @@ pub const PortForwardConfig = struct {
     proto: Proto,
     ext_port: u16,
     to: []const u8,
+    in_iface: ?[]const u8 = null,
 };
 
 pub const NatConfig = struct {

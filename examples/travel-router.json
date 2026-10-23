@@ -4,13 +4,13 @@
   "log": { "level": "info", "format": "text" },
   "lease_db": "/var/lib/vnat/leases.json",
   "ports": {
-    "wan": { "kind": "l3", "device": "eth0" },
+    "wan": { "kind": "l2", "device": "eth0" },
     "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 },
     "usb-lan": { "kind": "l2", "device": "usb0" },
     "vpn0": { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
-    "lan-br": { "ports": ["lan", "usb-lan"], "stp": true, "vlan_aware": true }
+    "lan-br": { "ports": ["lan", "usb-lan"] }
   },
   "interfaces": {
     "wan0": { "port": "wan", "address": "dhcp" },
@@ -40,7 +40,7 @@
   },
   "firewall": {
     "default_in": "drop",
-    "default_forward": "drop",
+    "default_forward": "accept",
     "default_out": "accept"
   }
 }

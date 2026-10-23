@@ -17,6 +17,51 @@ All notable changes to vNAT are documented here. The format follows
 - Golden Ethernet/IPv4/UDP frame fixtures and round-trip tests.
 - ADR-001…006 (router-first, hybrid datapath, Android tiers, overlay deferred,
   conntrack/NAT, config/journal).
+- Userspace L2 bridge datapath: bridge membership, MAC learning/FDB aging,
+  unicast/flood forwarding, per-bridge SVI addressing, bridge ARP resolution,
+  and DHCP serving on any member port.
+
+### Fixed
+
+- Bound the ARP neighbour cache and miss-rate map; stale entries are pruned and
+  the oldest entry is evicted at capacity (spoofed-ARP memory exhaustion).
+- Synchronize the DNS cache between UDP/TCP workers, use separate upstream
+  sockets per worker, and bound TCP query reads with a deadline.
+- Age cached DNS record TTLs, apply RFC 2308 negative-cache TTLs from SOA
+  records, return NODATA for non-A local-zone queries, and accept zone-only DNS
+  configs.
+- Reject DHCP pools that contain the router address and refuse to commit or
+  decline that address defensively.
+- Make journal address ownership host-exact rather than network-exact, and drop
+  journal records when a link/address/route mutation fails.
+- Make `examples/minimal.json` runnable with L2 ports and reject unsupported
+  existing L3 ports, duplicate port devices, routes without a device,
+  masquerade interfaces without an address, and DHCP pools containing the
+  router address.
+- Harden the DHCP client: random transaction IDs, reply/xid/server-id checks,
+  NAK handling, T1/T2 renew and rebind timers, and explicit masquerade opt-in.
+- Bring daemon-created TUN/TAP devices up before handing them to the datapath.
+- Record the boot time in the persisted DHCP lease database and discard leases
+  from a previous boot, so monotonic expiry timestamps cannot keep stale
+  bindings alive after a reboot.
+- Scope port forwards with the optional `in` ingress selector and match rules
+  by ingress port.
+- Cap supported MTUs at 1600 bytes (the 2048-byte frame buffer limit) and
+  reject jumbo configuration with a typed validation error.
+- Enforce firewall default input/forward policies (`drop`/`reject`/`accept`)
+  in the datapath; allow-rule matching remains R6. Explicit port forwards are
+  treated as administrator allows, and `default_out` rejects non-accept values
+  until outbound policy is implemented. Reject bridge STP, VLAN-aware and
+  kernel-offload options until implemented instead of silently ignoring them.
+- Keep bridge floods running when one member is down or its MTU is exceeded,
+  rate-limit bridge-wide ARP resolution, and send valid ARP probes for DHCP
+  conflict detection.
+- Retry DHCP client acquisition after repeated failures, accept ACKs/NAKs from
+  a replacement server during RENEWING/REBINDING, and scope conflict detection
+  to the local L2 segment.
+- Fix negative DNS caching for NXDOMAIN responses that also carry a CNAME, and
+  discard pre-`boot_ms` lease databases instead of restoring potentially stale
+  leases.
 
 ### R2 — IPv4 forwarding (core)
 

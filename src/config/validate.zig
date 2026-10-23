@@ -19,6 +19,13 @@ pub fn validate(cfg: *const schema.Config) ConfigError!void {
     try validateNat(cfg);
     try validateDhcp(cfg);
     try validateDns(cfg);
+    try validateFirewall(cfg);
+}
+
+fn validateFirewall(cfg: *const schema.Config) ConfigError!void {
+    // Outbound allow rules are not implemented yet; accepting the policy
+    // silently would make `default_out: "drop"` a no-op.
+    if (cfg.firewall.default_out != .accept) return error.InvalidValue;
 }
 
 fn validateInstance(instance: []const u8) ConfigError!void {
@@ -40,6 +47,11 @@ fn validatePorts(cfg: *const schema.Config) ConfigError!void {
 
         const port = entry.value_ptr.*;
         if (port.device.len == 0 or port.device.len >= 16) return error.InvalidValue;
+        if (port.kind == .l3 and port.create == null) {
+            // Existing L3 devices have no fd vNAT can adopt; only TUN can be
+            // created and owned by the daemon.
+            return error.InvalidValue;
+        }
         if (port.create) |create| {
             switch (create) {
                 .tun => if (port.kind != .l3) return error.InvalidValue,
@@ -47,7 +59,15 @@ fn validatePorts(cfg: *const schema.Config) ConfigError!void {
             }
         }
         if (port.mtu) |mtu| {
-            if (mtu < 576 or mtu > 9000) return error.InvalidValue;
+            if (mtu < 576 or mtu > types.max_supported_mtu) return error.InvalidValue;
+        }
+
+        var other = cfg.ports.iterator();
+        while (other.next()) |other_entry| {
+            if (std.mem.eql(u8, other_entry.key_ptr.*, name)) continue;
+            if (std.mem.eql(u8, other_entry.value_ptr.device, port.device)) {
+                return error.DuplicateName;
+            }
         }
     }
 }
@@ -61,6 +81,9 @@ fn validateBridges(cfg: *const schema.Config) ConfigError!void {
 
         const bridge = entry.value_ptr.*;
         if (bridge.ports.len == 0) return error.InvalidValue;
+        if (bridge.stp) return error.InvalidValue;
+        if (bridge.vlan_aware) return error.InvalidValue;
+        if (bridge.offload != .none) return error.InvalidValue;
 
         for (bridge.ports, 0..) |port_name, i| {
             const port = cfg.ports.getPtr(port_name) orelse return error.UndefinedReference;
@@ -98,6 +121,9 @@ fn validateInterfaces(cfg: *const schema.Config) ConfigError!void {
 
         if (itf.bridge) |bridge| {
             if (!cfg.bridges.contains(bridge)) return error.UndefinedReference;
+            if (itf.address) |address| {
+                if (std.mem.eql(u8, address, "dhcp")) return error.InvalidValue;
+            }
         }
         if (itf.port) |port| {
             if (!cfg.ports.contains(port)) return error.UndefinedReference;
@@ -117,14 +143,11 @@ fn validateRoutes(cfg: *const schema.Config) ConfigError!void {
         if (route.via) |via| {
             _ = types.Ipv4.parse(via) catch return error.InvalidValue;
         }
-        if (route.dev) |dev| {
-            if (!cfg.ports.contains(dev) and !cfg.interfaces.contains(dev)) {
-                return error.UndefinedReference;
-            }
-            if (cfg.ports.contains(dev) and portInAnyBridge(cfg, dev)) {
-                return error.InvalidValue;
-            }
-        } else if (route.via == null) {
+        const dev = route.dev orelse return error.InvalidValue;
+        if (!cfg.ports.contains(dev) and !cfg.interfaces.contains(dev)) {
+            return error.UndefinedReference;
+        }
+        if (cfg.ports.contains(dev) and portInAnyBridge(cfg, dev)) {
             return error.InvalidValue;
         }
     }
@@ -138,6 +161,9 @@ fn validateNat(cfg: *const schema.Config) ConfigError!void {
         if (cfg.ports.contains(m.out) and portInAnyBridge(cfg, m.out)) {
             return error.InvalidValue;
         }
+        if (cfg.interfaces.getPtr(m.out)) |itf| {
+            if (itf.address == null) return error.InvalidValue;
+        }
     }
 
     for (cfg.nat.port_forward) |f| {
@@ -148,6 +174,18 @@ fn validateNat(cfg: *const schema.Config) ConfigError!void {
             to.ip.eql(types.Ipv4.limited_broadcast))
         {
             return error.InvalidValue;
+        }
+        if (f.in_iface) |in_iface| {
+            if (!cfg.ports.contains(in_iface) and !cfg.interfaces.contains(in_iface)) {
+                return error.UndefinedReference;
+            }
+            if (cfg.ports.contains(in_iface) and portInAnyBridge(cfg, in_iface)) {
+                return error.InvalidValue;
+            }
+            if (cfg.interfaces.getPtr(in_iface)) |itf| {
+                if (itf.bridge != null) return error.InvalidValue;
+                if (itf.port == null) return error.InvalidValue;
+            }
         }
     }
 }
@@ -163,6 +201,9 @@ fn validateDhcp(cfg: *const schema.Config) ConfigError!void {
         _ = types.parseDurationSeconds(d.lease) catch return error.InvalidValue;
 
         if (!prefix.contains(range.first) or !prefix.contains(range.last)) {
+            return error.InvalidValue;
+        }
+        if (prefix.addr.value >= range.first.value and prefix.addr.value <= range.last.value) {
             return error.InvalidValue;
         }
         if (prefix.len < 31) {
@@ -183,7 +224,7 @@ fn validateDhcp(cfg: *const schema.Config) ConfigError!void {
             }
         }
         if (d.mtu) |mtu| {
-            if (mtu < 576 or mtu > 9000) return error.InvalidValue;
+            if (mtu < 576 or mtu > types.max_supported_mtu) return error.InvalidValue;
         }
         if (d.ntp) |ntp| {
             _ = types.Ipv4.parse(ntp) catch return error.InvalidValue;
@@ -214,7 +255,7 @@ fn validateDns(cfg: *const schema.Config) ConfigError!void {
     }
     if (cfg.dns.listen) |listen| {
         _ = types.Ipv4.parse(listen) catch return error.InvalidValue;
-    } else if (cfg.dns.upstreams.len != 0) {
+    } else if (cfg.dns.upstreams.len != 0 or cfg.dns.zones.len != 0) {
         return error.InvalidValue;
     }
     if (cfg.dns.max_entries == 0 or cfg.dns.max_entries > 1_000_000) {
@@ -251,7 +292,7 @@ const example =
     \\  "version": 1,
     \\  "instance": "travel-router",
     \\  "ports": {
-    \\    "wan": { "kind": "l3", "device": "eth0" },
+    \\    "wan": { "kind": "l2", "device": "eth0" },
     \\    "lan": { "kind": "l2", "device": "eth1" }
     \\  },
     \\  "bridges": { "lan-br": { "ports": ["lan"] } },
@@ -299,6 +340,35 @@ test "rejects l3 port in bridge" {
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();
     try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects unsupported bridge options" {
+    const input_stp =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "bridges": { "br": { "ports": ["lan"], "stp": true } } }
+    ;
+    var parsed_stp = try @import("parse.zig").parse(std.testing.allocator, input_stp);
+    defer parsed_stp.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_stp.config));
+
+    const input_vlan =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "bridges": { "br": { "ports": ["lan"], "vlan_aware": true } } }
+    ;
+    var parsed_vlan = try @import("parse.zig").parse(std.testing.allocator, input_vlan);
+    defer parsed_vlan.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_vlan.config));
+
+    const input_offload =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "bridges": { "br": { "ports": ["lan"], "offload": "kernel" } } }
+    ;
+    var parsed_offload = try @import("parse.zig").parse(std.testing.allocator, input_offload);
+    defer parsed_offload.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_offload.config));
 }
 
 test "rejects port in two bridges" {
@@ -430,6 +500,70 @@ test "accepts a lease database path" {
 test "rejects an empty lease database path" {
     const input =
         \\{ "version": 1, "instance": "x", "lease_db": "" }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects route via without a device" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "routes": [ { "dst": "0.0.0.0/0", "via": "10.0.0.1" } ] }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects dhcp pool containing the router address" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "interfaces": { "lan0": { "port": "lan", "address": "10.10.0.1/24" } },
+        \\  "dhcp": [ { "iface": "lan0", "pool": "10.10.0.1-10.10.0.20" } ] }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects duplicate port devices" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "eth1" },
+        \\    "b": { "kind": "l2", "device": "eth1" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.DuplicateName, validate(&parsed.config));
+}
+
+test "rejects existing l3 ports" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "wan": { "kind": "l3", "device": "eth0" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects zone-only dns without a listener" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "dns": { "zones": [ { "suffix": "lan", "upstreams": ["10.0.0.1"] } ] } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "rejects an outbound firewall policy that is not implemented" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "default_out": "drop" } }
     ;
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();

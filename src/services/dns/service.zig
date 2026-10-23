@@ -24,12 +24,19 @@ pub const Config = struct {
 };
 
 pub const Counters = struct {
-    queries: u64 = 0,
-    responses: u64 = 0,
-    cache_hits: u64 = 0,
-    upstream_errors: u64 = 0,
-    dropped: u64 = 0,
+    queries: std.atomic.Value(u64) = .init(0),
+    responses: std.atomic.Value(u64) = .init(0),
+    cache_hits: std.atomic.Value(u64) = .init(0),
+    upstream_errors: std.atomic.Value(u64) = .init(0),
+    dropped: std.atomic.Value(u64) = .init(0),
+
+    fn inc(counter: *std.atomic.Value(u64)) void {
+        _ = counter.fetchAdd(1, .monotonic);
+    }
 };
+
+const tcp_query_timeout_ms: i64 = 5_000;
+const max_tcp_query_len: usize = 4096;
 
 pub const Error = error{
     OutOfMemory,
@@ -44,8 +51,10 @@ pub const Service = struct {
     cfg: Config,
     socket: std.Io.net.Socket,
     upstream_socket: std.Io.net.Socket,
+    upstream_socket_tcp: std.Io.net.Socket,
     tcp_listener: ?std.Io.net.Server = null,
     cache: cache_mod.Cache,
+    cache_mutex: std.Io.Mutex = .init,
     counters: Counters = .{},
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_future: std.Io.Future(void) = undefined,
@@ -54,7 +63,7 @@ pub const Service = struct {
     tcp_started: bool = false,
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, cfg: Config) Error!Service {
-        if (cfg.upstreams.len == 0) return error.UpstreamBindFailed;
+        if (cfg.upstreams.len == 0 and cfg.zones.len == 0) return error.UpstreamBindFailed;
         const listen = std.Io.net.IpAddress{ .ip4 = .{
             .bytes = cfg.listen_ip.toBytes(),
             .port = cfg.listen_port,
@@ -67,6 +76,10 @@ pub const Service = struct {
         const upstream_socket = any.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch
             return error.UpstreamBindFailed;
         errdefer upstream_socket.close(io);
+
+        const upstream_socket_tcp = any.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch
+            return error.UpstreamBindFailed;
+        errdefer upstream_socket_tcp.close(io);
 
         var tcp_listener: ?std.Io.net.Server = null;
         if (cfg.tcp) {
@@ -83,6 +96,7 @@ pub const Service = struct {
             .cfg = cfg,
             .socket = socket,
             .upstream_socket = upstream_socket,
+            .upstream_socket_tcp = upstream_socket_tcp,
             .tcp_listener = tcp_listener,
             .cache = cache_mod.Cache.init(gpa, if (cfg.cache) cfg.cache_max_entries else 0),
         };
@@ -103,6 +117,7 @@ pub const Service = struct {
         self.stop.store(true, .release);
         self.socket.close(self.io);
         self.upstream_socket.close(self.io);
+        self.upstream_socket_tcp.close(self.io);
         if (self.tcp_listener) |*listener| {
             listener.socket.close(self.io);
             self.tcp_listener = null;
@@ -135,20 +150,20 @@ pub const Service = struct {
                 error.Timeout => continue,
                 error.Canceled => return,
                 else => {
-                    self.counters.dropped += 1;
+                    Counters.inc(&self.counters.dropped);
                     continue;
                 },
             };
-            self.counters.queries += 1;
-            const response = self.resolve(incoming.data, &out) catch {
-                self.counters.dropped += 1;
+            Counters.inc(&self.counters.queries);
+            const response = self.resolve(incoming.data, &out, &self.upstream_socket) catch {
+                Counters.inc(&self.counters.dropped);
                 continue;
             };
             self.socket.send(self.io, &incoming.from, response) catch {
-                self.counters.dropped += 1;
+                Counters.inc(&self.counters.dropped);
                 continue;
             };
-            self.counters.responses += 1;
+            Counters.inc(&self.counters.responses);
         }
     }
 
@@ -159,7 +174,7 @@ pub const Service = struct {
                 error.ConnectionAborted => continue,
                 else => {
                     if (self.stop.load(.acquire)) return;
-                    self.counters.dropped += 1;
+                    Counters.inc(&self.counters.dropped);
                     continue;
                 },
             };
@@ -169,29 +184,28 @@ pub const Service = struct {
 
     fn handleTcpStream(self: *Service, stream: std.Io.net.Stream) void {
         defer stream.close(self.io);
-        var read_buf: [4096]u8 = undefined;
-        var reader = stream.reader(self.io, &read_buf);
+        const deadline = nowMs(self.io) + tcp_query_timeout_ms;
         var len_buf: [2]u8 = undefined;
-        reader.interface.readSliceAll(&len_buf) catch {
-            self.counters.dropped += 1;
+        self.readTcpAll(stream.socket.handle, &len_buf, deadline) catch {
+            Counters.inc(&self.counters.dropped);
             return;
         };
         const query_len = std.mem.readInt(u16, &len_buf, .big);
-        if (query_len < 12 or query_len > read_buf.len) {
-            self.counters.dropped += 1;
+        if (query_len < 12 or query_len > max_tcp_query_len) {
+            Counters.inc(&self.counters.dropped);
             return;
         }
-        var query_buf: [4096]u8 = undefined;
-        reader.interface.readSliceAll(query_buf[0..query_len]) catch {
-            self.counters.dropped += 1;
+        var query_buf: [max_tcp_query_len]u8 = undefined;
+        self.readTcpAll(stream.socket.handle, query_buf[0..query_len], deadline) catch {
+            Counters.inc(&self.counters.dropped);
             return;
         };
         const query = query_buf[0..query_len];
 
-        self.counters.queries += 1;
+        Counters.inc(&self.counters.queries);
         var out: [4096]u8 = undefined;
-        const response = self.resolve(query, &out) catch {
-            self.counters.dropped += 1;
+        const response = self.resolve(query, &out, &self.upstream_socket_tcp) catch {
+            Counters.inc(&self.counters.dropped);
             return;
         };
 
@@ -200,21 +214,44 @@ pub const Service = struct {
         var prefix: [2]u8 = undefined;
         std.mem.writeInt(u16, &prefix, @intCast(response.len), .big);
         writer.interface.writeAll(&prefix) catch {
-            self.counters.dropped += 1;
+            Counters.inc(&self.counters.dropped);
             return;
         };
         writer.interface.writeAll(response) catch {
-            self.counters.dropped += 1;
+            Counters.inc(&self.counters.dropped);
             return;
         };
         writer.interface.flush() catch {
-            self.counters.dropped += 1;
+            Counters.inc(&self.counters.dropped);
             return;
         };
-        self.counters.responses += 1;
+        Counters.inc(&self.counters.responses);
     }
 
-    fn resolve(self: *Service, query: []const u8, out: []u8) ![]u8 {
+    fn readTcpAll(self: *Service, fd: std.posix.fd_t, out: []u8, deadline_ms: i64) !void {
+        // std.Io has no deadline-aware stream read, so poll() bounds the
+        // whole query and keeps a stalled client from pinning the TCP worker.
+        var off: usize = 0;
+        while (off < out.len) {
+            const remaining = deadline_ms - nowMs(self.io);
+            if (remaining <= 0) return error.Timeout;
+            var fds = [_]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32))));
+            if (ready == 0) return error.Timeout;
+            const n = std.posix.read(fd, out[off..]) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.EndOfStream;
+            off += n;
+        }
+    }
+
+    fn resolve(self: *Service, query: []const u8, out: []u8, upstream_socket: *std.Io.net.Socket) ![]u8 {
         if (!message.isStandardQuery(query)) return error.BadQuery;
         const header = message.parseHeader(query) catch return error.BadQuery;
         const key = message.questionKey(query) catch return error.BadQuery;
@@ -224,26 +261,29 @@ pub const Service = struct {
 
         if (qname) |name| {
             if (isLocalZone(name)) {
-                return buildLocalResponse(out, query, header.id, self.cfg.listen_ip);
+                if (message.questionType(query) == 1) {
+                    return buildLocalResponse(out, query, header.id, self.cfg.listen_ip);
+                }
+                return message.buildError(out, query, 0);
             }
         }
 
         if (self.cfg.cache) {
-            if (self.cache.get(key, out, nowMs(self.io))) |cached| {
+            if (self.cacheGet(key, out, nowMs(self.io))) |cached| {
                 message.setHeaderId(cached, header.id);
-                self.counters.cache_hits += 1;
+                Counters.inc(&self.counters.cache_hits);
                 return cached;
             }
         }
 
         const upstreams = if (qname) |name| self.upstreamsFor(name) else self.cfg.upstreams;
-        const response = self.queryUpstream(query, key, upstreams, out) catch {
-            self.counters.upstream_errors += 1;
+        const response = self.queryUpstream(upstream_socket, query, key, upstreams, out) catch {
+            Counters.inc(&self.counters.upstream_errors);
             return message.buildError(out, query, 2) catch error.BadQuery;
         };
-        const ttl = message.minTtl(response);
+        const ttl = message.cacheTtl(response);
         const ttl_ms = @as(u64, ttl) * 1000;
-        self.cache.put(
+        self.cachePut(
             key,
             response,
             @intCast(@min(ttl_ms, std.math.maxInt(u32))),
@@ -267,7 +307,19 @@ pub const Service = struct {
         return self.cfg.upstreams;
     }
 
-    fn queryUpstream(self: *Service, query: []const u8, key: []const u8, upstreams: []const types.Ipv4, out: []u8) ![]u8 {
+    fn cacheGet(self: *Service, key: []const u8, out: []u8, now: i64) ?[]u8 {
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        return self.cache.get(key, out, now);
+    }
+
+    fn cachePut(self: *Service, key: []const u8, response: []const u8, ttl_ms: u32, now: i64) !void {
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        try self.cache.put(key, response, ttl_ms, now);
+    }
+
+    fn queryUpstream(self: *Service, socket: *std.Io.net.Socket, query: []const u8, key: []const u8, upstreams: []const types.Ipv4, out: []u8) ![]u8 {
         const header = try message.parseHeader(query);
         for (upstreams) |upstream| {
             const dest = std.Io.net.IpAddress{ .ip4 = .{
@@ -276,12 +328,12 @@ pub const Service = struct {
             } };
 
             // UDP first, with a single retry window.
-            self.upstream_socket.send(self.io, &dest, query) catch {};
+            socket.send(self.io, &dest, query) catch {};
             var udp_response: ?[]u8 = null;
             var udp_buf: [4096]u8 = undefined;
             var attempts: usize = 0;
             while (attempts < 2) : (attempts += 1) {
-                const incoming = self.upstream_socket.receiveTimeout(
+                const incoming = socket.receiveTimeout(
                     self.io,
                     &udp_buf,
                     timeoutMs(1_000),
@@ -460,4 +512,19 @@ test "service rejects configs without upstreams" {
         .upstreams = &.{},
     };
     try testing.expectError(error.UpstreamBindFailed, Service.init(testing.io, testing.allocator, cfg));
+}
+
+test "service accepts a zone-only configuration" {
+    const zones = [_]Zone{.{
+        .suffix = "lan",
+        .upstreams = &.{.{ .value = 0x0a000001 }},
+    }};
+    var service = try Service.init(testing.io, testing.allocator, .{
+        .listen_ip = .{ .value = 0x7f000001 },
+        .listen_port = 0,
+        .upstreams = &.{},
+        .zones = &zones,
+        .tcp = false,
+    });
+    defer service.deinit();
 }

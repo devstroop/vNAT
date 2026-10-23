@@ -85,7 +85,7 @@ pub fn setUp(name: []const u8, up: bool) PortError!void {
 }
 
 pub fn setMtu(name: []const u8, value: u16) PortError!void {
-    if (value < 576 or value > 9000) return error.InvalidArgument;
+    if (value < 576 or value > types.max_supported_mtu) return error.InvalidArgument;
 
     const fd = try sys.controlSocket();
     defer sys.close(fd);

@@ -75,7 +75,9 @@ Every port exposes:
 | monitor | rtnetlink `RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV6_IFADDR`, `RTMGRP_NEIGH` | — |
 
 - Config creation: set `"create": "tun"` (L3) or `"create": "tap"` (L2) to
-  have vNAT create the device; without `create`, the device must already exist.
+  have vNAT create the device. Existing L2 devices are opened via `AF_PACKET`;
+  existing L3 devices are rejected because vNAT cannot adopt their fd from
+  config (hosts may still inject a TUN fd through the C ABI).
 - Default: **no kernel bridge**, vNAT bridges in userspace. Optional
   `bridge.offload = "kernel"` creates a kernel bridge and enslaves ports for
   higher throughput.
@@ -128,8 +130,13 @@ pub const Frame = struct {
   - unknown unicast / broadcast / multicast → flood to all member ports
     (except ingress)
   - no hairpin unless configured
+- Implemented: userspace MAC learning/FDB aging, known-unicast, unknown-
+  unicast and broadcast flooding, per-bridge SVI addressing and DHCP service
+  on any member port. Router-routed traffic resolves neighbours across the
+  bridge and preserves the bridge zone in conntrack.
 - STP: 802.1D basic (blocking/listening/learning/forwarding) **optional**;
-  default off for small trusted topologies, on when `bridge.stp = true`.
+  default off for small trusted topologies. `bridge.stp = true` is rejected
+  until the implementation lands (R5).
 - Loop protection: per-port ingress rate limit + storm control.
 - Port isolation and per-port VLAN membership.
 
@@ -138,15 +145,16 @@ pub const Frame = struct {
 - 802.1Q parse/insert; TPID 0x8100 (0x88A8 optional later).
 - Per-port `pvid` (untagged ingress VLAN) and `tagged` set.
 - Trunk ports carry multiple VLANs; access ports carry one.
-- VLAN-aware bridging: FDB keyed by `(vlan, mac)`.
+- VLAN-aware bridging: FDB keyed by `(vlan, mac)`. `vlan_aware = true` is
+  rejected until VLAN bridging lands (R5); tagged frames are dropped.
 - No QinQ in v1.
 
 ### 3.3 Offload
 
 `bridge.offload = "none" | "kernel"`:
 - `none`: userspace forwarding (default, portable).
-- `kernel` (Linux): create `br-<name>`, enslave ports, set `vlan_filtering`.
-  vNAT still owns configuration and monitoring. Requires `CAP_NET_ADMIN`.
+- `kernel` (Linux): reserved for a later milestone; currently rejected rather
+  than silently falling back to userspace.
 
 ### 3.4 Counters
 
@@ -180,6 +188,9 @@ Per bridge/port: rx/tx frames, bytes, flooded, learned, aged, drops
 - MSS clamping on TCP SYN/SYN-ACK when `mtu.clamp = true` (recommended).
 - Generate ICMP Fragmentation Needed with the correct next-hop MTU.
 - Never emit a frame larger than the egress MTU; drop + count otherwise.
+- Validated MTUs are capped at 1600 bytes by the current 2048-byte userspace
+  frame buffers; jumbo-frame configs are rejected instead of silently
+  truncating.
 - DF honored; no PMTUD blackhole workaround in v1 beyond MSS clamp.
 
 ### 4.4 Multicast / broadcast
@@ -257,6 +268,8 @@ vnat nat add port-forward --proto udp --ext-port 51820 --to 10.10.0.7:51820
 ```
 
 - Match on egress port + protocol + external port (+ optional source CIDR).
+  The optional `in` selector restricts a rule to one ingress port/interface;
+  omitted means any ingress.
 - Rewrite destination and reverse state; optional source rewriting for
   hairpin.
 - Range mapping `8080-8090:80-90` — v1.1.
@@ -264,8 +277,9 @@ vnat nat add port-forward --proto udp --ext-port 51820 --to 10.10.0.7:51820
 ### 5.4 R3 implementation notes (current)
 
 - Conntrack uses a single table with both directions mapped to one entry and
-  a zone (ingress/egress port id) in the key; 64-way sharding is deferred. GC
-  is a 1 s full sweep, cap 65,536 entries.
+  a zone (ingress/egress port id, or a shared bridge zone for bridged SVIs) in
+  the key; 64-way sharding is deferred. GC is a 1 s full sweep, cap 65,536
+  entries.
 - TCP uses flag-based new/established/closing states with SYN 10 s,
   established 300 s and FIN 120 s/RST 10 s timeouts. UDP and ICMP echo use
   30 s; other protocols are not tracked yet.
@@ -308,7 +322,10 @@ Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
 `reject`, `log`, `mark`, `snat`, `dnat`.
 
 - Default policy: `inbound: drop`, `forward: drop`, `outbound: accept`
-  (configurable; this is a router, not a transparent bridge).
+  (configurable; this is a router, not a transparent bridge). The default
+  input/forward policies are enforced in the datapath now. Ordered rule
+  matching, `outbound` policy and reject-with-reason details remain R6.
+  Router-local DHCP/DNS services bypass the input policy until R6 hooks land.
 - Conntrack integration: `ct_state established,related` accept shortcut.
 - Stateful by default for TCP/UDP; stateless option per rule.
 
@@ -376,7 +393,7 @@ machine-checked configs live in `examples/`):
     "vpn0":    { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
-    "lan-br": { "ports": ["lan"], "stp": false, "vlan_aware": true }
+    "lan-br": { "ports": ["lan"] }
   },
   "interfaces": {
     "lan0": { "bridge": "lan-br", "address": "10.10.0.1/24" },
@@ -409,7 +426,7 @@ machine-checked configs live in `examples/`):
     "listen": "10.10.0.1",
     "max_entries": 1024
   },
-  "firewall": { "default_in": "drop", "default_forward": "drop" }
+  "firewall": { "default_in": "drop", "default_forward": "accept" }
 }
 ```
 
@@ -427,9 +444,15 @@ Rules for config:
 
 - **validated**: parsed and semantically checked.
 - **consumed**: used by the running daemon.
-- **reserved**: accepted for forward compatibility but not yet consumed.
+- **reserved**: recognized but not implemented; enabling it fails with a
+  typed error instead of silently falling back.
 
-Current reserved fields include future bridge, firewall, and VLAN keys.
+Current reserved fields include bridge STP/VLAN-awareness/kernel offload and
+future firewall rule keys. Bridge membership, the DHCP client, and
+`default_in`/`default_forward` are consumed by the datapath; `default_out`
+only accepts `"accept"` until outbound policy is implemented. Explicit
+`port_forward` rules are treated as administrator allows and bypass
+`default_forward` for the flow they create.
 
 ### 9.2 CLI
 

@@ -74,7 +74,8 @@ cat >"$CONFIG" <<JSON
     "listen": "10.30.0.1",
     "cache": true,
     "max_entries": 64
-  }
+  },
+  "firewall": { "default_in": "accept", "default_forward": "accept" }
 }
 JSON
 

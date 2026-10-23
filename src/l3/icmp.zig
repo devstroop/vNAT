@@ -15,6 +15,7 @@ pub const Code = struct {
     pub const net_unreachable: u8 = 0;
     pub const host_unreachable: u8 = 1;
     pub const frag_needed: u8 = 4;
+    pub const admin_prohibited: u8 = 13;
     pub const ttl_exceeded: u8 = 0;
 };
 
