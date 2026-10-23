@@ -1,35 +1,37 @@
 # vNAT
 
-Portable virtual router in Zig 0.16.x for Linux and Android.
+Headless virtual router implemented in Zig 0.16.x.
 
-## Quick Start
+vNAT attaches network interfaces, forwards Ethernet and IPv4 traffic, and
+provides NAT, DHCP, DNS, and journal-backed host configuration. It runs as a
+daemon with a command-line interface and exposes a C ABI for embedded hosts.
 
-```sh
-zig build
-./zig-out/bin/vnat validate examples/minimal.json
-./zig-out/bin/vnatd -c examples/minimal.json
-```
+## Capabilities
 
-## CLI
+- AF_PACKET L2 ports and TUN/TAP L3 ports
+- ARP handling, IPv4 forwarding, ICMP errors, and TTL processing
+- Userspace connection tracking and garbage collection
+- Source NAT, destination NAT, port forwarding, and hairpin handling
+- DHCPv4 server and client with lease persistence
+- DNS forwarding with cache, TCP fallback, and split zones
+- Atomic, journaled route/address/link changes with rollback
+- Cross-compilation for Linux and Android targets
 
-```sh
-vnat version
-vnat validate <config.json>
-vnat status [-c <config>]
-vnat port list
-vnat iface set|del <dev> <cidr> [-c <config>]
-vnat iface up|down <dev> [-c <config>]
-vnat route add|del ...
-vnat down [-c <config>]
-vnat journal [-c <config>]
-vnat dhcp status [-c <config>]
-vnat dns query <name> [-c <config>]
-```
+## Requirements
 
-## Build and Test
+- Zig 0.16.x
+- Linux kernel with AF_PACKET support
+
+## Build
 
 ```sh
 zig build
+zig build --release=fast
+```
+
+## Test
+
+```sh
 zig build test
 bash scripts/test_netns.sh
 bash scripts/test_route.sh
@@ -40,24 +42,65 @@ bash scripts/test_dhcp.sh
 bash scripts/test_dns.sh
 ```
 
+Cross-build:
+
+```sh
+zig build -Dtarget=x86_64-linux
+zig build -Dtarget=aarch64-linux
+zig build -Dtarget=aarch64-linux-android
+zig build -Dtarget=arm-linux-androideabi
+```
+
+## Usage
+
+Validate a configuration:
+
+```sh
+./zig-out/bin/vnat validate examples/minimal.json
+```
+
+Start the daemon:
+
+```sh
+./zig-out/bin/vnatd -c examples/minimal.json
+```
+
+Common commands:
+
+```sh
+vnat status [-c <config>]
+vnat port list
+vnat iface set <dev> <cidr> [-c <config>]
+vnat route add <dst> [via <ip>] dev <dev> [-c <config>]
+vnat down [-c <config>]
+vnat journal [-c <config>]
+vnat dhcp status [-c <config>]
+vnat dns query <name> [-c <config>]
+```
+
 ## Configuration
 
-`examples/minimal.json` is runnable. `examples/travel-router.json` is illustrative.
-See `examples/README.md`.
-
-## Architecture
-
-Userspace L2/L3 forwarding, conntrack, NAT, DHCP, DNS, journaled mutations.
-See `docs/ARCHITECTURE.md`.
+- `examples/minimal.json`: runnable example
+- `examples/travel-router.json`: illustrative target-state configuration
+- `examples/README.md`: example status notes
 
 ## Documentation
 
-1. docs/PRODUCT.md
-2. docs/CORE-SCOPE.md
-3. docs/ANDROID.md
-4. docs/ARCHITECTURE.md
-5. docs/PLAN.md
+1. `docs/PRODUCT.md`
+2. `docs/CORE-SCOPE.md`
+3. `docs/ANDROID.md`
+4. `docs/ARCHITECTURE.md`
+5. `docs/PLAN.md`
+6. `docs/RESEARCH.md`
+7. `docs/SOURCES.md`
+8. `docs/adr/`
 
-## Status
+Contributor rules: `AGENTS.md`.
 
-R0-R3 complete. R4 in progress. R5-R9 planned.
+## Implementation Status
+
+- R0-R3: complete
+- R4: in progress
+- R5-R9: planned
+
+See `docs/PLAN.md` for milestone details.
