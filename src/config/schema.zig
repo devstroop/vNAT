@@ -21,6 +21,11 @@ pub const PortConfig = struct {
     device: []const u8,
     create: ?PortCreate = null,
     mtu: ?u16 = null,
+    /// Untagged ingress VLAN; null means untagged (non-VLAN bridge) or 1
+    /// (VLAN-aware bridge).
+    pvid: ?u16 = null,
+    /// VLANs accepted and emitted with an 802.1Q tag on this port.
+    tagged: []const u16 = &.{},
 };
 
 pub const BridgeOffload = enum { none, kernel };
@@ -37,6 +42,8 @@ pub const InterfaceConfig = struct {
     port: ?[]const u8 = null,
     /// CIDR (e.g. "10.10.0.1/24") or "dhcp".
     address: ?[]const u8 = null,
+    /// Routed VLAN on a VLAN-aware bridge SVI; defaults to 1.
+    vlan: ?u16 = null,
 };
 
 pub const RouteConfig = struct {
@@ -97,10 +104,26 @@ pub const DnsConfig = struct {
 
 pub const FirewallAction = enum { accept, drop, reject };
 
+pub const FirewallCtState = enum { new, established, related, invalid };
+
+pub const FirewallRuleConfig = struct {
+    action: FirewallAction,
+    proto: ?Proto = null,
+    src: ?[]const u8 = null,
+    dst: ?[]const u8 = null,
+    sport: ?u16 = null,
+    dport: ?u16 = null,
+    iif: ?[]const u8 = null,
+    oif: ?[]const u8 = null,
+    ct_state: []const FirewallCtState = &.{},
+};
+
 pub const FirewallConfig = struct {
     default_in: FirewallAction = .drop,
     default_forward: FirewallAction = .drop,
     default_out: FirewallAction = .accept,
+    rp_filter: bool = false,
+    rules: []const FirewallRuleConfig = &.{},
 };
 
 pub const PortMap = std.StringArrayHashMapUnmanaged(PortConfig);

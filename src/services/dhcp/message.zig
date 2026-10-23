@@ -157,6 +157,14 @@ pub const Message = struct {
         @memcpy(&mac.bytes, self.chaddr[0..6]);
         return mac;
     }
+
+    /// RFC 2132 option 61. When present it takes precedence over `chaddr` as
+    /// the lease identity.
+    pub fn clientId(self: Message) ?[]const u8 {
+        const value = self.options.get(61) orelse return null;
+        if (value.len == 0) return null;
+        return value;
+    }
 };
 
 pub const Builder = struct {

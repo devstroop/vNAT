@@ -86,7 +86,9 @@ pub const Cache = struct {
     /// memory.
     pub const max_entries: usize = 1024;
 
-    map: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+    /// Keyed by `(vlan, ip)`: overlapping subnets on different VLANs must not
+    /// share neighbours, even when they arrive on the same trunk port.
+    map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
         self.map.deinit(gpa);
@@ -98,7 +100,11 @@ pub const Cache = struct {
     }
 
     pub fn get(self: *const Cache, ip: types.Ipv4) ?Entry {
-        return self.map.get(ip.value);
+        return self.getVlan(ip, 0);
+    }
+
+    pub fn getVlan(self: *const Cache, ip: types.Ipv4, vlan: u16) ?Entry {
+        return self.map.get(cacheKey(ip, vlan));
     }
 
     pub fn getFresh(
@@ -108,27 +114,59 @@ pub const Cache = struct {
         now_ms: i64,
         ttl_ms: i64,
     ) ?Entry {
-        const entry = self.map.get(ip.value) orelse return null;
+        return self.getFreshVlan(ip, 0, port, now_ms, ttl_ms);
+    }
+
+    pub fn getFreshVlan(
+        self: *const Cache,
+        ip: types.Ipv4,
+        vlan: u16,
+        port: types.PortId,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) ?Entry {
+        const entry = self.map.get(cacheKey(ip, vlan)) orelse return null;
         if (!entry.port.eql(port)) return null;
         if (now_ms - entry.updated_ms > ttl_ms) return null;
         return entry;
     }
 
     pub fn getFreshAny(self: *const Cache, ip: types.Ipv4, now_ms: i64, ttl_ms: i64) ?Entry {
-        const entry = self.map.get(ip.value) orelse return null;
+        return self.getFreshAnyVlan(ip, 0, now_ms, ttl_ms);
+    }
+
+    pub fn getFreshAnyVlan(
+        self: *const Cache,
+        ip: types.Ipv4,
+        vlan: u16,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) ?Entry {
+        const entry = self.map.get(cacheKey(ip, vlan)) orelse return null;
         if (now_ms - entry.updated_ms > ttl_ms) return null;
         return entry;
     }
 
     pub fn put(self: *Cache, gpa: std.mem.Allocator, ip: types.Ipv4, entry: Entry) !void {
-        if (self.map.getPtr(ip.value)) |slot| {
+        return self.putVlan(gpa, ip, 0, entry);
+    }
+
+    pub fn putVlan(
+        self: *Cache,
+        gpa: std.mem.Allocator,
+        ip: types.Ipv4,
+        vlan: u16,
+        entry: Entry,
+    ) !void {
+        const key = cacheKey(ip, vlan);
+        if (self.map.getPtr(key)) |slot| {
             slot.* = entry;
             return;
         }
         if (self.map.count() >= max_entries and !self.evictOldest()) {
             return error.NoSpace;
         }
-        try self.map.put(gpa, ip.value, entry);
+        try self.map.put(gpa, key, entry);
     }
 
     /// Drops entries that have not been refreshed within `ttl_ms`. Called from
@@ -142,7 +180,11 @@ pub const Cache = struct {
     }
 
     pub fn remove(self: *Cache, ip: types.Ipv4) bool {
-        return self.map.remove(ip.value);
+        return self.removeVlan(ip, 0);
+    }
+
+    pub fn removeVlan(self: *Cache, ip: types.Ipv4, vlan: u16) bool {
+        return self.map.remove(cacheKey(ip, vlan));
     }
 
     pub fn count(self: *const Cache) usize {
@@ -150,19 +192,23 @@ pub const Cache = struct {
     }
 
     fn evictOldest(self: *Cache) bool {
-        var oldest_ip: ?u32 = null;
+        var oldest_key: ?u64 = null;
         var oldest_ms: i64 = std.math.maxInt(i64);
         var it = self.map.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.updated_ms < oldest_ms) {
                 oldest_ms = entry.value_ptr.updated_ms;
-                oldest_ip = entry.key_ptr.*;
+                oldest_key = entry.key_ptr.*;
             }
         }
-        if (oldest_ip) |ip| return self.map.remove(ip);
+        if (oldest_key) |key| return self.map.remove(key);
         return false;
     }
 };
+
+fn cacheKey(ip: types.Ipv4, vlan: u16) u64 {
+    return (@as(u64, vlan) << 32) | ip.value;
+}
 
 fn readU16(buf: []const u8, off: usize) u16 {
     return (@as(u16, buf[off]) << 8) | buf[off + 1];
@@ -296,4 +342,27 @@ test "arp cache prune drops stale entries" {
     try testing.expectEqual(@as(usize, 1), cache.count());
     try testing.expect(cache.get(testIp("10.0.1.2")) == null);
     try testing.expect(cache.get(testIp("10.0.1.3")) != null);
+}
+
+test "arp cache separates overlapping subnets by vlan" {
+    var cache: Cache = .{};
+    defer cache.deinit(testing.allocator);
+
+    const port: types.PortId = .{ .value = 1 };
+    try cache.putVlan(testing.allocator, testIp("10.0.1.2"), 10, .{
+        .mac = mac_a,
+        .port = port,
+        .updated_ms = 1000,
+    });
+    try cache.putVlan(testing.allocator, testIp("10.0.1.2"), 20, .{
+        .mac = mac_b,
+        .port = port,
+        .updated_ms = 1000,
+    });
+
+    try testing.expect(cache.getVlan(testIp("10.0.1.2"), 10).?.mac.eql(mac_a));
+    try testing.expect(cache.getVlan(testIp("10.0.1.2"), 20).?.mac.eql(mac_b));
+    try testing.expect(cache.getVlan(testIp("10.0.1.2"), 30) == null);
+    try testing.expect(cache.getVlan(testIp("10.0.1.2"), 0) == null);
+    try testing.expectEqual(@as(usize, 2), cache.count());
 }

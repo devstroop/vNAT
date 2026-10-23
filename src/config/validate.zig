@@ -26,6 +26,33 @@ fn validateFirewall(cfg: *const schema.Config) ConfigError!void {
     // Outbound allow rules are not implemented yet; accepting the policy
     // silently would make `default_out: "drop"` a no-op.
     if (cfg.firewall.default_out != .accept) return error.InvalidValue;
+
+    if (cfg.firewall.rules.len > 4096) return error.InvalidValue;
+    for (cfg.firewall.rules) |rule| {
+        if (rule.src) |src| _ = types.Prefix4.parse(src) catch return error.InvalidValue;
+        if (rule.dst) |dst| _ = types.Prefix4.parse(dst) catch return error.InvalidValue;
+        if (rule.sport != null or rule.dport != null) {
+            if (rule.proto != .tcp and rule.proto != .udp) return error.InvalidValue;
+        }
+        if (rule.sport) |port| if (port == 0) return error.InvalidValue;
+        if (rule.dport) |port| if (port == 0) return error.InvalidValue;
+        if (rule.iif) |name| try validateFirewallIface(cfg, name);
+        if (rule.oif) |name| try validateFirewallIface(cfg, name);
+        for (rule.ct_state, 0..) |state, i| {
+            for (rule.ct_state[0..i]) |seen| {
+                if (seen == state) return error.InvalidValue;
+            }
+        }
+    }
+}
+
+fn validateFirewallIface(cfg: *const schema.Config, name: []const u8) ConfigError!void {
+    if (!cfg.ports.contains(name) and
+        !cfg.interfaces.contains(name) and
+        !cfg.bridges.contains(name))
+    {
+        return error.UndefinedReference;
+    }
 }
 
 fn validateInstance(instance: []const u8) ConfigError!void {
@@ -61,6 +88,11 @@ fn validatePorts(cfg: *const schema.Config) ConfigError!void {
         if (port.mtu) |mtu| {
             if (mtu < 576 or mtu > types.max_supported_mtu) return error.InvalidValue;
         }
+        if (!portInAnyBridge(cfg, name) and
+            (port.pvid != null or port.tagged.len != 0))
+        {
+            return error.InvalidValue;
+        }
 
         var other = cfg.ports.iterator();
         while (other.next()) |other_entry| {
@@ -82,12 +114,12 @@ fn validateBridges(cfg: *const schema.Config) ConfigError!void {
         const bridge = entry.value_ptr.*;
         if (bridge.ports.len == 0) return error.InvalidValue;
         if (bridge.stp) return error.InvalidValue;
-        if (bridge.vlan_aware) return error.InvalidValue;
         if (bridge.offload != .none) return error.InvalidValue;
 
         for (bridge.ports, 0..) |port_name, i| {
             const port = cfg.ports.getPtr(port_name) orelse return error.UndefinedReference;
             if (port.kind != .l2) return error.InvalidValue;
+            try validatePortVlans(port, bridge.vlan_aware);
 
             for (bridge.ports[0..i]) |seen| {
                 if (std.mem.eql(u8, seen, port_name)) return error.DuplicateName;
@@ -118,9 +150,13 @@ fn validateInterfaces(cfg: *const schema.Config) ConfigError!void {
         const has_port = itf.port != null;
 
         if (has_bridge == has_port) return error.InvalidValue;
+        if (itf.vlan) |vlan| {
+            if (vlan == 0 or vlan > 4094) return error.InvalidValue;
+        }
 
-        if (itf.bridge) |bridge| {
-            if (!cfg.bridges.contains(bridge)) return error.UndefinedReference;
+        if (itf.bridge) |bridge_name| {
+            const bridge = cfg.bridges.getPtr(bridge_name) orelse return error.UndefinedReference;
+            if (itf.vlan != null and !bridge.vlan_aware) return error.InvalidValue;
             if (itf.address) |address| {
                 if (std.mem.eql(u8, address, "dhcp")) return error.InvalidValue;
             }
@@ -128,6 +164,7 @@ fn validateInterfaces(cfg: *const schema.Config) ConfigError!void {
         if (itf.port) |port| {
             if (!cfg.ports.contains(port)) return error.UndefinedReference;
             if (portInAnyBridge(cfg, port)) return error.InvalidValue;
+            if (itf.vlan != null) return error.InvalidValue;
         }
         if (itf.address) |address| {
             if (!std.mem.eql(u8, address, "dhcp")) {
@@ -275,6 +312,22 @@ fn validateDns(cfg: *const schema.Config) ConfigError!void {
     }
 }
 
+fn validatePortVlans(port: *const schema.PortConfig, vlan_aware: bool) ConfigError!void {
+    if (!vlan_aware) {
+        if (port.pvid != null or port.tagged.len != 0) return error.InvalidValue;
+        return;
+    }
+    if (port.pvid) |pvid| {
+        if (pvid == 0 or pvid > 4094) return error.InvalidValue;
+    }
+    for (port.tagged, 0..) |vlan, i| {
+        if (vlan == 0 or vlan > 4094) return error.InvalidValue;
+        for (port.tagged[0..i]) |seen| {
+            if (seen == vlan) return error.InvalidValue;
+        }
+    }
+}
+
 fn portInAnyBridge(cfg: *const schema.Config, port_name: []const u8) bool {
     var it = cfg.bridges.iterator();
     while (it.next()) |entry| {
@@ -354,12 +407,21 @@ test "rejects unsupported bridge options" {
 
     const input_vlan =
         \\{ "version": 1, "instance": "x",
-        \\  "ports": { "lan": { "kind": "l2", "device": "eth1" } },
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1", "pvid": 10, "tagged": [20] } },
         \\  "bridges": { "br": { "ports": ["lan"], "vlan_aware": true } } }
     ;
     var parsed_vlan = try @import("parse.zig").parse(std.testing.allocator, input_vlan);
     defer parsed_vlan.deinit();
-    try std.testing.expectError(error.InvalidValue, validate(&parsed_vlan.config));
+    try validate(&parsed_vlan.config);
+
+    const input_bad_vlan =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "lan": { "kind": "l2", "device": "eth1", "pvid": 5000 } },
+        \\  "bridges": { "br": { "ports": ["lan"], "vlan_aware": true } } }
+    ;
+    var parsed_bad_vlan = try @import("parse.zig").parse(std.testing.allocator, input_bad_vlan);
+    defer parsed_bad_vlan.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_bad_vlan.config));
 
     const input_offload =
         \\{ "version": 1, "instance": "x",
@@ -568,4 +630,52 @@ test "rejects an outbound firewall policy that is not implemented" {
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();
     try std.testing.expectError(error.InvalidValue, validate(&parsed.config));
+}
+
+test "accepts valid firewall rules" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": {
+        \\    "lan": { "kind": "l2", "device": "eth1" },
+        \\    "wan": { "kind": "l2", "device": "eth0" } },
+        \\  "bridges": { "br": { "ports": ["lan"] } },
+        \\  "interfaces": {
+        \\    "lan0": { "bridge": "br", "address": "10.0.0.1/24" },
+        \\    "wan0": { "port": "wan", "address": "dhcp" } },
+        \\  "firewall": { "rules": [
+        \\    { "action": "accept", "proto": "udp", "src": "10.0.0.0/24",
+        \\      "dst": "1.1.1.1/32", "sport": 1024, "dport": 53,
+        \\      "iif": "br", "oif": "wan0", "ct_state": "new" }
+        \\  ] } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try validate(&parsed.config);
+}
+
+test "rejects invalid firewall rules" {
+    const bad_ref =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [ { "action": "drop", "iif": "nope" } ] } }
+    ;
+    var parsed_ref = try @import("parse.zig").parse(std.testing.allocator, bad_ref);
+    defer parsed_ref.deinit();
+    try std.testing.expectError(error.UndefinedReference, validate(&parsed_ref.config));
+
+    const bad_port =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [
+        \\    { "action": "drop", "proto": "icmp", "dport": 80 } ] } }
+    ;
+    var parsed_port = try @import("parse.zig").parse(std.testing.allocator, bad_port);
+    defer parsed_port.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_port.config));
+
+    const bad_cidr =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [ { "action": "drop", "src": "10.0.0.0/33" } ] } }
+    ;
+    var parsed_cidr = try @import("parse.zig").parse(std.testing.allocator, bad_cidr);
+    defer parsed_cidr.deinit();
+    try std.testing.expectError(error.InvalidValue, validate(&parsed_cidr.config));
 }

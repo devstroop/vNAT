@@ -34,11 +34,15 @@ const fdb_max_entries: usize = 4096;
 const fdb_ttl_ms: i64 = 300_000;
 const maintenance_interval_ms: i64 = 1_000;
 const dhcp_failed_retry_ms: i64 = 30_000;
+const dhcp_probe_delay_ms: i64 = 250;
+const dhcp_pending_slots = 32;
+const dhcp_reply_max = 576;
 
 const PendingPacket = struct {
     used: bool = false,
     port: types.PortId = .{ .value = 0 },
     next_hop: types.Ipv4 = .{ .value = 0 },
+    vlan: u16 = 0,
     queued_ms: i64 = 0,
     len: u16 = 0,
     bytes: [pending_packet_max]u8 = undefined,
@@ -53,6 +57,7 @@ pub const PortEntry = struct {
 pub const LocalAddr = struct {
     prefix: types.Prefix4,
     port: types.PortId,
+    vlan: u16 = 0,
 };
 
 pub const Counters = struct {
@@ -80,15 +85,41 @@ pub const Counters = struct {
     dhcp_client_bound: u64 = 0,
     nat_unsupported: u64 = 0,
     firewall_dropped: u64 = 0,
+    firewall_spoofed: u64 = 0,
+};
+
+pub const BridgePortVlan = struct {
+    pvid: u16 = 0,
+    tagged: []const u16 = &.{},
 };
 
 pub const Bridge = struct {
     id: u32,
     members: []types.PortId,
+    vlan_aware: bool = false,
+    vlans: []BridgePortVlan = &.{},
 
     pub fn contains(self: Bridge, port: types.PortId) bool {
         for (self.members) |member| {
             if (member.eql(port)) return true;
+        }
+        return false;
+    }
+
+    pub fn portVlan(self: Bridge, port: types.PortId) ?BridgePortVlan {
+        for (self.members, 0..) |member, i| {
+            if (member.eql(port)) {
+                if (i >= self.vlans.len) return null;
+                return self.vlans[i];
+            }
+        }
+        return null;
+    }
+
+    pub fn allowsTagged(self: Bridge, port: types.PortId, vlan: u16) bool {
+        const cfg = self.portVlan(port) orelse return false;
+        for (cfg.tagged) |tagged| {
+            if (tagged == vlan) return true;
         }
         return false;
     }
@@ -99,6 +130,24 @@ const FdbEntry = struct {
     updated_ms: i64,
 };
 
+const FirewallIface = union(enum) {
+    port: types.PortId,
+    bridge: u32,
+};
+
+const FirewallRule = struct {
+    action: schema.FirewallAction,
+    proto: ?u8 = null,
+    src: ?types.Prefix4 = null,
+    dst: ?types.Prefix4 = null,
+    sport: ?u16 = null,
+    dport: ?u16 = null,
+    iif: ?FirewallIface = null,
+    oif: ?FirewallIface = null,
+    ct_mask: u8 = 0,
+    packets: u64 = 0,
+};
+
 pub const DhcpClientState = enum {
     init,
     selecting,
@@ -107,6 +156,20 @@ pub const DhcpClientState = enum {
     renewing,
     rebinding,
     failed,
+};
+
+const PendingDhcpOffer = struct {
+    used: bool = false,
+    port: types.PortId = .{ .value = 0 },
+    bridge: ?u32 = null,
+    vlan: u16 = 0,
+    client_mac: types.Mac = .{},
+    ip: types.Ipv4 = .{},
+    queued_ms: i64 = 0,
+    len: u16 = 0,
+    dst_ip: types.Ipv4 = .{},
+    dst_mac: types.Mac = .{},
+    bytes: [dhcp_reply_max]u8 = undefined,
 };
 
 pub const DhcpClient = struct {
@@ -143,10 +206,12 @@ pub const Forwarder = struct {
     conntrack: conntrack_mod.Conntrack,
     snat_rules: std.ArrayListUnmanaged(nat_mod.Rule) = .empty,
     forward_rules: std.ArrayListUnmanaged(nat_mod.ForwardRule) = .empty,
+    firewall_rules: std.ArrayListUnmanaged(FirewallRule) = .empty,
     dhcp_servers: std.ArrayListUnmanaged(dhcp_server.Server) = .empty,
     dhcp_clients: std.ArrayListUnmanaged(DhcpClient) = .empty,
+    dhcp_pending: [dhcp_pending_slots]PendingDhcpOffer = [_]PendingDhcpOffer{.{}} ** dhcp_pending_slots,
     bridges: std.ArrayListUnmanaged(Bridge) = .empty,
-    fdb: std.AutoHashMapUnmanaged(u64, FdbEntry) = .empty,
+    fdb: std.AutoHashMapUnmanaged(u128, FdbEntry) = .empty,
     last_maintenance_ms: i64 = 0,
     firewall: schema.FirewallConfig = .{
         .default_in = .accept,
@@ -183,23 +248,33 @@ pub const Forwarder = struct {
         self.arp_misses.deinit(self.gpa);
         self.snat_rules.deinit(self.gpa);
         self.forward_rules.deinit(self.gpa);
+        self.firewall_rules.deinit(self.gpa);
         for (self.dhcp_servers.items) |*server| server.deinit();
         self.dhcp_servers.deinit(self.gpa);
         self.dhcp_clients.deinit(self.gpa);
-        for (self.bridges.items) |bridge| self.gpa.free(bridge.members);
+        for (self.bridges.items) |bridge| {
+            for (bridge.vlans) |vlan| self.gpa.free(vlan.tagged);
+            self.gpa.free(bridge.vlans);
+            self.gpa.free(bridge.members);
+        }
         self.bridges.deinit(self.gpa);
         self.fdb.deinit(self.gpa);
         self.conntrack.deinit();
     }
 
-    pub fn addLocal(self: *Forwarder, prefix: types.Prefix4, port: types.PortId) PortError!void {
-        try self.local.append(self.gpa, .{ .prefix = prefix, .port = port });
+    pub fn addLocal(
+        self: *Forwarder,
+        prefix: types.Prefix4,
+        port: types.PortId,
+        vlan: u16,
+    ) PortError!void {
+        try self.local.append(self.gpa, .{ .prefix = prefix, .port = port, .vlan = vlan });
     }
 
-    fn removeLocal(self: *Forwarder, prefix: types.Prefix4, port: types.PortId) void {
+    fn removeLocal(self: *Forwarder, prefix: types.Prefix4, port: types.PortId, vlan: u16) void {
         for (self.local.items, 0..) |local, i| {
-            if (local.port.eql(port) and local.prefix.len == prefix.len and
-                local.prefix.addr.eql(prefix.addr))
+            if (local.port.eql(port) and local.vlan == vlan and
+                local.prefix.len == prefix.len and local.prefix.addr.eql(prefix.addr))
             {
                 _ = self.local.swapRemove(i);
                 return;
@@ -309,6 +384,7 @@ pub const Forwarder = struct {
             self.last_maintenance_ms = now;
         }
         for (self.dhcp_servers.items) |*server| server.gc(now);
+        self.tickDhcpOffers(io, now);
         self.tickDhcpClients(io, now);
     }
 
@@ -325,14 +401,35 @@ pub const Forwarder = struct {
         var bridge_it = cfg.bridges.iterator();
         var bridge_id: u32 = 0;
         while (bridge_it.next()) |bridge_entry| {
-            if (bridge_entry.value_ptr.ports.len == 0) return error.InvalidArgument;
-            const members = try gpa.alloc(types.PortId, bridge_entry.value_ptr.ports.len);
+            const bridge_cfg = bridge_entry.value_ptr;
+            if (bridge_cfg.ports.len == 0) return error.InvalidArgument;
+            const members = try gpa.alloc(types.PortId, bridge_cfg.ports.len);
             errdefer gpa.free(members);
-            for (bridge_entry.value_ptr.ports, 0..) |port_name, i| {
+            const vlans = try gpa.alloc(BridgePortVlan, bridge_cfg.ports.len);
+            errdefer gpa.free(vlans);
+            var vlan_count: usize = 0;
+            errdefer for (vlans[0..vlan_count]) |vlan| gpa.free(vlan.tagged);
+            for (bridge_cfg.ports, 0..) |port_name, i| {
                 const port_entry = findPort(ports, port_name) orelse return error.NotFound;
                 members[i] = port_entry.id;
+                if (bridge_cfg.vlan_aware) {
+                    const port_cfg = cfg.ports.getPtr(port_name) orelse return error.NotFound;
+                    const tagged = try gpa.dupe(u16, port_cfg.tagged);
+                    vlans[i] = .{
+                        .pvid = port_cfg.pvid orelse 1,
+                        .tagged = tagged,
+                    };
+                    vlan_count = i + 1;
+                } else {
+                    vlans[i] = .{};
+                }
             }
-            try self.bridges.append(gpa, .{ .id = bridge_id, .members = members });
+            try self.bridges.append(gpa, .{
+                .id = bridge_id,
+                .members = members,
+                .vlan_aware = bridge_cfg.vlan_aware,
+                .vlans = vlans,
+            });
             bridge_id += 1;
         }
 
@@ -345,11 +442,13 @@ pub const Forwarder = struct {
                 const bridge = self.bridgeByName(cfg, bridge_name) orelse return error.NotFound;
                 if (std.mem.eql(u8, address, "dhcp")) return error.InvalidArgument;
                 const prefix = types.Prefix4.parse(address) catch return error.InvalidArgument;
-                for (bridge.members) |member| try self.addLocal(prefix, member);
+                const vlan = if (bridge.vlan_aware) itf.vlan orelse 1 else 0;
+                for (bridge.members) |member| try self.addLocal(prefix, member, vlan);
                 try self.addRoute(.{
                     .prefix = .{ .addr = prefix.network(), .len = prefix.len },
                     .port = bridge.members[0],
                     .bridge = bridge.id,
+                    .vlan = vlan,
                     .kind = .connected,
                 });
                 continue;
@@ -377,7 +476,7 @@ pub const Forwarder = struct {
             }
 
             const prefix = types.Prefix4.parse(address) catch return error.InvalidArgument;
-            try self.addLocal(prefix, port_entry.id);
+            try self.addLocal(prefix, port_entry.id, 0);
             try self.addRoute(.{
                 .prefix = .{ .addr = prefix.network(), .len = prefix.len },
                 .port = port_entry.id,
@@ -394,11 +493,13 @@ pub const Forwarder = struct {
             const dev = route.dev orelse return error.InvalidArgument;
             var port_entry = findRoutePort(cfg, ports, dev) orelse null;
             var route_bridge: ?u32 = null;
+            var route_vlan: u16 = 0;
             if (cfg.interfaces.get(dev)) |itf| {
                 if (itf.bridge) |bridge_name| {
                     const bridge = self.bridgeByName(cfg, bridge_name) orelse return error.NotFound;
                     port_entry = self.portById(bridge.members[0]) orelse return error.NotFound;
                     route_bridge = bridge.id;
+                    route_vlan = if (bridge.vlan_aware) itf.vlan orelse 1 else 0;
                 }
             }
             const endpoint = port_entry orelse return error.NotFound;
@@ -408,6 +509,7 @@ pub const Forwarder = struct {
                 .next_hop = next_hop,
                 .port = endpoint.id,
                 .bridge = route_bridge,
+                .vlan = route_vlan,
                 .metric = route.metric,
             });
         }
@@ -449,10 +551,12 @@ pub const Forwarder = struct {
             const itf = cfg.interfaces.getPtr(dhcp.iface) orelse return error.InvalidArgument;
             var port_entry: PortEntry = undefined;
             var server_bridge: ?u32 = null;
+            var server_vlan: u16 = 0;
             if (itf.bridge) |bridge_name| {
                 const bridge = self.bridgeByName(cfg, bridge_name) orelse return error.NotFound;
                 port_entry = self.portById(bridge.members[0]) orelse return error.NotFound;
                 server_bridge = bridge.id;
+                server_vlan = if (bridge.vlan_aware) itf.vlan orelse 1 else 0;
             } else {
                 const port_name = itf.port orelse return error.InvalidArgument;
                 port_entry = findPort(ports, port_name) orelse return error.NotFound;
@@ -485,6 +589,7 @@ pub const Forwarder = struct {
             try self.addDhcpServer(.{
                 .port = port_entry.id,
                 .bridge = server_bridge,
+                .vlan = server_vlan,
                 .server_ip = prefix.addr,
                 .prefix = prefix,
                 .pool = pool,
@@ -497,6 +602,7 @@ pub const Forwarder = struct {
             });
         }
 
+        try self.compileFirewall(cfg);
         return self;
     }
 
@@ -517,8 +623,14 @@ pub const Forwarder = struct {
                 types.Mac.zero,
                 local.prefix.addr,
             ) catch continue;
-            self.sendL2(io, local.port, types.Mac.broadcast, ethernet.EtherType.arp, &payload) catch
-                continue;
+            self.sendL2Vlan(
+                io,
+                local.port,
+                types.Mac.broadcast,
+                ethernet.EtherType.arp,
+                &payload,
+                local.vlan,
+            ) catch continue;
             self.counters.garps += 1;
         }
     }
@@ -545,7 +657,7 @@ pub const Forwarder = struct {
                 self.counters.dropped += 1;
                 return;
             };
-            try self.handleIpv4(io, null, ip, ingress);
+            try self.handleIpv4(io, null, ip, ingress, 0);
             return;
         }
 
@@ -553,33 +665,40 @@ pub const Forwarder = struct {
             self.counters.dropped += 1;
             return;
         };
-        if (eth.vlan != null) {
-            // VLAN forwarding is R5; dropping keeps tagged traffic from leaking
-            // into the untagged bridge.
-            self.counters.dropped += 1;
-            return;
-        }
 
         const bridge = self.bridgeForPort(ingress);
+        const vlan: u16 = if (bridge) |b|
+            self.ingressVlan(b, ingress, eth.vlan) orelse {
+                self.counters.dropped += 1;
+                return;
+            }
+        else blk: {
+            if (eth.vlan != null) {
+                self.counters.dropped += 1;
+                return;
+            }
+            break :blk 0;
+        };
+
         if (bridge) |b| {
             if (!eth.src.isMulticast() and !eth.src.isZero()) {
-                self.learnFdb(b.id, eth.src, ingress, now);
+                self.learnFdb(b.id, vlan, eth.src, ingress, now);
             }
         }
 
         switch (eth.ethertype) {
             ethernet.EtherType.arp => {
-                try self.handleArp(io, eth, ingress);
+                try self.handleArp(io, eth, ingress, vlan);
                 if (bridge) |b| {
                     if (!self.bridgeMacLocal(b, eth.dst)) {
-                        try self.bridgeForward(io, b, frame, eth, ingress, now);
+                        try self.bridgeForward(io, b, frame, eth, ingress, vlan, now);
                     }
                 }
             },
             ethernet.EtherType.ipv4 => {
                 if (bridge) |b| {
                     if (!eth.dst.isMulticast() and !self.bridgeMacLocal(b, eth.dst)) {
-                        try self.bridgeForward(io, b, frame, eth, ingress, now);
+                        try self.bridgeForward(io, b, frame, eth, ingress, vlan, now);
                         return;
                     }
                 }
@@ -587,21 +706,35 @@ pub const Forwarder = struct {
                     self.counters.dropped += 1;
                     return;
                 };
-                try self.handleIpv4(io, eth, ip, ingress);
+                try self.handleIpv4(io, eth, ip, ingress, vlan);
                 if (bridge) |b| {
                     if (eth.dst.isMulticast()) {
-                        try self.bridgeForward(io, b, frame, eth, ingress, now);
+                        try self.bridgeForward(io, b, frame, eth, ingress, vlan, now);
                     }
                 }
             },
             else => {
                 if (bridge) |b| {
-                    try self.bridgeForward(io, b, frame, eth, ingress, now);
+                    try self.bridgeForward(io, b, frame, eth, ingress, vlan, now);
                 } else {
                     self.counters.dropped += 1;
                 }
             },
         }
+    }
+
+    fn ingressVlan(self: *const Forwarder, bridge: Bridge, port: types.PortId, tagged: ?u16) ?u16 {
+        _ = self;
+        if (!bridge.vlan_aware) {
+            if (tagged != null) return null;
+            return 0;
+        }
+        const cfg = bridge.portVlan(port) orelse return null;
+        if (tagged) |vlan| {
+            if (bridge.allowsTagged(port, vlan)) return vlan;
+            return null;
+        }
+        return cfg.pvid;
     }
 
     fn bridgeMacLocal(self: *const Forwarder, bridge: Bridge, mac: types.Mac) bool {
@@ -611,14 +744,14 @@ pub const Forwarder = struct {
         return false;
     }
 
-    fn learnFdb(self: *Forwarder, bridge_id: u32, mac: types.Mac, port: types.PortId, now: i64) void {
-        const key = fdbKey(bridge_id, mac);
+    fn learnFdb(self: *Forwarder, bridge_id: u32, vlan: u16, mac: types.Mac, port: types.PortId, now: i64) void {
+        const key = fdbKey(bridge_id, vlan, mac);
         if (self.fdb.getPtr(key)) |slot| {
             slot.* = .{ .port = port, .updated_ms = now };
             return;
         }
         if (self.fdb.count() >= fdb_max_entries) {
-            var oldest_key: u64 = 0;
+            var oldest_key: u128 = 0;
             var oldest_ms: i64 = std.math.maxInt(i64);
             var it = self.fdb.iterator();
             while (it.next()) |entry| {
@@ -639,12 +772,14 @@ pub const Forwarder = struct {
         frame: []const u8,
         eth: ethernet.Header,
         ingress: types.PortId,
+        vlan: u16,
         now: i64,
     ) PortError!void {
+        _ = frame;
         if (!eth.dst.isMulticast()) {
-            if (self.fdb.get(fdbKey(bridge.id, eth.dst))) |entry| {
+            if (self.fdb.get(fdbKey(bridge.id, vlan, eth.dst))) |entry| {
                 if (!entry.port.eql(ingress)) {
-                    self.sendFrameRaw(io, entry.port, frame) catch {
+                    self.sendBridgeFrame(io, bridge, entry.port, eth, vlan) catch {
                         self.counters.dropped += 1;
                     };
                 }
@@ -655,20 +790,50 @@ pub const Forwarder = struct {
         // remaining members.
         for (bridge.members) |member| {
             if (member.eql(ingress)) continue;
-            self.sendFrameRaw(io, member, frame) catch {
+            self.sendBridgeFrame(io, bridge, member, eth, vlan) catch {
                 self.counters.dropped += 1;
                 continue;
             };
         }
-        if (eth.dst.isMulticast()) self.learnFdb(bridge.id, eth.src, ingress, now);
+        if (eth.dst.isMulticast()) self.learnFdb(bridge.id, vlan, eth.src, ingress, now);
     }
 
-    fn sendFrameRaw(self: *Forwarder, io: std.Io, port: types.PortId, frame: []const u8) PortError!void {
-        const entry = self.portById(port) orelse return error.NotFound;
+    const EgressVlan = union(enum) { untagged, tagged: u16, filtered };
+
+    fn egressVlan(bridge: Bridge, port: types.PortId, vlan: u16) EgressVlan {
+        if (!bridge.vlan_aware) return .untagged;
+        const cfg = bridge.portVlan(port) orelse return .filtered;
+        for (cfg.tagged) |tagged| {
+            if (tagged == vlan) return .{ .tagged = vlan };
+        }
+        if (cfg.pvid == vlan) return .untagged;
+        return .filtered;
+    }
+
+    fn sendBridgeFrame(
+        self: *Forwarder,
+        io: std.Io,
+        bridge: Bridge,
+        member: types.PortId,
+        eth: ethernet.Header,
+        vlan: u16,
+    ) PortError!void {
+        const tag: ?u16 = switch (egressVlan(bridge, member, vlan)) {
+            .untagged => null,
+            .tagged => |vid| vid,
+            .filtered => return,
+        };
+        const entry = self.portById(member) orelse return error.NotFound;
         const info = entry.port.info();
         if (info.kind == .tun) return;
-        if (frame.len > @as(usize, info.mtu) + 14) return error.FrameTooLarge;
-        try entry.port.write(io, frame);
+
+        var out: [2048]u8 = undefined;
+        const hlen = ethernet.write(&out, eth.dst, eth.src, eth.ethertype, tag) catch
+            return error.FrameTooLarge;
+        if (eth.payload.len > out.len - hlen) return error.FrameTooLarge;
+        if (eth.payload.len > info.mtu) return error.FrameTooLarge;
+        @memcpy(out[hlen..][0..eth.payload.len], eth.payload);
+        try entry.port.write(io, out[0 .. hlen + eth.payload.len]);
         self.counters.bridged += 1;
     }
 
@@ -684,6 +849,7 @@ pub const Forwarder = struct {
         io: std.Io,
         eth: ethernet.Header,
         ingress: types.PortId,
+        vlan: u16,
     ) PortError!void {
         const packet = arp.parse(eth.payload) catch {
             self.counters.dropped += 1;
@@ -699,7 +865,7 @@ pub const Forwarder = struct {
 
         const learned = !packet.sender_ip.isUnspecified() and !packet.sender_mac.isZero();
         if (learned) {
-            self.arp.put(self.gpa, packet.sender_ip, .{
+            self.arp.putVlan(self.gpa, packet.sender_ip, vlan, .{
                 .mac = packet.sender_mac,
                 .port = ingress,
                 .updated_ms = nowMs(io),
@@ -708,7 +874,7 @@ pub const Forwarder = struct {
         }
 
         if (packet.operation == .request) {
-            if (self.localOn(packet.target_ip, ingress)) |local| {
+            if (self.localOn(packet.target_ip, ingress, vlan)) |local| {
                 if (!info.mac.isZero()) {
                     var reply: [28]u8 = undefined;
                     _ = arp.write(
@@ -722,14 +888,14 @@ pub const Forwarder = struct {
                         self.counters.dropped += 1;
                         return;
                     };
-                    try self.sendL2(io, ingress, packet.sender_mac, ethernet.EtherType.arp, &reply);
+                    try self.sendL2Vlan(io, ingress, packet.sender_mac, ethernet.EtherType.arp, &reply, vlan);
                     self.counters.arp_replies += 1;
                 }
             }
         }
 
         if (learned) {
-            try self.flushPending(io, ingress, packet.sender_ip, packet.sender_mac);
+            try self.flushPending(io, ingress, packet.sender_ip, packet.sender_mac, vlan);
         }
     }
 
@@ -816,7 +982,7 @@ pub const Forwarder = struct {
 
     fn clearDhcpClient(self: *Forwarder, client: *DhcpClient) void {
         if (client.configured_prefix) |prefix| {
-            self.removeLocal(prefix, client.port);
+            self.removeLocal(prefix, client.port, 0);
             _ = self.fib.remove(.{ .addr = prefix.network(), .len = prefix.len }, client.port);
         }
         if (client.configured_router) |router| {
@@ -954,7 +1120,7 @@ pub const Forwarder = struct {
 
         if (prefix_changed) {
             if (client.configured_prefix) |old| {
-                self.removeLocal(old, client.port);
+                self.removeLocal(old, client.port, 0);
                 _ = self.fib.remove(.{ .addr = old.network(), .len = old.len }, client.port);
             }
         }
@@ -965,7 +1131,7 @@ pub const Forwarder = struct {
         }
 
         if (!was_configured or prefix_changed) {
-            self.addLocal(prefix, client.port) catch {};
+            self.addLocal(prefix, client.port, 0) catch {};
             self.addRoute(.{
                 .prefix = .{ .addr = prefix.network(), .len = prefix.len },
                 .port = client.port,
@@ -1111,14 +1277,15 @@ pub const Forwarder = struct {
         eth: ?ethernet.Header,
         ip: ipv4.Header,
         ingress: types.PortId,
+        vlan: u16,
     ) PortError!void {
         const total: usize = ip.total_len;
         const now = nowMs(io);
         if (try self.handleDhcpClient(io, ip, ingress, now)) return;
-        if (try self.handleDhcp(io, ip, ingress, now)) return;
-        if (try self.translateIcmpError(io, eth, ip, ingress, now)) return;
-        const is_local = self.isLocal(ip.dst);
-        const flow_key = flowKey(ip, self.trafficZone(ingress));
+        if (try self.handleDhcp(io, ip, ingress, vlan, now)) return;
+        if (try self.translateIcmpError(io, eth, ip, ingress, vlan, now)) return;
+        const is_local = self.isLocal(ip.dst, vlan);
+        const flow_key = flowKey(ip, self.trafficZone(ingress), vlan);
 
         var entry: ?*conntrack_mod.Entry = null;
         var direction: Direction = .new;
@@ -1148,7 +1315,7 @@ pub const Forwarder = struct {
                 break :blk nat_info.dnat_addr != null;
             } else dnat_rule != null;
             if (!forwardable) {
-                try self.handleLocal(io, eth, ip, ingress);
+                try self.handleLocal(io, eth, ip, ingress, vlan);
                 return;
             }
         }
@@ -1157,6 +1324,12 @@ pub const Forwarder = struct {
             ip.dst.eql(types.Ipv4.limited_broadcast)))
         {
             self.counters.dropped += 1;
+            return;
+        }
+        if (self.firewall.rp_filter and !self.sourceOnIngress(ip.src, ingress, vlan)) {
+            self.counters.dropped += 1;
+            self.counters.firewall_dropped += 1;
+            self.counters.firewall_spoofed += 1;
             return;
         }
         if (ip.ttl <= 1) {
@@ -1169,6 +1342,7 @@ pub const Forwarder = struct {
                 icmp.Type.time_exceeded,
                 icmp.Code.ttl_exceeded,
                 0,
+                vlan,
             );
             return;
         }
@@ -1245,14 +1419,43 @@ pub const Forwarder = struct {
                 icmp.Type.destination_unreachable,
                 icmp.Code.net_unreachable,
                 0,
+                vlan,
             );
             return;
         };
 
-        // An explicit port-forward rule is an administrator allow for the
-        // flow it creates; only traffic with neither a conntrack entry nor a
-        // DNAT rule is subject to the default forwarding policy.
-        if (entry == null and dnat_rule == null) {
+        // Ordered rules run before the default policy. Existing conntrack
+        // entries are the stateful shortcut: when no rule matches they are
+        // accepted even under a default-drop policy.
+        const fw_state: schema.FirewallCtState = if (entry != null) .established else .new;
+        if (self.firewallAction(ingress, route.port, ipm, fw_state)) |action| {
+            switch (action) {
+                .accept => {},
+                .drop => {
+                    self.counters.dropped += 1;
+                    self.counters.firewall_dropped += 1;
+                    return;
+                },
+                .reject => {
+                    self.counters.dropped += 1;
+                    self.counters.firewall_dropped += 1;
+                    try self.sendError(
+                        io,
+                        eth,
+                        ipm,
+                        ingress,
+                        icmp.Type.destination_unreachable,
+                        icmp.Code.admin_prohibited,
+                        0,
+                        vlan,
+                    );
+                    return;
+                },
+            }
+        } else if (entry == null and dnat_rule == null) {
+            // An explicit port-forward rule is an administrator allow for the
+            // flow it creates; only traffic with neither a conntrack entry nor
+            // a DNAT rule is subject to the default forwarding policy.
             switch (self.firewall.default_forward) {
                 .accept => {},
                 .drop => {
@@ -1271,6 +1474,7 @@ pub const Forwarder = struct {
                         icmp.Type.destination_unreachable,
                         icmp.Code.admin_prohibited,
                         0,
+                        vlan,
                     );
                     return;
                 },
@@ -1294,6 +1498,7 @@ pub const Forwarder = struct {
                 icmp.Type.destination_unreachable,
                 icmp.Code.frag_needed,
                 egress_info.mtu,
+                vlan,
             );
             return;
         }
@@ -1325,7 +1530,7 @@ pub const Forwarder = struct {
                 var hairpin_addr: ?types.Ipv4 = null;
                 var hairpin_port: u16 = 0;
                 if (route.port.eql(ingress) or self.sameBridge(route.port, ingress)) {
-                    const local = self.localForPeer(route.port, ipm.dst) orelse {
+                    const local = self.localForPeer(route.port, ipm.dst, route.vlan) orelse {
                         self.counters.dropped += 1;
                         return;
                     };
@@ -1344,6 +1549,7 @@ pub const Forwarder = struct {
                         local.prefix.addr,
                         snat_port,
                         self.trafficZone(route.port),
+                        route.vlan,
                     );
                     translated_key = makeTranslatedKey(
                         key,
@@ -1352,6 +1558,7 @@ pub const Forwarder = struct {
                         rule.to_addr,
                         rule.to_port,
                         self.trafficZone(route.port),
+                        route.vlan,
                     );
                 } else {
                     reply_key = makeDnatReplyKey(
@@ -1359,6 +1566,7 @@ pub const Forwarder = struct {
                         rule.to_addr,
                         rule.to_port,
                         self.trafficZone(route.port),
+                        route.vlan,
                     );
                     translated_key = makeTranslatedKey(
                         key,
@@ -1367,6 +1575,7 @@ pub const Forwarder = struct {
                         rule.to_addr,
                         rule.to_port,
                         self.trafficZone(route.port),
+                        route.vlan,
                     );
                 }
 
@@ -1398,7 +1607,13 @@ pub const Forwarder = struct {
                 }
             } else if (self.snatAddrFor(route.port)) |nat_addr| {
                 if (ipm.src.eql(nat_addr)) {
-                    const reply_key = makeReplyKey(key, key.src, key.sport, self.trafficZone(route.port));
+                    const reply_key = makeReplyKey(
+                        key,
+                        key.src,
+                        key.sport,
+                        self.trafficZone(route.port),
+                        route.vlan,
+                    );
                     const created = self.conntrack.create(
                         key,
                         reply_key,
@@ -1415,7 +1630,13 @@ pub const Forwarder = struct {
                         self.counters.dropped += 1;
                         return;
                     };
-                    const reply_key = makeReplyKey(key, nat_addr, nat_port, self.trafficZone(route.port));
+                    const reply_key = makeReplyKey(
+                        key,
+                        nat_addr,
+                        nat_port,
+                        self.trafficZone(route.port),
+                        route.vlan,
+                    );
                     const translated_key = makeTranslatedKey(
                         key,
                         nat_addr,
@@ -1423,6 +1644,7 @@ pub const Forwarder = struct {
                         key.dst,
                         key.dport,
                         self.trafficZone(route.port),
+                        route.vlan,
                     );
                     const nat_info = conntrack_mod.Nat{
                         .snat_addr = nat_addr,
@@ -1454,7 +1676,13 @@ pub const Forwarder = struct {
                     self.counters.snat_packets += 1;
                 }
             } else {
-                const reply_key = makeReplyKey(key, key.src, key.sport, self.trafficZone(route.port));
+                const reply_key = makeReplyKey(
+                    key,
+                    key.src,
+                    key.sport,
+                    self.trafficZone(route.port),
+                    route.vlan,
+                );
                 const created = self.conntrack.create(
                     key,
                     reply_key,
@@ -1495,27 +1723,29 @@ pub const Forwarder = struct {
         var arp_entry: ?arp.Entry = null;
         var egress_port = route.port;
         if (route.bridge) |bridge_id| {
-            if (self.arp.getFreshAny(next_hop, now, arp_ttl_ms)) |found| {
+            if (self.arp.getFreshAnyVlan(next_hop, route.vlan, now, arp_ttl_ms)) |found| {
                 if (self.bridgeById(bridge_id)) |bridge| {
-                    if (bridge.contains(found.port)) {
+                    if (bridge.contains(found.port) and
+                        egressVlan(bridge, found.port, route.vlan) != .filtered)
+                    {
                         arp_entry = found;
                         egress_port = found.port;
                     }
                 }
             }
             if (arp_entry == null) {
-                try self.sendArpRequestBridge(io, bridge_id, next_hop);
-                if (!self.enqueuePending(route.port, next_hop, ipm.packet[0..total], now)) {
+                try self.sendArpRequestBridge(io, bridge_id, next_hop, route.vlan);
+                if (!self.enqueuePending(route.port, next_hop, route.vlan, ipm.packet[0..total], now)) {
                     self.counters.dropped += 1;
                     self.counters.pending_dropped += 1;
                 }
                 return;
             }
         } else {
-            arp_entry = self.arp.getFresh(next_hop, route.port, now, arp_ttl_ms);
+            arp_entry = self.arp.getFreshVlan(next_hop, route.vlan, route.port, now, arp_ttl_ms);
             if (arp_entry == null) {
-                try self.sendArpRequest(io, route.port, next_hop);
-                if (!self.enqueuePending(route.port, next_hop, ipm.packet[0..total], now)) {
+                try self.sendArpRequest(io, route.port, next_hop, route.vlan);
+                if (!self.enqueuePending(route.port, next_hop, route.vlan, ipm.packet[0..total], now)) {
                     self.counters.dropped += 1;
                     self.counters.pending_dropped += 1;
                 }
@@ -1538,32 +1768,26 @@ pub const Forwarder = struct {
                 icmp.Type.destination_unreachable,
                 icmp.Code.frag_needed,
                 final_info.mtu,
+                vlan,
             );
             return;
         }
 
         var out: [2048]u8 = undefined;
-        const hlen = ethernet.write(
-            &out,
-            resolved.mac,
-            final_info.mac,
-            ethernet.EtherType.ipv4,
-            null,
-        ) catch {
-            self.counters.dropped += 1;
-            return;
-        };
-        if (total > out.len - hlen) {
+        if (total > out.len) {
             self.counters.dropped += 1;
             return;
         }
-        @memcpy(out[hlen..][0..total], ipm.packet[0..total]);
-        ipv4.decrementTtl(out[hlen..][0..total]) catch {
+        @memcpy(out[0..total], ipm.packet[0..total]);
+        ipv4.decrementTtl(out[0..total]) catch {
             self.counters.dropped += 1;
             return;
         };
-        fixTransportChecksum(out[hlen..][0..total]);
-        try final_egress.port.write(io, out[0 .. hlen + total]);
+        fixTransportChecksum(out[0..total]);
+        self.sendL2Vlan(io, egress_port, resolved.mac, ethernet.EtherType.ipv4, out[0..total], route.vlan) catch {
+            self.counters.dropped += 1;
+            return;
+        };
         self.counters.forwarded += 1;
     }
 
@@ -1572,6 +1796,7 @@ pub const Forwarder = struct {
         io: std.Io,
         ip: ipv4.Header,
         ingress: types.PortId,
+        vlan: u16,
         now: i64,
     ) PortError!bool {
         if (ip.protocol != ipv4.Protocol.udp) return false;
@@ -1580,7 +1805,7 @@ pub const Forwarder = struct {
         if (udp_len < 8 or udp_len > ip.payload.len) return false;
         if (readU16(ip.payload, 2) != 67) return false;
 
-        const server = self.dhcpServerFor(ingress) orelse return false;
+        const server = self.dhcpServerFor(ingress, vlan) orelse return false;
         self.counters.dhcp_requests += 1;
         const msg = dhcp_message.Message.parse(ip.payload[8..udp_len]) catch {
             self.counters.dhcp_dropped += 1;
@@ -1606,7 +1831,7 @@ pub const Forwarder = struct {
             // Conflict detection: only trust ARP entries learned on the same
             // L2 segment; a host elsewhere in a routed network cannot own an
             // address from this pool.
-            if (self.arp.getFreshAny(candidate.yiaddr, now, arp_ttl_ms)) |entry| {
+            if (self.arp.getFreshAnyVlan(candidate.yiaddr, vlan, now, arp_ttl_ms)) |entry| {
                 const same_segment = entry.port.eql(ingress) or self.sameBridge(entry.port, ingress);
                 if (same_segment and !entry.mac.eql(client_mac)) {
                     server.decline(client_mac, candidate.yiaddr, now);
@@ -1619,26 +1844,122 @@ pub const Forwarder = struct {
         }
         const final_reply = reply orelse return true;
 
+        if (final_reply.typ == .offer) {
+            if (!self.queueDhcpOffer(ingress, server.cfg.bridge, vlan, client_mac, final_reply, now)) {
+                self.counters.dhcp_dropped += 1;
+                return true;
+            }
+            self.probeDhcpOffer(io, server, final_reply.yiaddr, vlan);
+            return true;
+        }
+
         switch (final_reply.typ) {
-            .offer => self.counters.dhcp_offers += 1,
             .ack => self.counters.dhcp_acks += 1,
             .nak => self.counters.dhcp_naks += 1,
             else => {},
         }
-        self.sendDhcpReply(io, ingress, final_reply) catch {
+        self.sendDhcpReply(io, ingress, final_reply, vlan) catch {
             self.counters.dhcp_dropped += 1;
             return true;
         };
-        if (final_reply.typ == .offer) {
-            self.sendArpProbe(io, ingress, final_reply.yiaddr) catch {};
-        }
         return true;
     }
 
-    fn dhcpServerFor(self: *Forwarder, ingress: types.PortId) ?*dhcp_server.Server {
+    fn queueDhcpOffer(
+        self: *Forwarder,
+        port: types.PortId,
+        bridge: ?u32,
+        vlan: u16,
+        client_mac: types.Mac,
+        reply: dhcp_server.Reply,
+        now: i64,
+    ) bool {
+        if (reply.payload.len > dhcp_reply_max) return false;
+        for (&self.dhcp_pending) |*slot| {
+            if (slot.used) continue;
+            @memcpy(slot.bytes[0..reply.payload.len], reply.payload);
+            slot.used = true;
+            slot.port = port;
+            slot.bridge = bridge;
+            slot.vlan = vlan;
+            slot.client_mac = client_mac;
+            slot.ip = reply.yiaddr;
+            slot.queued_ms = now;
+            slot.len = @intCast(reply.payload.len);
+            slot.dst_ip = reply.dst_ip;
+            slot.dst_mac = reply.dst_mac;
+            return true;
+        }
+        return false;
+    }
+
+    fn probeDhcpOffer(self: *Forwarder, io: std.Io, server: *dhcp_server.Server, ip: types.Ipv4, vlan: u16) void {
+        if (server.cfg.bridge) |bridge_id| {
+            const bridge = self.bridgeById(bridge_id) orelse return;
+            for (bridge.members) |member| {
+                if (egressVlan(bridge, member, vlan) == .filtered) continue;
+                self.sendArpProbe(io, member, ip, vlan) catch {};
+            }
+            return;
+        }
+        self.sendArpProbe(io, server.cfg.port, ip, vlan) catch {};
+    }
+
+    fn tickDhcpOffers(self: *Forwarder, io: std.Io, now: i64) void {
+        for (&self.dhcp_pending) |*slot| {
+            if (!slot.used) continue;
+            if (now - slot.queued_ms < dhcp_probe_delay_ms) continue;
+
+            const server = self.dhcpServerFor(slot.port, slot.vlan) orelse {
+                slot.used = false;
+                self.counters.dhcp_dropped += 1;
+                continue;
+            };
+            if (self.arp.getFreshAnyVlan(slot.ip, slot.vlan, now, arp_ttl_ms)) |entry| {
+                if (self.dhcpSameSegment(slot, entry.port) and !entry.mac.eql(slot.client_mac)) {
+                    server.decline(slot.client_mac, slot.ip, now);
+                    self.counters.dhcp_conflicts += 1;
+                    slot.used = false;
+                    continue;
+                }
+            }
+
+            const reply = dhcp_server.Reply{
+                .payload = slot.bytes[0..slot.len],
+                .dst_ip = slot.dst_ip,
+                .dst_mac = slot.dst_mac,
+                .typ = .offer,
+                .yiaddr = slot.ip,
+            };
+            self.sendDhcpReply(io, slot.port, reply, slot.vlan) catch {
+                self.counters.dhcp_dropped += 1;
+                slot.used = false;
+                continue;
+            };
+            self.counters.dhcp_offers += 1;
+            slot.used = false;
+        }
+    }
+
+    fn dhcpSameSegment(self: *const Forwarder, slot: *const PendingDhcpOffer, port: types.PortId) bool {
+        if (slot.bridge) |bridge_id| {
+            if (self.bridgeById(bridge_id)) |bridge| {
+                if (!bridge.contains(port)) return false;
+                if (!bridge.vlan_aware) return true;
+                const cfg = bridge.portVlan(port) orelse return false;
+                if (cfg.pvid == slot.vlan) return true;
+                return bridge.allowsTagged(port, slot.vlan);
+            }
+            return false;
+        }
+        return slot.port.eql(port);
+    }
+
+    fn dhcpServerFor(self: *Forwarder, ingress: types.PortId, vlan: u16) ?*dhcp_server.Server {
         for (self.dhcp_servers.items) |*server| {
-            if (server.cfg.port.eql(ingress)) return server;
+            if (server.cfg.port.eql(ingress) and server.cfg.vlan == vlan) return server;
             if (server.cfg.bridge) |bridge_id| {
+                if (server.cfg.vlan != vlan) continue;
                 if (self.bridgeById(bridge_id)) |bridge| {
                     if (bridge.contains(ingress)) return server;
                 }
@@ -1647,11 +1968,11 @@ pub const Forwarder = struct {
         return null;
     }
 
-    fn sendArpProbe(self: *Forwarder, io: std.Io, port: types.PortId, ip: types.Ipv4) PortError!void {
+    fn sendArpProbe(self: *Forwarder, io: std.Io, port: types.PortId, ip: types.Ipv4, vlan: u16) PortError!void {
         const port_mac = self.portMac(port);
         var arp_buf: [28]u8 = undefined;
         _ = arp.write(&arp_buf, .request, port_mac, .{ .value = 0 }, types.Mac{}, ip) catch return error.FrameTooLarge;
-        try self.sendL2(io, port, types.Mac.broadcast, ethernet.EtherType.arp, &arp_buf);
+        try self.sendL2Vlan(io, port, types.Mac.broadcast, ethernet.EtherType.arp, &arp_buf, vlan);
     }
 
     fn sendDhcpReply(
@@ -1659,6 +1980,7 @@ pub const Forwarder = struct {
         io: std.Io,
         port: types.PortId,
         reply: dhcp_server.Reply,
+        vlan: u16,
     ) PortError!void {
         var udp: [576]u8 = undefined;
         const udp_len = 8 + reply.payload.len;
@@ -1672,7 +1994,7 @@ pub const Forwarder = struct {
         var ip_buf: [576]u8 = undefined;
         const ip_len = ipv4.write(
             &ip_buf,
-            self.dhcpServerAddress(port) orelse return error.NotFound,
+            self.dhcpServerAddress(port, vlan) orelse return error.NotFound,
             reply.dst_ip,
             ipv4.Protocol.udp,
             64,
@@ -1688,11 +2010,12 @@ pub const Forwarder = struct {
         writeU16(&ip_buf, 10, 0);
         writeU16(&ip_buf, 10, ipv4.checksum(ip_buf[0..parsed.header_len]));
 
-        try self.sendL2(io, port, reply.dst_mac, ethernet.EtherType.ipv4, ip_buf[0..ip_len]);
+        try self.sendL2Vlan(io, port, reply.dst_mac, ethernet.EtherType.ipv4, ip_buf[0..ip_len], vlan);
     }
 
-    fn dhcpServerAddress(self: *const Forwarder, port: types.PortId) ?types.Ipv4 {
+    fn dhcpServerAddress(self: *const Forwarder, port: types.PortId, vlan: u16) ?types.Ipv4 {
         for (self.dhcp_servers.items) |server| {
+            if (server.cfg.vlan != vlan) continue;
             if (server.cfg.port.eql(port)) return server.cfg.server_ip;
             if (server.cfg.bridge) |bridge_id| {
                 if (self.bridgeById(bridge_id)) |bridge| {
@@ -1712,6 +2035,7 @@ pub const Forwarder = struct {
         eth: ?ethernet.Header,
         ip: ipv4.Header,
         ingress: types.PortId,
+        vlan: u16,
         now: i64,
     ) PortError!bool {
         if (ip.protocol != ipv4.Protocol.icmp) return false;
@@ -1740,6 +2064,7 @@ pub const Forwarder = struct {
             .sport = flow.sport,
             .dst = flow.dst,
             .dport = flow.dport,
+            .vlan = vlan,
         };
         const found = self.conntrack.lookupTranslated(translated_key) orelse return false;
         const nat_info = found.nat orelse return false;
@@ -1891,27 +2216,29 @@ pub const Forwarder = struct {
         var arp_entry: ?arp.Entry = null;
         var egress_port = route.port;
         if (route.bridge) |bridge_id| {
-            if (self.arp.getFreshAny(next_hop, now, arp_ttl_ms)) |found_arp| {
+            if (self.arp.getFreshAnyVlan(next_hop, route.vlan, now, arp_ttl_ms)) |found_arp| {
                 if (self.bridgeById(bridge_id)) |bridge| {
-                    if (bridge.contains(found_arp.port)) {
+                    if (bridge.contains(found_arp.port) and
+                        egressVlan(bridge, found_arp.port, route.vlan) != .filtered)
+                    {
                         arp_entry = found_arp;
                         egress_port = found_arp.port;
                     }
                 }
             }
             if (arp_entry == null) {
-                try self.sendArpRequestBridge(io, bridge_id, next_hop);
-                if (!self.enqueuePending(route.port, next_hop, ipm.packet[0..total], now)) {
+                try self.sendArpRequestBridge(io, bridge_id, next_hop, route.vlan);
+                if (!self.enqueuePending(route.port, next_hop, route.vlan, ipm.packet[0..total], now)) {
                     self.counters.dropped += 1;
                     self.counters.pending_dropped += 1;
                 }
                 return true;
             }
         } else {
-            arp_entry = self.arp.getFresh(next_hop, route.port, now, arp_ttl_ms);
+            arp_entry = self.arp.getFreshVlan(next_hop, route.vlan, route.port, now, arp_ttl_ms);
             if (arp_entry == null) {
-                try self.sendArpRequest(io, route.port, next_hop);
-                if (!self.enqueuePending(route.port, next_hop, ipm.packet[0..total], now)) {
+                try self.sendArpRequest(io, route.port, next_hop, route.vlan);
+                if (!self.enqueuePending(route.port, next_hop, route.vlan, ipm.packet[0..total], now)) {
                     self.counters.dropped += 1;
                     self.counters.pending_dropped += 1;
                 }
@@ -1934,32 +2261,26 @@ pub const Forwarder = struct {
                 icmp.Type.destination_unreachable,
                 icmp.Code.frag_needed,
                 final_info.mtu,
+                vlan,
             );
             return true;
         }
 
         var out: [2048]u8 = undefined;
-        const hlen = ethernet.write(
-            &out,
-            resolved.mac,
-            final_info.mac,
-            ethernet.EtherType.ipv4,
-            null,
-        ) catch {
-            self.counters.dropped += 1;
-            return true;
-        };
-        if (total > out.len - hlen) {
+        if (total > out.len) {
             self.counters.dropped += 1;
             return true;
         }
-        @memcpy(out[hlen..][0..total], ipm.packet[0..total]);
-        ipv4.decrementTtl(out[hlen..][0..total]) catch {
+        @memcpy(out[0..total], ipm.packet[0..total]);
+        ipv4.decrementTtl(out[0..total]) catch {
             self.counters.dropped += 1;
             return true;
         };
-        fixTransportChecksum(out[hlen..][0..total]);
-        try final_egress.port.write(io, out[0 .. hlen + total]);
+        fixTransportChecksum(out[0..total]);
+        self.sendL2Vlan(io, egress_port, resolved.mac, ethernet.EtherType.ipv4, out[0..total], route.vlan) catch {
+            self.counters.dropped += 1;
+            return true;
+        };
         self.counters.forwarded += 1;
         return true;
     }
@@ -1970,6 +2291,7 @@ pub const Forwarder = struct {
         eth: ?ethernet.Header,
         ip: ipv4.Header,
         ingress: types.PortId,
+        vlan: u16,
     ) PortError!void {
         if (ip.protocol != ipv4.Protocol.icmp or ip.payload.len < 8 or
             ip.payload[0] != icmp.Type.echo_request)
@@ -1978,7 +2300,9 @@ pub const Forwarder = struct {
             return;
         }
 
-        switch (self.firewall.default_in) {
+        const rule_action = self.firewallAction(ingress, null, ip, .new);
+        const input_action = rule_action orelse self.firewall.default_in;
+        switch (input_action) {
             .accept => {},
             .drop => {
                 self.counters.dropped += 1;
@@ -1996,6 +2320,7 @@ pub const Forwarder = struct {
                     icmp.Type.destination_unreachable,
                     icmp.Code.admin_prohibited,
                     0,
+                    vlan,
                 );
                 return;
             },
@@ -2041,23 +2366,17 @@ pub const Forwarder = struct {
             return;
         }
 
-        var frame_buf: [2048]u8 = undefined;
-        const hlen = ethernet.write(
-            &frame_buf,
+        self.sendL2Vlan(
+            io,
+            ingress,
             l2.src,
-            info.mac,
             ethernet.EtherType.ipv4,
-            null,
+            ip_buf[0..ip_len],
+            vlan,
         ) catch {
             self.counters.dropped += 1;
             return;
         };
-        if (ip_len > frame_buf.len - hlen) {
-            self.counters.dropped += 1;
-            return;
-        }
-        @memcpy(frame_buf[hlen..][0..ip_len], ip_buf[0..ip_len]);
-        try entry.port.write(io, frame_buf[0 .. hlen + ip_len]);
         self.counters.local_delivered += 1;
     }
 
@@ -2070,6 +2389,7 @@ pub const Forwarder = struct {
         typ: u8,
         code: u8,
         rest: u32,
+        vlan: u16,
     ) PortError!void {
         if (ip.fragmentOffset() != 0) return;
         if (ip.src.isUnspecified() or ip.src.isMulticast() or
@@ -2079,7 +2399,7 @@ pub const Forwarder = struct {
             if (t != icmp.Type.echo_request and t != icmp.Type.echo_reply) return;
         }
 
-        const local = self.localForPeer(ingress, ip.src) orelse return;
+        const local = self.localForPeer(ingress, ip.src, vlan) orelse return;
         const entry = self.portById(ingress) orelse return;
         const info = entry.port.info();
 
@@ -2105,17 +2425,7 @@ pub const Forwarder = struct {
         const l2 = eth orelse return;
         if (info.mac.isZero() or l2.src.isMulticast()) return;
 
-        var frame_buf: [1200]u8 = undefined;
-        const hlen = ethernet.write(
-            &frame_buf,
-            l2.src,
-            info.mac,
-            ethernet.EtherType.ipv4,
-            null,
-        ) catch return;
-        if (ip_len > frame_buf.len - hlen) return;
-        @memcpy(frame_buf[hlen..][0..ip_len], ip_buf[0..ip_len]);
-        try entry.port.write(io, frame_buf[0 .. hlen + ip_len]);
+        self.sendL2Vlan(io, ingress, l2.src, ethernet.EtherType.ipv4, ip_buf[0..ip_len], vlan) catch return;
         self.counters.icmp_errors += 1;
     }
 
@@ -2123,6 +2433,7 @@ pub const Forwarder = struct {
         self: *Forwarder,
         port: types.PortId,
         next_hop: types.Ipv4,
+        vlan: u16,
         packet: []const u8,
         now: i64,
     ) bool {
@@ -2133,6 +2444,7 @@ pub const Forwarder = struct {
                 .used = true,
                 .port = port,
                 .next_hop = next_hop,
+                .vlan = vlan,
                 .queued_ms = now,
                 .len = @intCast(packet.len),
             };
@@ -2158,13 +2470,14 @@ pub const Forwarder = struct {
         port: types.PortId,
         next_hop: types.Ipv4,
         next_mac: types.Mac,
+        vlan: u16,
     ) PortError!void {
         const entry = self.portById(port) orelse return;
         const info = entry.port.info();
         if (info.mac.isZero()) return;
 
         for (&self.pending) |*slot| {
-            if (!slot.used or !slot.next_hop.eql(next_hop)) continue;
+            if (!slot.used or !slot.next_hop.eql(next_hop) or slot.vlan != vlan) continue;
             if (!slot.port.eql(port) and !self.sameBridge(slot.port, port)) continue;
 
             const len: usize = slot.len;
@@ -2181,7 +2494,7 @@ pub const Forwarder = struct {
                 continue;
             };
             fixTransportChecksum(packet[0..len]);
-            self.sendL2(io, port, next_mac, ethernet.EtherType.ipv4, packet[0..len]) catch {
+            self.sendL2Vlan(io, port, next_mac, ethernet.EtherType.ipv4, packet[0..len], vlan) catch {
                 self.counters.pending_dropped += 1;
                 continue;
             };
@@ -2195,8 +2508,9 @@ pub const Forwarder = struct {
         io: std.Io,
         egress: types.PortId,
         target: types.Ipv4,
+        vlan: u16,
     ) PortError!void {
-        try self.sendArpRequestLimited(io, egress, target, true);
+        try self.sendArpRequestLimited(io, egress, target, vlan, true);
     }
 
     fn sendArpRequestLimited(
@@ -2204,6 +2518,7 @@ pub const Forwarder = struct {
         io: std.Io,
         egress: types.PortId,
         target: types.Ipv4,
+        vlan: u16,
         limit: bool,
     ) PortError!void {
         const entry = self.portById(egress) orelse return error.NotFound;
@@ -2212,7 +2527,7 @@ pub const Forwarder = struct {
 
         if (limit and !try self.recordArpMiss(io, target)) return;
 
-        const local = self.localForPeer(egress, target) orelse return;
+        const local = self.localForPeer(egress, target, vlan) orelse return;
         var payload: [28]u8 = undefined;
         _ = arp.write(
             &payload,
@@ -2222,7 +2537,7 @@ pub const Forwarder = struct {
             types.Mac.zero,
             target,
         ) catch return;
-        try self.sendL2(io, egress, types.Mac.broadcast, ethernet.EtherType.arp, &payload);
+        try self.sendL2Vlan(io, egress, types.Mac.broadcast, ethernet.EtherType.arp, &payload, vlan);
         self.counters.arp_requests += 1;
     }
 
@@ -2238,14 +2553,15 @@ pub const Forwarder = struct {
         return true;
     }
 
-    fn sendArpRequestBridge(self: *Forwarder, io: std.Io, bridge_id: u32, target: types.Ipv4) PortError!void {
+    fn sendArpRequestBridge(self: *Forwarder, io: std.Io, bridge_id: u32, target: types.Ipv4, vlan: u16) PortError!void {
         const bridge = self.bridgeById(bridge_id) orelse return error.NotFound;
         // Rate-limit once for the whole bridge, then send on each member.
         // Otherwise an unresolved next hop generates one request per member
         // for every forwarded packet.
         if (!try self.recordArpMiss(io, target)) return;
         for (bridge.members) |member| {
-            self.sendArpRequestLimited(io, member, target, false) catch {};
+            if (egressVlan(bridge, member, vlan) == .filtered) continue;
+            self.sendArpRequestLimited(io, member, target, vlan, false) catch {};
         }
     }
 
@@ -2262,44 +2578,70 @@ pub const Forwarder = struct {
         ethertype: u16,
         payload: []const u8,
     ) PortError!void {
+        return self.sendL2Vlan(io, egress, dst, ethertype, payload, 0);
+    }
+
+    fn sendL2Vlan(
+        self: *Forwarder,
+        io: std.Io,
+        egress: types.PortId,
+        dst: types.Mac,
+        ethertype: u16,
+        payload: []const u8,
+        vlan: u16,
+    ) PortError!void {
         const entry = self.portById(egress) orelse return error.NotFound;
         const info = entry.port.info();
         if (info.mac.isZero()) return error.Unsupported;
 
+        var tag: ?u16 = null;
+        if (self.bridgeForPort(egress)) |bridge| {
+            tag = switch (egressVlan(bridge, egress, vlan)) {
+                .untagged => null,
+                .tagged => |vid| vid,
+                .filtered => return error.Unsupported,
+            };
+        } else if (vlan != 0) {
+            return error.Unsupported;
+        }
+
         var frame: [2048]u8 = undefined;
-        const hlen = ethernet.write(&frame, dst, info.mac, ethertype, null) catch
+        const hlen = ethernet.write(&frame, dst, info.mac, ethertype, tag) catch
             return error.FrameTooLarge;
         if (payload.len > frame.len - hlen) return error.FrameTooLarge;
+        if (payload.len > info.mtu) return error.FrameTooLarge;
         @memcpy(frame[hlen..][0..payload.len], payload);
         try entry.port.write(io, frame[0 .. hlen + payload.len]);
     }
 
-    fn isLocal(self: *const Forwarder, ip: types.Ipv4) bool {
+    fn isLocal(self: *const Forwarder, ip: types.Ipv4, vlan: u16) bool {
         for (self.local.items) |local| {
-            if (local.prefix.addr.value == ip.value) return true;
+            if (local.vlan == vlan and local.prefix.addr.value == ip.value) return true;
         }
         return false;
     }
 
-    fn localOn(self: *const Forwarder, ip: types.Ipv4, port: types.PortId) ?LocalAddr {
+    fn localOn(self: *const Forwarder, ip: types.Ipv4, port: types.PortId, vlan: u16) ?LocalAddr {
         for (self.local.items) |local| {
-            if (local.port.eql(port) and local.prefix.addr.value == ip.value) return local;
+            if (local.port.eql(port) and local.vlan == vlan and local.prefix.addr.value == ip.value) {
+                return local;
+            }
         }
         return null;
     }
 
-    fn localForPort(self: *const Forwarder, port: types.PortId) ?LocalAddr {
+    fn localForPort(self: *const Forwarder, port: types.PortId, vlan: u16) ?LocalAddr {
         for (self.local.items) |local| {
-            if (local.port.eql(port)) return local;
+            if (local.port.eql(port) and local.vlan == vlan) return local;
         }
         return null;
     }
 
-    fn localForPeer(self: *const Forwarder, port: types.PortId, peer: types.Ipv4) ?LocalAddr {
+    fn localForPeer(self: *const Forwarder, port: types.PortId, peer: types.Ipv4, vlan: u16) ?LocalAddr {
         for (self.local.items) |local| {
-            if (local.port.eql(port) and local.prefix.contains(peer)) return local;
+            if (local.port.eql(port) and local.vlan == vlan and local.prefix.contains(peer)) return local;
         }
-        return self.localForPort(port);
+        return self.localForPort(port, vlan);
     }
 
     fn snatAddrFor(self: *const Forwarder, port: types.PortId) ?types.Ipv4 {
@@ -2322,6 +2664,97 @@ pub const Forwarder = struct {
             return rule;
         }
         return null;
+    }
+
+    fn compileFirewall(self: *Forwarder, cfg: *const schema.Config) PortError!void {
+        for (cfg.firewall.rules) |rule| {
+            var compiled = FirewallRule{
+                .action = rule.action,
+                .proto = if (rule.proto) |proto| switch (proto) {
+                    .tcp => ipv4.Protocol.tcp,
+                    .udp => ipv4.Protocol.udp,
+                    .icmp => ipv4.Protocol.icmp,
+                } else null,
+                .src = if (rule.src) |src| types.Prefix4.parse(src) catch
+                    return error.InvalidArgument else null,
+                .dst = if (rule.dst) |dst| types.Prefix4.parse(dst) catch
+                    return error.InvalidArgument else null,
+                .sport = rule.sport,
+                .dport = rule.dport,
+            };
+            if (rule.iif) |name| {
+                compiled.iif = self.firewallIface(cfg, name) orelse return error.NotFound;
+            }
+            if (rule.oif) |name| {
+                compiled.oif = self.firewallIface(cfg, name) orelse return error.NotFound;
+            }
+            for (rule.ct_state) |state| {
+                compiled.ct_mask |= firewallCtBit(state);
+            }
+            try self.firewall_rules.append(self.gpa, compiled);
+        }
+    }
+
+    fn firewallIface(self: *const Forwarder, cfg: *const schema.Config, name: []const u8) ?FirewallIface {
+        if (findPort(self.ports, name)) |entry| return .{ .port = entry.id };
+        const itf = cfg.interfaces.get(name) orelse return null;
+        if (itf.port) |port_name| {
+            const entry = findPort(self.ports, port_name) orelse return null;
+            return .{ .port = entry.id };
+        }
+        if (itf.bridge) |bridge_name| {
+            const bridge = self.bridgeByName(cfg, bridge_name) orelse return null;
+            return .{ .bridge = bridge.id };
+        }
+        return null;
+    }
+
+    fn firewallAction(
+        self: *Forwarder,
+        iif: types.PortId,
+        oif: ?types.PortId,
+        ip: ipv4.Header,
+        state: schema.FirewallCtState,
+    ) ?schema.FirewallAction {
+        const ports = firewallPorts(ip);
+        for (self.firewall_rules.items) |*rule| {
+            if (rule.proto) |proto| {
+                if (proto != ip.protocol) continue;
+            }
+            if (rule.src) |prefix| {
+                if (!prefix.contains(ip.src)) continue;
+            }
+            if (rule.dst) |prefix| {
+                if (!prefix.contains(ip.dst)) continue;
+            }
+            if (rule.sport) |port| {
+                if (ports.sport != port) continue;
+            }
+            if (rule.dport) |port| {
+                if (ports.dport != port) continue;
+            }
+            if (rule.iif) |match| {
+                if (!self.firewallIfaceMatches(match, iif)) continue;
+            }
+            if (rule.oif) |match| {
+                const port = oif orelse continue;
+                if (!self.firewallIfaceMatches(match, port)) continue;
+            }
+            if (rule.ct_mask != 0 and rule.ct_mask & firewallCtBit(state) == 0) continue;
+            rule.packets += 1;
+            return rule.action;
+        }
+        return null;
+    }
+
+    fn firewallIfaceMatches(self: *const Forwarder, match: FirewallIface, port: types.PortId) bool {
+        return switch (match) {
+            .port => |required| required.eql(port),
+            .bridge => |bridge_id| blk: {
+                const bridge = self.bridgeForPort(port) orelse break :blk false;
+                break :blk bridge.id == bridge_id;
+            },
+        };
     }
 
     fn bridgeByName(self: *const Forwarder, cfg: *const schema.Config, name: []const u8) ?Bridge {
@@ -2349,6 +2782,20 @@ pub const Forwarder = struct {
             if (bridge.contains(port)) return bridge;
         }
         return null;
+    }
+
+    fn sourceOnIngress(
+        self: *const Forwarder,
+        src: types.Ipv4,
+        ingress: types.PortId,
+        vlan: u16,
+    ) bool {
+        if (src.isUnspecified() or src.isMulticast() or src.eql(types.Ipv4.limited_broadcast)) {
+            return false;
+        }
+        const route = self.fib.lookup(src) orelse return false;
+        if (route.vlan != vlan) return false;
+        return route.port.eql(ingress) or self.sameBridge(route.port, ingress);
     }
 
     fn trafficZone(self: *const Forwarder, port: types.PortId) u32 {
@@ -2429,7 +2876,7 @@ const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
 const TCP_ACK: u8 = 0x10;
 
-fn flowKey(ip: ipv4.Header, zone: u32) ?conntrack_mod.FlowKey {
+fn flowKey(ip: ipv4.Header, zone: u32, vlan: u16) ?conntrack_mod.FlowKey {
     if (ip.isFragment()) return null;
     if (ip.protocol == ipv4.Protocol.tcp) {
         if (ip.payload.len < 20) return null;
@@ -2440,6 +2887,7 @@ fn flowKey(ip: ipv4.Header, zone: u32) ?conntrack_mod.FlowKey {
             .sport = readU16(ip.payload, 0),
             .dst = ip.dst,
             .dport = readU16(ip.payload, 2),
+            .vlan = vlan,
         };
     }
     if (ip.protocol == ipv4.Protocol.udp) {
@@ -2451,6 +2899,7 @@ fn flowKey(ip: ipv4.Header, zone: u32) ?conntrack_mod.FlowKey {
             .sport = readU16(ip.payload, 0),
             .dst = ip.dst,
             .dport = readU16(ip.payload, 2),
+            .vlan = vlan,
         };
     }
     if (ip.protocol == ipv4.Protocol.icmp) {
@@ -2465,6 +2914,7 @@ fn flowKey(ip: ipv4.Header, zone: u32) ?conntrack_mod.FlowKey {
             .sport = readU16(ip.payload, 4),
             .dst = ip.dst,
             .dport = 0,
+            .vlan = vlan,
         };
     }
     return null;
@@ -2475,6 +2925,7 @@ fn makeReplyKey(
     nat_addr: types.Ipv4,
     nat_port: u16,
     reply_zone: u32,
+    reply_vlan: u16,
 ) conntrack_mod.FlowKey {
     if (original.proto == ipv4.Protocol.icmp) {
         return .{
@@ -2484,6 +2935,7 @@ fn makeReplyKey(
             .sport = nat_port,
             .dst = nat_addr,
             .dport = 0,
+            .vlan = reply_vlan,
         };
     }
     return .{
@@ -2493,6 +2945,7 @@ fn makeReplyKey(
         .sport = original.dport,
         .dst = nat_addr,
         .dport = nat_port,
+        .vlan = reply_vlan,
     };
 }
 
@@ -2552,6 +3005,7 @@ fn makeTranslatedKey(
     dst: types.Ipv4,
     dport: u16,
     zone: u32,
+    vlan: u16,
 ) conntrack_mod.FlowKey {
     return .{
         .zone = zone,
@@ -2560,6 +3014,7 @@ fn makeTranslatedKey(
         .sport = sport,
         .dst = dst,
         .dport = dport,
+        .vlan = vlan,
     };
 }
 
@@ -2568,6 +3023,7 @@ fn makeDnatReplyKey(
     target_addr: types.Ipv4,
     target_port: u16,
     reply_zone: u32,
+    reply_vlan: u16,
 ) conntrack_mod.FlowKey {
     return .{
         .zone = reply_zone,
@@ -2576,6 +3032,7 @@ fn makeDnatReplyKey(
         .sport = target_port,
         .dst = original.src,
         .dport = original.sport,
+        .vlan = reply_vlan,
     };
 }
 
@@ -2586,6 +3043,7 @@ fn makeHairpinReplyKey(
     snat_addr: types.Ipv4,
     snat_port: u16,
     reply_zone: u32,
+    reply_vlan: u16,
 ) conntrack_mod.FlowKey {
     return .{
         .zone = reply_zone,
@@ -2594,13 +3052,37 @@ fn makeHairpinReplyKey(
         .sport = target_port,
         .dst = snat_addr,
         .dport = snat_port,
+        .vlan = reply_vlan,
     };
 }
 
-fn fdbKey(bridge_id: u32, mac: types.Mac) u64 {
+fn firewallCtBit(state: schema.FirewallCtState) u8 {
+    return switch (state) {
+        .new => 1,
+        .established => 2,
+        .related => 4,
+        .invalid => 8,
+    };
+}
+
+const FirewallPorts = struct { sport: ?u16 = null, dport: ?u16 = null };
+
+fn firewallPorts(ip: ipv4.Header) FirewallPorts {
+    if (ip.protocol != ipv4.Protocol.tcp and ip.protocol != ipv4.Protocol.udp) return .{};
+    // Non-initial fragments have no transport header to inspect.
+    if (ip.fragmentOffset() != 0 or ip.payload.len < 4) return .{};
+    return .{
+        .sport = readU16(ip.payload, 0),
+        .dport = readU16(ip.payload, 2),
+    };
+}
+
+fn fdbKey(bridge_id: u32, vlan: u16, mac: types.Mac) u128 {
     var value: u64 = 0;
     for (mac.bytes) |byte| value = (value << 8) | byte;
-    return (@as(u64, bridge_id) << 48) | value;
+    return (@as(u128, bridge_id) << 60) |
+        (@as(u128, vlan) << 48) |
+        @as(u128, value);
 }
 
 fn initialTimeout(proto: u8) i64 {
@@ -2738,10 +3220,25 @@ fn setup(
         .{ .id = port_b, .config_name = "b", .port = b.port() },
     };
     fwd.* = try Forwarder.init(testing.allocator, entries);
-    try fwd.addLocal(testPrefix("10.0.1.1/24"), port_a);
-    try fwd.addLocal(testPrefix("10.0.2.1/24"), port_b);
+    try fwd.addLocal(testPrefix("10.0.1.1/24"), port_a, 0);
+    try fwd.addLocal(testPrefix("10.0.2.1/24"), port_b, 0);
     try fwd.addRoute(.{ .prefix = testNet("10.0.1.0/24"), .port = port_a, .kind = .connected });
     try fwd.addRoute(.{ .prefix = testNet("10.0.2.0/24"), .port = port_b, .kind = .connected });
+}
+
+fn flushDhcpOffers(fwd: *Forwarder) void {
+    for (&fwd.dhcp_pending) |*slot| {
+        if (slot.used) slot.queued_ms = 0;
+    }
+    fwd.tick(testing.io);
+}
+
+fn takeIpv4Sent(port: anytype, out: []u8) !usize {
+    while (try port.takeSent(out)) |n| {
+        const h = try ethernet.parse(out[0..n]);
+        if (h.ethertype == ethernet.EtherType.ipv4) return n;
+    }
+    return error.TestUnexpectedResult;
 }
 
 fn buildEchoRequest(
@@ -2801,8 +3298,8 @@ fn setupTun(
         .{ .id = port_tun, .config_name = "tun0", .port = t.port() },
     };
     fwd.* = try Forwarder.init(testing.allocator, entries);
-    try fwd.addLocal(testPrefix("10.0.1.1/24"), port_a);
-    try fwd.addLocal(testPrefix("10.0.3.1/24"), port_tun);
+    try fwd.addLocal(testPrefix("10.0.1.1/24"), port_a, 0);
+    try fwd.addLocal(testPrefix("10.0.3.1/24"), port_tun, 0);
     try fwd.addRoute(.{ .prefix = testNet("10.0.1.0/24"), .port = port_a, .kind = .connected });
     try fwd.addRoute(.{ .prefix = testNet("10.0.3.0/24"), .port = port_tun, .kind = .connected });
     try fwd.addRoute(.{
@@ -3182,6 +3679,144 @@ test "forwarder drops vlan tagged frames" {
     try testing.expectEqual(@as(u64, 1), fwd.counters.dropped);
 }
 
+test "vlan-aware bridge tags and filters by port membership" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+
+    const entries = [2]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "vlan",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a", "pvid": 10 },
+        \\    "b": { "kind": "l2", "device": "b", "pvid": 20, "tagged": [10, 20] }
+        \\  },
+        \\  "bridges": {
+        \\    "br": { "ports": ["a", "b"], "vlan_aware": true }
+        \\  }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+
+    var frame: [128]u8 = undefined;
+    var hlen = try ethernet.write(&frame, host_b_mac, host_a_mac, 0x88b5, null);
+    @memcpy(frame[hlen..][0..4], "vlan");
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_a);
+
+    var out: [512]u8 = undefined;
+    const n = (try b.takeSent(&out)).?;
+    const tagged = try ethernet.parse(out[0..n]);
+    try testing.expectEqual(@as(?u16, 10), tagged.vlan);
+    try testing.expectEqualSlices(u8, "vlan", tagged.payload);
+
+    hlen = try ethernet.write(&frame, host_a_mac, host_b_mac, 0x88b5, 10);
+    @memcpy(frame[hlen..][0..4], "back");
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_b);
+    const back_n = (try a.takeSent(&out)).?;
+    const untagged = try ethernet.parse(out[0..back_n]);
+    try testing.expectEqual(@as(?u16, null), untagged.vlan);
+    try testing.expectEqualSlices(u8, "back", untagged.payload);
+
+    hlen = try ethernet.write(&frame, host_a_mac, host_b_mac, 0x88b5, 20);
+    @memcpy(frame[hlen..][0..4], "drop");
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_b);
+    try testing.expectEqual(@as(usize, 0), a.queuedTx());
+
+    hlen = try ethernet.write(&frame, host_a_mac, host_b_mac, 0x88b5, null);
+    @memcpy(frame[hlen..][0..4], "pvid");
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_b);
+    try testing.expectEqual(@as(usize, 0), a.queuedTx());
+}
+
+test "vlan-aware SVI replies and ARP cache are per vlan" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+
+    const entries = [2]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "vlan-svi",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a", "pvid": 10 },
+        \\    "b": { "kind": "l2", "device": "b", "pvid": 20, "tagged": [10, 20] }
+        \\  },
+        \\  "bridges": {
+        \\    "br": { "ports": ["a", "b"], "vlan_aware": true }
+        \\  },
+        \\  "interfaces": {
+        \\    "lan0": { "bridge": "br", "address": "10.0.1.1/24", "vlan": 10 }
+        \\  }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+
+    var frame: [128]u8 = undefined;
+    var arp_buf: [28]u8 = undefined;
+    _ = try arp.write(
+        &arp_buf,
+        .request,
+        host_a_mac,
+        testIp("10.0.1.9"),
+        types.Mac.zero,
+        testIp("10.0.1.1"),
+    );
+    var hlen = try ethernet.write(&frame, types.Mac.broadcast, host_a_mac, ethernet.EtherType.arp, null);
+    @memcpy(frame[hlen..][0..arp_buf.len], &arp_buf);
+    try fwd.handle(testing.io, frame[0 .. hlen + arp_buf.len], port_a);
+
+    var out: [512]u8 = undefined;
+    const n = (try a.takeSent(&out)).?;
+    const reply = try ethernet.parse(out[0..n]);
+    try testing.expectEqual(@as(?u16, null), reply.vlan);
+    const reply_arp = try arp.parse(reply.payload);
+    try testing.expectEqual(arp.Operation.reply, reply_arp.operation);
+    try testing.expect(reply_arp.sender_mac.eql(port_a_mac));
+    try testing.expect(reply_arp.sender_ip.eql(testIp("10.0.1.1")));
+    try testing.expect(fwd.arp.getVlan(testIp("10.0.1.9"), 10) != null);
+
+    _ = try arp.write(
+        &arp_buf,
+        .reply,
+        host_b_mac,
+        testIp("10.0.1.9"),
+        port_b_mac,
+        testIp("10.0.1.1"),
+    );
+    hlen = try ethernet.write(&frame, port_b_mac, host_b_mac, ethernet.EtherType.arp, 20);
+    @memcpy(frame[hlen..][0..arp_buf.len], &arp_buf);
+    try fwd.handle(testing.io, frame[0 .. hlen + arp_buf.len], port_b);
+
+    const vlan10 = fwd.arp.getVlan(testIp("10.0.1.9"), 10).?;
+    const vlan20 = fwd.arp.getVlan(testIp("10.0.1.9"), 20).?;
+    try testing.expect(vlan10.mac.eql(host_a_mac));
+    try testing.expect(vlan20.mac.eql(host_b_mac));
+    try testing.expect(fwd.arp.getVlan(testIp("10.0.1.9"), 0) == null);
+}
+
 test "forwarder builds state from config" {
     const MemoryPort = @import("../port/memory.zig").MemoryPort;
     var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
@@ -3230,7 +3865,7 @@ test "forwarder builds state from config" {
     try testing.expect(route.next_hop.?.eql(testIp("10.0.1.254")));
     try testing.expect(route.port.eql(port_a));
     try testing.expect(route.metric == 100);
-    try testing.expect(fwd.localForPeer(port_b, testIp("10.0.2.9")) != null);
+    try testing.expect(fwd.localForPeer(port_b, testIp("10.0.2.9"), 0) != null);
     try testing.expectEqual(@as(usize, 1), fwd.snat_rules.items.len);
     try testing.expect(fwd.snat_rules.items[0].port.eql(port_b));
     try testing.expect(fwd.snat_rules.items[0].addr.eql(testIp("10.0.2.1")));
@@ -3239,6 +3874,144 @@ test "forwarder builds state from config" {
     try testing.expectEqual(@as(u16, 8080), fwd.forward_rules.items[0].ext_port);
     try testing.expect(fwd.forward_rules.items[0].to_addr.eql(testIp("10.0.1.10")));
     try testing.expectEqual(@as(u16, 80), fwd.forward_rules.items[0].to_port);
+}
+
+test "firewall rules are ordered and match interfaces and addresses" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+    const entries = [2]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "fw",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a" },
+        \\    "b": { "kind": "l2", "device": "b" }
+        \\  },
+        \\  "interfaces": {
+        \\    "lan-a": { "port": "a", "address": "10.0.1.1/24" },
+        \\    "lan-b": { "port": "b", "address": "10.0.2.1/24" }
+        \\  },
+        \\  "firewall": {
+        \\    "default_forward": "drop",
+        \\    "rules": [
+        \\      { "action": "drop", "proto": "icmp", "src": "10.0.1.2/32" },
+        \\      { "action": "accept", "proto": "icmp", "iif": "lan-a", "oif": "lan-b" }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = nowMs(testing.io),
+    });
+
+    var frame: [512]u8 = undefined;
+    const dropped = try buildEchoRequest(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.2.2"),
+        64,
+        "no",
+    );
+    try fwd.handle(testing.io, frame[0..dropped], port_a);
+    try testing.expectEqual(@as(usize, 0), b.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.firewall_dropped);
+    try testing.expectEqual(@as(u64, 1), fwd.firewall_rules.items[0].packets);
+
+    const allowed = try buildEchoRequest(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.3"),
+        testIp("10.0.2.2"),
+        64,
+        "yes",
+    );
+    try fwd.handle(testing.io, frame[0..allowed], port_a);
+    try testing.expectEqual(@as(usize, 1), b.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.firewall_rules.items[1].packets);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.forwarded);
+}
+
+test "rp_filter drops sources not reachable from the ingress port" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+    const entries = [2]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "rp",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a" },
+        \\    "b": { "kind": "l2", "device": "b" }
+        \\  },
+        \\  "interfaces": {
+        \\    "lan": { "port": "a", "address": "10.0.1.1/24" },
+        \\    "wan": { "port": "b", "address": "10.0.2.1/24" }
+        \\  },
+        \\  "firewall": { "rp_filter": true, "default_forward": "accept" }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = nowMs(testing.io),
+    });
+
+    var frame: [512]u8 = undefined;
+    const spoofed = try buildEchoRequest(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.9.9"),
+        testIp("10.0.2.2"),
+        64,
+        "bad",
+    );
+    try fwd.handle(testing.io, frame[0..spoofed], port_a);
+    try testing.expectEqual(@as(usize, 0), b.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.firewall_spoofed);
+
+    const allowed = try buildEchoRequest(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.2.2"),
+        64,
+        "ok",
+    );
+    try fwd.handle(testing.io, frame[0..allowed], port_a);
+    try testing.expectEqual(@as(usize, 1), b.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.firewall_spoofed);
 }
 
 test "bridge forwards frames and serves dhcp on any member" {
@@ -3319,7 +4092,8 @@ test "bridge forwards frames and serves dhcp on any member" {
         discover,
     );
     try fwd.handle(testing.io, dhcp_frame[0..dn], port_b);
-    const offer_n = (try b.takeSent(&out)).?;
+    flushDhcpOffers(&fwd);
+    const offer_n = try takeIpv4Sent(&b, &out);
     const offer_eth = try ethernet.parse(out[0..offer_n]);
     const offer_ip = try ipv4.parse(offer_eth.payload);
     const offer = try dhcp_message.Message.parse(offer_ip.payload[8..]);
@@ -4467,18 +5241,16 @@ test "dhcp server offers and acks a lease" {
         discover,
     );
     try fwd.handle(testing.io, frame[0..n], port_a);
+    flushDhcpOffers(&fwd);
 
     var out: [512]u8 = undefined;
-    const m = (try a.takeSent(&out)).?;
+    const m = try takeIpv4Sent(&a, &out);
     const eth = try ethernet.parse(out[0..m]);
     const ip_h = try ipv4.parse(eth.payload);
     const offer = try dhcp_message.Message.parse(ip_h.payload[8..]);
     try testing.expectEqual(dhcp_message.MessageType.offer, offer.messageType().?);
     try testing.expectEqual(@as(u32, 0x0a000164), offer.yiaddr.value);
     try testing.expectEqual(@as(u32, 0x0a000101), offer.options.serverId().?.value);
-
-    var probe_buf: [512]u8 = undefined;
-    _ = try a.takeSent(&probe_buf);
 
     const request = try buildDhcpPayload(
         &payload_buf,
@@ -4509,6 +5281,60 @@ test "dhcp server offers and acks a lease" {
     try testing.expectEqual(@as(u32, 0x0a000164), ack.yiaddr.value);
     try testing.expectEqual(@as(u64, 1), fwd.counters.dhcp_offers);
     try testing.expectEqual(@as(u64, 1), fwd.counters.dhcp_acks);
+}
+
+test "dhcp probes a candidate before offering and declines conflicts" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+
+    try fwd.addDhcpServer(.{
+        .port = port_a,
+        .server_ip = testIp("10.0.1.1"),
+        .prefix = testPrefix("10.0.1.1/24"),
+        .pool = types.parseIpRange("10.0.1.100-10.0.1.101") catch unreachable,
+        .lease_seconds = 3600,
+        .dns = testIp("10.0.1.1"),
+    });
+
+    var payload_buf: [512]u8 = undefined;
+    const discover = try buildDhcpPayload(&payload_buf, .discover, 21, host_a_mac, null, null);
+    var frame: [512]u8 = undefined;
+    const n = try buildUdpFrame(
+        &frame,
+        types.Mac.broadcast,
+        host_a_mac,
+        types.Ipv4.unspecified,
+        types.Ipv4.limited_broadcast,
+        68,
+        67,
+        64,
+        discover,
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+
+    var out: [512]u8 = undefined;
+    const pn = (try a.takeSent(&out)).?;
+    const probe_eth = try ethernet.parse(out[0..pn]);
+    try testing.expectEqual(ethernet.EtherType.arp, probe_eth.ethertype);
+    const probe = try arp.parse(probe_eth.payload);
+    try testing.expect(probe.target_ip.eql(testIp("10.0.1.100")));
+
+    try fwd.arp.put(testing.allocator, testIp("10.0.1.100"), .{
+        .mac = host_b_mac,
+        .port = port_a,
+        .updated_ms = nowMs(testing.io),
+    });
+    flushDhcpOffers(&fwd);
+    try testing.expectEqual(@as(?usize, null), try a.takeSent(&out));
+    try testing.expectEqual(@as(u64, 1), fwd.counters.dhcp_conflicts);
+    try testing.expectEqual(@as(usize, 1), fwd.dhcp_servers.items[0].leaseCount(.declined));
 }
 
 test "dhcp client validates xid and server id and schedules renewal" {

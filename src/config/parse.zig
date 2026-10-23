@@ -42,9 +42,9 @@ const config_keys = [_][]const u8{
     "routes",  "nat",      "dhcp", "dns",   "firewall", "lease_db",
 };
 const log_keys = [_][]const u8{ "level", "format" };
-const port_keys = [_][]const u8{ "kind", "device", "create", "mtu" };
+const port_keys = [_][]const u8{ "kind", "device", "create", "mtu", "pvid", "tagged" };
 const bridge_keys = [_][]const u8{ "ports", "stp", "vlan_aware", "offload" };
-const interface_keys = [_][]const u8{ "bridge", "port", "address" };
+const interface_keys = [_][]const u8{ "bridge", "port", "address", "vlan" };
 const route_keys = [_][]const u8{ "dst", "via", "dev", "metric", "table" };
 const nat_keys = [_][]const u8{ "masquerade", "port_forward" };
 const masquerade_keys = [_][]const u8{"out"};
@@ -55,7 +55,12 @@ const dhcp_keys = [_][]const u8{
 const dhcp_reservation_keys = [_][]const u8{ "mac", "ip" };
 const dns_zone_keys = [_][]const u8{ "suffix", "upstreams" };
 const dns_keys = [_][]const u8{ "upstreams", "cache", "listen", "max_entries", "tcp", "zones" };
-const firewall_keys = [_][]const u8{ "default_in", "default_forward", "default_out" };
+const firewall_keys = [_][]const u8{
+    "default_in", "default_forward", "default_out", "rp_filter", "rules",
+};
+const firewall_rule_keys = [_][]const u8{
+    "action", "proto", "src", "dst", "sport", "dport", "iif", "oif", "ct_state",
+};
 
 fn parseRoot(a: std.mem.Allocator, value: std.json.Value) ConfigError!schema.Config {
     const obj = try asObject(&value);
@@ -77,7 +82,7 @@ fn parseRoot(a: std.mem.Allocator, value: std.json.Value) ConfigError!schema.Con
     if (field(obj, "nat")) |v| config.nat = try parseNat(a, v);
     if (field(obj, "dhcp")) |v| config.dhcp = try parseDhcp(a, v);
     if (field(obj, "dns")) |v| config.dns = try parseDns(a, v);
-    if (field(obj, "firewall")) |v| config.firewall = try parseFirewall(v);
+    if (field(obj, "firewall")) |v| config.firewall = try parseFirewall(a, v);
     config.lease_db = try optString(obj, "lease_db");
 
     return config;
@@ -99,12 +104,12 @@ fn parsePorts(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!sc
     while (it.next()) |entry| {
         const name = try a.dupe(u8, entry.key_ptr.*);
         if (name.len == 0) return error.InvalidValue;
-        try out.put(a, name, try parsePort(entry.value_ptr));
+        try out.put(a, name, try parsePort(a, entry.value_ptr));
     }
     return out;
 }
 
-fn parsePort(value: *const std.json.Value) ConfigError!schema.PortConfig {
+fn parsePort(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!schema.PortConfig {
     const obj = try asObject(value);
     try onlyKeys(obj, &port_keys);
 
@@ -129,6 +134,8 @@ fn parsePort(value: *const std.json.Value) ConfigError!schema.PortConfig {
         .device = device,
         .create = create,
         .mtu = mtu,
+        .pvid = if (field(obj, "pvid")) |v| try asInt(u16, v) else null,
+        .tagged = if (field(obj, "tagged")) |v| try parseIntArray(a, v) else &.{},
     };
 }
 
@@ -174,6 +181,7 @@ fn parseInterface(value: *const std.json.Value) ConfigError!schema.InterfaceConf
         .bridge = try optString(obj, "bridge"),
         .port = try optString(obj, "port"),
         .address = try optString(obj, "address"),
+        .vlan = if (field(obj, "vlan")) |v| try asInt(u16, v) else null,
     };
 }
 
@@ -302,14 +310,68 @@ fn parseDns(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!sche
     };
 }
 
-fn parseFirewall(value: *const std.json.Value) ConfigError!schema.FirewallConfig {
+fn parseFirewall(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!schema.FirewallConfig {
     const obj = try asObject(value);
     try onlyKeys(obj, &firewall_keys);
-    return .{
+    var firewall = schema.FirewallConfig{
         .default_in = try optEnum(schema.FirewallAction, obj, "default_in", .drop),
         .default_forward = try optEnum(schema.FirewallAction, obj, "default_forward", .drop),
         .default_out = try optEnum(schema.FirewallAction, obj, "default_out", .accept),
+        .rp_filter = try optBool(obj, "rp_filter", false),
     };
+    if (field(obj, "rules")) |rules_value| {
+        const arr = try asArray(rules_value);
+        const rules = try a.alloc(schema.FirewallRuleConfig, arr.items.len);
+        for (arr.items, 0..) |item, i| rules[i] = try parseFirewallRule(a, &item);
+        firewall.rules = rules;
+    }
+    return firewall;
+}
+
+fn parseFirewallRule(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!schema.FirewallRuleConfig {
+    const obj = try asObject(value);
+    try onlyKeys(obj, &firewall_rule_keys);
+    return .{
+        .action = try reqEnum(schema.FirewallAction, obj, "action"),
+        .proto = if (field(obj, "proto")) |v| blk: {
+            const s = switch (v.*) {
+                .string => |x| x,
+                else => return error.InvalidType,
+            };
+            break :blk std.meta.stringToEnum(schema.Proto, s) orelse return error.InvalidValue;
+        } else null,
+        .src = try optString(obj, "src"),
+        .dst = try optString(obj, "dst"),
+        .sport = if (field(obj, "sport")) |v| try asInt(u16, v) else null,
+        .dport = if (field(obj, "dport")) |v| try asInt(u16, v) else null,
+        .iif = try optString(obj, "iif"),
+        .oif = try optString(obj, "oif"),
+        .ct_state = if (field(obj, "ct_state")) |v| try parseCtStates(a, v) else &.{},
+    };
+}
+
+fn parseCtStates(a: std.mem.Allocator, value: *const std.json.Value) ConfigError![]const schema.FirewallCtState {
+    switch (value.*) {
+        .string => |one| {
+            const states = try a.alloc(schema.FirewallCtState, 1);
+            states[0] = std.meta.stringToEnum(schema.FirewallCtState, one) orelse
+                return error.InvalidValue;
+            return states;
+        },
+        .array => |arr| {
+            const states = try a.alloc(schema.FirewallCtState, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                const s = switch (item) {
+                    .string => |x| x,
+                    else => return error.InvalidType,
+                };
+                states[i] = std.meta.stringToEnum(schema.FirewallCtState, s) orelse
+                    return error.InvalidValue;
+            }
+            return states;
+        },
+        else => return error.InvalidType,
+    }
 }
 
 // --- JSON helpers ---------------------------------------------------------
@@ -407,6 +469,13 @@ fn reqStringArray(a: std.mem.Allocator, obj: *const std.json.ObjectMap, key: []c
     return parseStringArray(a, v);
 }
 
+fn parseIntArray(a: std.mem.Allocator, value: *const std.json.Value) ConfigError![]const u16 {
+    const arr = try asArray(value);
+    const out = try a.alloc(u16, arr.items.len);
+    for (arr.items, 0..) |item, i| out[i] = try asInt(u16, &item);
+    return out;
+}
+
 fn parseStringArray(a: std.mem.Allocator, value: *const std.json.Value) ConfigError![]const []const u8 {
     const arr = try asArray(value);
     const out = try a.alloc([]const u8, arr.items.len);
@@ -448,7 +517,15 @@ const example =
     \\    { "iface": "lan0", "pool": "10.10.0.100-10.10.0.200", "lease": "12h", "dns": "10.10.0.1" }
     \\  ],
     \\  "dns": { "upstreams": ["1.1.1.1", "8.8.8.8"], "cache": true, "listen": "10.10.0.1" },
-    \\  "firewall": { "default_in": "drop", "default_forward": "drop", "default_out": "accept" }
+    \\  "firewall": {
+    \\    "default_in": "drop", "default_forward": "drop", "default_out": "accept",
+    \\    "rp_filter": true,
+    \\    "rules": [
+    \\      { "action": "accept", "proto": "tcp", "src": "10.10.0.0/24",
+    \\        "dst": "0.0.0.0/0", "dport": 443, "iif": "lan-br",
+    \\        "ct_state": ["new", "established"] }
+    \\    ]
+    \\  }
     \\}
 ;
 
@@ -467,6 +544,12 @@ test "parses a full config" {
     try std.testing.expectEqual(@as(usize, 2), cfg.dns.upstreams.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.dhcp.len);
     try std.testing.expectEqualStrings("12h", cfg.dhcp[0].lease);
+    try std.testing.expect(cfg.firewall.rp_filter);
+    try std.testing.expectEqual(@as(usize, 1), cfg.firewall.rules.len);
+    try std.testing.expectEqual(schema.FirewallAction.accept, cfg.firewall.rules[0].action);
+    try std.testing.expectEqual(schema.Proto.tcp, cfg.firewall.rules[0].proto.?);
+    try std.testing.expectEqual(@as(u16, 443), cfg.firewall.rules[0].dport.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.firewall.rules[0].ct_state.len);
 }
 
 test "rejects unknown top-level field" {
@@ -501,4 +584,24 @@ test "rejects wrong types" {
     try std.testing.expectError(error.InvalidType, parse(std.testing.allocator,
         \\{ "version": "1", "instance": "x" }
     ));
+}
+
+test "rejects invalid firewall values" {
+    const bad_proto =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [ { "action": "accept", "proto": "sctp" } ] } }
+    ;
+    try std.testing.expectError(error.InvalidValue, parse(std.testing.allocator, bad_proto));
+
+    const bad_ct =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [ { "action": "drop", "ct_state": ["bogus"] } ] } }
+    ;
+    try std.testing.expectError(error.InvalidValue, parse(std.testing.allocator, bad_ct));
+
+    const bad_action =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rules": [ { "action": "log" } ] } }
+    ;
+    try std.testing.expectError(error.InvalidValue, parse(std.testing.allocator, bad_action));
 }

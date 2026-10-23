@@ -145,8 +145,9 @@ pub const Frame = struct {
 - 802.1Q parse/insert; TPID 0x8100 (0x88A8 optional later).
 - Per-port `pvid` (untagged ingress VLAN) and `tagged` set.
 - Trunk ports carry multiple VLANs; access ports carry one.
-- VLAN-aware bridging: FDB keyed by `(vlan, mac)`. `vlan_aware = true` is
-  rejected until VLAN bridging lands (R5); tagged frames are dropped.
+- VLAN-aware bridging: FDB keyed by `(vlan, mac)`. `vlan_aware = true`
+  enables filtering; non-VLAN bridges reject `pvid`/`tagged` and drop tagged
+  frames. Interface SVIs default to VLAN 1 on a VLAN-aware bridge.
 - No QinQ in v1.
 
 ### 3.3 Offload
@@ -215,7 +216,8 @@ Per bridge/port: rx/tx frames, bytes, flooded, learned, aged, drops
 - Non-first fragments are forwarded without L4 inspection; there is no
   reassembly or fragmentation. Packets above the egress MTU produce ICMP
   Fragmentation Needed.
-- Tagged frames are dropped until VLAN support (R5).
+- A single 802.1Q tag is parsed; non-VLAN bridges drop tagged frames, while
+  VLAN-aware bridges enforce per-port PVID/tagged membership.
 - TCP/UDP checksums are recomputed on forwarded, non-fragmented packets
   (ADR-007).
 - Gratuitous ARP is sent for configured local addresses when `vnatd` starts.
@@ -234,7 +236,9 @@ Per bridge/port: rx/tx frames, bytes, flooded, learned, aged, drops
 The NAT engine requires connection tracking; the firewall reuses it.
 
 ```zig
-pub const FlowKey = struct { proto: u8, src: IpAddr, sport: u16, dst: IpAddr, dport: u16 };
+pub const FlowKey = struct {
+    zone: u32, proto: u8, src: IpAddr, sport: u16, dst: IpAddr, dport: u16, vlan: u16,
+};
 pub const FlowState = enum { new, established, related, closing };
 ```
 
@@ -317,21 +321,29 @@ preservation across restarts.
 
 ### 6.1 Rules
 
-Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
-`sport`, `dport`, `ct_state`, `mark`, `dscp`. Actions: `accept`, `drop`,
-`reject`, `log`, `mark`, `snat`, `dnat`.
+Ordered, first-match. Implemented match fields: `iif`, `oif` (port, interface
+or bridge name), `src`, `dst`, `proto`, `sport`, `dport`, `ct_state`.
+Implementing actions: `accept`, `drop`, `reject` (ICMP admin-prohibited).
+`mark`, `dscp`, `log`, and NAT actions remain future work.
 
 - Default policy: `inbound: drop`, `forward: drop`, `outbound: accept`
   (configurable; this is a router, not a transparent bridge). The default
-  input/forward policies are enforced in the datapath now. Ordered rule
-  matching, `outbound` policy and reject-with-reason details remain R6.
-  Router-local DHCP/DNS services bypass the input policy until R6 hooks land.
-- Conntrack integration: `ct_state established,related` accept shortcut.
-- Stateful by default for TCP/UDP; stateless option per rule.
+  input/forward policies and ordered rules are enforced in the datapath;
+  `outbound` policy remains unimplemented and must be `accept`.
+  Router-local DHCP/DNS services bypass the input policy.
+- Forward rules see the packet after destination NAT and reverse NAT but
+  before source NAT; `iif`/`oif` are the original ingress and resolved egress.
+- Anti-spoofing: with `rp_filter: true`, a forwarded packet whose source is
+  not reachable through the ingress port and VLAN (strict uRPF-lite) is
+  dropped.
+- Conntrack integration: a conntrack match accepts established/related flows
+  when no rule matches; rules may still target them by `ct_state`.
+- Stateful by default for TCP/UDP; stateless option per rule is not yet
+  exposed in config.
 
 ### 6.2 Limits
 
-- Rule count cap (default 10,000) with compile-time validation.
+- Rule count cap (4,096) with compile-time validation.
 - No L7/app identification, no IPS, no geo-IP.
 
 ## 7. DHCPv4 server
@@ -389,7 +401,7 @@ machine-checked configs live in `examples/`):
   "lease_db": "/var/lib/vnat/leases.json",
   "ports": {
     "uplink":  { "kind": "l2", "device": "wlan0" },
-    "lan":     { "kind": "l2", "device": "usb0" },
+    "lan":     { "kind": "l2", "device": "usb0", "pvid": 10, "tagged": [20] },
     "vpn0":    { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
@@ -426,11 +438,26 @@ machine-checked configs live in `examples/`):
     "listen": "10.10.0.1",
     "max_entries": 1024
   },
-  "firewall": { "default_in": "drop", "default_forward": "accept" }
+  "firewall": {
+    "default_in": "drop",
+    "default_forward": "drop",
+    "rp_filter": true,
+    "rules": [
+      { "action": "accept", "proto": "tcp", "iif": "lan0", "oif": "wan0",
+        "src": "10.10.0.0/24", "dport": 443, "ct_state": "new" },
+      { "action": "drop", "proto": "icmp", "src": "10.10.0.0/24" }
+    ]
+  }
 }
 ```
 
 Rules for config:
+- `ports.<name>.pvid` and `ports.<name>.tagged` configure VLAN membership on a
+  `vlan_aware` bridge; `interfaces.<name>.vlan` selects the SVI VLAN.
+- `firewall.rules` is evaluated in order before the default policy. Each rule
+  may match `proto`, `src`/`dst` CIDRs, `sport`/`dport` (TCP/UDP only),
+  `iif`/`oif` (port, interface or bridge name) and `ct_state`, and applies
+  `accept`, `drop` or `reject`.
 - Unknown keys are errors (catches typos).
 - Version 1 grows by adding *optional* keys in the milestone that implements
   them (R4 DHCP/DNS, R5 VLAN/STP, R6 firewall); existing keys never change
@@ -447,12 +474,13 @@ Rules for config:
 - **reserved**: recognized but not implemented; enabling it fails with a
   typed error instead of silently falling back.
 
-Current reserved fields include bridge STP/VLAN-awareness/kernel offload and
-future firewall rule keys. Bridge membership, the DHCP client, and
+Current reserved fields include bridge STP/kernel offload. Bridge membership,
+VLAN membership, the DHCP client, firewall rules, and
 `default_in`/`default_forward` are consumed by the datapath; `default_out`
 only accepts `"accept"` until outbound policy is implemented. Explicit
 `port_forward` rules are treated as administrator allows and bypass
-`default_forward` for the flow they create.
+`default_forward` for the flow they create; ordered `firewall.rules` still
+apply first.
 
 ### 9.2 CLI
 
@@ -479,7 +507,7 @@ vnat nat add masquerade --out wan0       # R3
 vnat dhcp status                         # R4
 vnat dns query example.com               # R4
 vnat conntrack list [--state established] # R3
-vnat firewall list                       # R6
+vnat firewall list [-c <config>]         # R6
 vnat pcap --iface lan --write cap.pcap   # R9
 vnat doctor                              # R7
 ```

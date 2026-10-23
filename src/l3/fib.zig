@@ -15,6 +15,8 @@ pub const Route = struct {
     port: types.PortId,
     /// Set when `port` is the first member of a userspace bridge.
     bridge: ?u32 = null,
+    /// Canonical egress VLAN; 0 for untagged/non-VLAN routes.
+    vlan: u16 = 0,
     metric: u32 = 0,
     kind: Kind = .static,
 };

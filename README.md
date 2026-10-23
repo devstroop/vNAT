@@ -99,8 +99,8 @@ Contributor rules: `AGENTS.md`.
 
 ## Implementation Status
 
-- R0-R3: complete
-- R4: in progress
-- R5-R9: planned
+- R0-R4: complete
+- R5-R6: in progress (VLAN bridging and firewall core wired)
+- R7-R9: planned
 
 See `docs/PLAN.md` for milestone details.

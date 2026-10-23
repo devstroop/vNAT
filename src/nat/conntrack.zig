@@ -30,6 +30,7 @@ pub const FlowKey = struct {
     sport: u16,
     dst: types.Ipv4,
     dport: u16,
+    vlan: u16 = 0,
 
     pub fn eql(a: FlowKey, b: FlowKey) bool {
         return a.zone == b.zone and
@@ -37,7 +38,8 @@ pub const FlowKey = struct {
             a.src.eql(b.src) and
             a.sport == b.sport and
             a.dst.eql(b.dst) and
-            a.dport == b.dport;
+            a.dport == b.dport and
+            a.vlan == b.vlan;
     }
 };
 
@@ -81,7 +83,8 @@ pub const Error = error{
 };
 
 pub fn pack(key: FlowKey) u192 {
-    return (@as(u192, key.zone) << 136) |
+    return (@as(u192, key.vlan) << 152) |
+        (@as(u192, key.zone) << 136) |
         (@as(u192, key.proto) << 128) |
         (@as(u192, key.src.value) << 96) |
         (@as(u192, key.sport) << 80) |
@@ -420,4 +423,21 @@ test "translated lookup maps post-nat packets" {
 
     ct.remove(entry);
     try testing.expect(ct.lookupTranslated(translated) == null);
+}
+
+test "vlan separates otherwise identical tuples" {
+    var ct = try Conntrack.init(testing.allocator, 4);
+    defer ct.deinit();
+
+    var original = tcpKey("10.0.1.2", 40000, "10.0.2.2", 80);
+    original.vlan = 10;
+    var reply = tcpKey("10.0.2.2", 80, "10.0.1.2", 40000);
+    reply.vlan = 10;
+    _ = try ct.create(original, reply, null, 0, tcp_established_ms);
+
+    try testing.expect(ct.lookup(original) != null);
+    var other_vlan = original;
+    other_vlan.vlan = 20;
+    try testing.expect(ct.lookup(other_vlan) == null);
+    try testing.expect(pack(original) != pack(other_vlan));
 }

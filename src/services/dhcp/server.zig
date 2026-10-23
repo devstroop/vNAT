@@ -28,6 +28,8 @@ pub const Reservation = struct {
 pub const Config = struct {
     port: types.PortId,
     bridge: ?u32 = null,
+    /// VLAN served on a VLAN-aware bridge; 0 for untagged/non-VLAN.
+    vlan: u16 = 0,
     server_ip: types.Ipv4,
     prefix: types.Prefix4,
     pool: types.IpRange,
@@ -58,7 +60,30 @@ const Lease = struct {
     state: State = .free,
     ip: types.Ipv4 = .{},
     mac: types.Mac = .{},
+    client_id_len: u8 = 0,
+    client_id: [255]u8 = undefined,
     expires_ms: i64 = 0,
+
+    fn matches(self: *const Lease, identity: Identity) bool {
+        if (identity.client_id.len != 0) {
+            return self.client_id_len == identity.client_id.len and
+                std.mem.eql(u8, self.client_id[0..self.client_id_len], identity.client_id);
+        }
+        return self.client_id_len == 0 and self.mac.eql(identity.mac);
+    }
+
+    fn setIdentity(self: *Lease, identity: Identity) void {
+        self.mac = identity.mac;
+        self.client_id_len = @intCast(identity.client_id.len);
+        if (identity.client_id.len != 0) {
+            @memcpy(self.client_id[0..identity.client_id.len], identity.client_id);
+        }
+    }
+};
+
+const Identity = struct {
+    mac: types.Mac,
+    client_id: []const u8 = &.{},
 };
 
 pub const Reply = struct {
@@ -162,6 +187,10 @@ pub const Server = struct {
             self.counters.dropped += 1;
             return null;
         };
+        const identity = Identity{
+            .mac = mac,
+            .client_id = request.clientId() orelse &.{},
+        };
         if (!request.giaddr.isUnspecified()) {
             // Relayed DHCP is out of scope for v1.
             self.counters.dropped += 1;
@@ -180,7 +209,7 @@ pub const Server = struct {
         switch (typ) {
             .discover => {
                 self.counters.discovers += 1;
-                const ip = self.offer(mac, requested, now_ms) orelse {
+                const ip = self.offer(identity, requested, now_ms) orelse {
                     self.counters.dropped += 1;
                     return null;
                 };
@@ -197,7 +226,7 @@ pub const Server = struct {
                     const payload = try self.buildReply(out, .nak, request, mac, .{}, false);
                     return self.makeReply(payload, .nak, request, .{}, true);
                 };
-                if (!self.commit(mac, ip, now_ms)) {
+                if (!self.commit(identity, ip, now_ms)) {
                     self.counters.naks += 1;
                     const payload = try self.buildReply(out, .nak, request, mac, .{}, false);
                     return self.makeReply(payload, .nak, request, .{}, true);
@@ -215,7 +244,7 @@ pub const Server = struct {
             .release => {
                 self.counters.releases += 1;
                 const ip = if (request.ciaddr.isUnspecified()) requested else request.ciaddr;
-                if (ip) |addr| self.release(mac, addr);
+                if (ip) |addr| self.release(identity, addr);
                 return null;
             },
             .inform => {
@@ -240,6 +269,7 @@ pub const Server = struct {
             if (now_ms >= lease.expires_ms) {
                 lease.state = .free;
                 lease.mac = .{};
+                lease.client_id_len = 0;
                 lease.expires_ms = 0;
                 self.counters.expired += 1;
             }
@@ -298,6 +328,7 @@ pub const Server = struct {
         if (lease.state != .free and !lease.mac.eql(record.mac)) return false;
         lease.state = record.state;
         lease.mac = record.mac;
+        lease.client_id_len = 0;
         lease.expires_ms = record.expires_ms;
         return true;
     }
@@ -310,56 +341,56 @@ pub const Server = struct {
         return count;
     }
 
-    fn offer(self: *Server, mac: types.Mac, requested: ?types.Ipv4, now_ms: i64) ?types.Ipv4 {
+    fn offer(self: *Server, identity: Identity, requested: ?types.Ipv4, now_ms: i64) ?types.Ipv4 {
         self.gc(now_ms);
-        if (self.reservationFor(mac)) |reservation| {
+        if (self.reservationFor(identity.mac)) |reservation| {
             const lease = self.leaseForIp(reservation.ip) orelse return null;
             if (lease.state == .free or
-                ((lease.state == .offered or lease.state == .bound) and lease.mac.eql(mac)))
+                ((lease.state == .offered or lease.state == .bound) and lease.matches(identity)))
             {
-                markOffered(lease, mac, now_ms);
+                markOffered(lease, identity, now_ms);
                 return lease.ip;
             }
             return null;
         }
-        if (self.leaseForMac(mac)) |lease| return lease.ip;
+        if (self.leaseForIdentity(identity)) |lease| return lease.ip;
 
         if (requested) |ip| {
             if (self.leaseForIp(ip)) |lease| {
-                if (lease.state == .free and !self.reservedForOther(ip, mac)) {
-                    markOffered(lease, mac, now_ms);
+                if (lease.state == .free and !self.reservedForOther(ip, identity.mac)) {
+                    markOffered(lease, identity, now_ms);
                     return lease.ip;
                 }
             }
         }
         for (self.leases) |*lease| {
             if (lease.state != .free) continue;
-            if (self.reservedForOther(lease.ip, mac)) continue;
-            markOffered(lease, mac, now_ms);
+            if (self.reservedForOther(lease.ip, identity.mac)) continue;
+            markOffered(lease, identity, now_ms);
             return lease.ip;
         }
         return null;
     }
 
-    fn commit(self: *Server, mac: types.Mac, ip: types.Ipv4, now_ms: i64) bool {
+    fn commit(self: *Server, identity: Identity, ip: types.Ipv4, now_ms: i64) bool {
         if (ip.eql(self.cfg.server_ip)) return false;
         self.gc(now_ms);
-        if (self.reservationFor(mac)) |reservation| {
+        if (self.reservationFor(identity.mac)) |reservation| {
             if (!reservation.ip.eql(ip)) return false;
-        } else if (self.reservedForOther(ip, mac)) {
+        } else if (self.reservedForOther(ip, identity.mac)) {
             return false;
         }
         const lease = self.leaseForIp(ip) orelse return false;
         switch (lease.state) {
             .free => {
                 lease.state = .bound;
-                lease.mac = mac;
+                lease.setIdentity(identity);
                 lease.expires_ms = now_ms + leaseMs(self.cfg.lease_seconds);
                 return true;
             },
             .declined => return false,
             .offered, .bound => {
-                if (!lease.mac.eql(mac)) return false;
+                if (!lease.matches(identity)) return false;
                 lease.state = .bound;
                 lease.expires_ms = now_ms + leaseMs(self.cfg.lease_seconds);
                 return true;
@@ -374,15 +405,17 @@ pub const Server = struct {
         if (lease.state != .free and !lease.mac.eql(mac)) return;
         lease.state = .declined;
         lease.mac = .{};
+        lease.client_id_len = 0;
         lease.expires_ms = now_ms + decline_timeout_ms;
     }
 
-    fn release(self: *Server, mac: types.Mac, ip: types.Ipv4) void {
-        if (self.reservedForOther(ip, mac)) return;
+    fn release(self: *Server, identity: Identity, ip: types.Ipv4) void {
+        if (self.reservedForOther(ip, identity.mac)) return;
         const lease = self.leaseForIp(ip) orelse return;
-        if (lease.state == .free or !lease.mac.eql(mac)) return;
+        if (lease.state == .free or !lease.matches(identity)) return;
         lease.state = .free;
         lease.mac = .{};
+        lease.client_id_len = 0;
         lease.expires_ms = 0;
     }
 
@@ -400,9 +433,9 @@ pub const Server = struct {
         return false;
     }
 
-    fn markOffered(lease: *Lease, mac: types.Mac, now_ms: i64) void {
+    fn markOffered(lease: *Lease, identity: Identity, now_ms: i64) void {
         lease.state = .offered;
-        lease.mac = mac;
+        lease.setIdentity(identity);
         lease.expires_ms = now_ms + offer_timeout_ms;
     }
 
@@ -410,6 +443,14 @@ pub const Server = struct {
         for (self.leases) |*lease| {
             if (lease.state == .free or lease.state == .declined) continue;
             if (lease.mac.eql(mac)) return lease;
+        }
+        return null;
+    }
+
+    fn leaseForIdentity(self: *Server, identity: Identity) ?*Lease {
+        for (self.leases) |*lease| {
+            if (lease.state == .free or lease.state == .declined) continue;
+            if (lease.matches(identity)) return lease;
         }
         return null;
     }
@@ -567,6 +608,37 @@ test "discover, request and ack allocate and bind a lease" {
     try testing.expectEqual(message.MessageType.ack, acked.messageType().?);
     try testing.expectEqual(wanted.value, acked.yiaddr.value);
     try testing.expectEqual(@as(usize, 1), server.leaseCount(.bound));
+}
+
+test "client id takes precedence over chaddr for lease identity" {
+    var server = try Server.init(testing.allocator, testConfig());
+    defer server.deinit();
+
+    var req_buf: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    var first = try message.Builder.init(&req_buf, message.op_request, .discover, 1, client_mac, 0x8000);
+    try first.addOption(61, "client-a");
+    const first_payload = try first.finish();
+    const first_offer = (try server.handle(try message.Message.parse(first_payload), &out, 1_000)).?;
+    const first_ip = (try message.Message.parse(first_offer.payload)).yiaddr;
+
+    var second = try message.Builder.init(&req_buf, message.op_request, .discover, 2, client_mac, 0x8000);
+    try second.addOption(61, "client-b");
+    const second_payload = try second.finish();
+    const second_offer = (try server.handle(try message.Message.parse(second_payload), &out, 1_000)).?;
+    const second_ip = (try message.Message.parse(second_offer.payload)).yiaddr;
+
+    try testing.expect(!first_ip.eql(second_ip));
+    try testing.expectEqual(@as(usize, 2), server.leaseCount(.offered));
+
+    var steal = try message.Builder.init(&req_buf, message.op_request, .request, 3, client_mac, 0x8000);
+    try steal.addOption(61, "client-b");
+    try steal.addIpv4(50, first_ip);
+    try steal.addIpv4(54, .{ .value = 0x0a000101 });
+    const steal_payload = try steal.finish();
+    const nak = (try server.handle(try message.Message.parse(steal_payload), &out, 1_000)).?;
+    try testing.expectEqual(message.MessageType.nak, (try message.Message.parse(nak.payload)).messageType().?);
 }
 
 test "pool exhaustion and conflicting requests are rejected" {

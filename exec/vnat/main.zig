@@ -114,6 +114,11 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "firewall")) {
+        try firewallCommand(init, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "dns")) {
         try dnsCommand(init, args[2..]);
         return;
@@ -668,6 +673,48 @@ fn readConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes));
 }
 
+fn firewallCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len != 1 or !std.mem.eql(u8, cfg.rest[0], "list")) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    const firewall = &parsed.config.firewall;
+    try print(io, gpa, "defaults: in={s} forward={s} out={s} rp_filter={s}\n", .{
+        @tagName(firewall.default_in),
+        @tagName(firewall.default_forward),
+        @tagName(firewall.default_out),
+        if (firewall.rp_filter) "on" else "off",
+    });
+    for (firewall.rules, 0..) |rule, i| {
+        try print(io, gpa, "{d}: {s}", .{ i + 1, @tagName(rule.action) });
+        if (rule.proto) |proto| try print(io, gpa, " proto={s}", .{@tagName(proto)});
+        if (rule.src) |src| try print(io, gpa, " src={s}", .{src});
+        if (rule.dst) |dst| try print(io, gpa, " dst={s}", .{dst});
+        if (rule.sport) |port| try print(io, gpa, " sport={d}", .{port});
+        if (rule.dport) |port| try print(io, gpa, " dport={d}", .{port});
+        if (rule.iif) |iif| try print(io, gpa, " iif={s}", .{iif});
+        if (rule.oif) |oif| try print(io, gpa, " oif={s}", .{oif});
+        if (rule.ct_state.len > 0) {
+            try print(io, gpa, " ct_state=", .{});
+            for (rule.ct_state, 0..) |state, j| {
+                if (j > 0) try print(io, gpa, ",", .{});
+                try print(io, gpa, "{s}", .{@tagName(state)});
+            }
+        }
+        try print(io, gpa, "\n", .{});
+    }
+}
+
 fn dhcpCommand(init: std.process.Init, args: []const []const u8) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -842,6 +889,7 @@ fn usage(io: std.Io) !void {
         \\  vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
         \\  vnat down [-c <config>]
         \\  vnat journal [-c <config>]
+        \\  vnat firewall list [-c <config>]
         \\  vnat selftest l2 <inject> <port-a> <port-b> <recv>
         \\  vnat selftest tun|tap <name>
         \\  vnat help

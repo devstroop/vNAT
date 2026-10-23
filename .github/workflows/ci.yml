@@ -60,6 +60,7 @@ jobs:
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_tun.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_journal.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/nat_matrix.sh
+      - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_firewall.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_dhcp.sh
       - run: sudo env "PATH=$PATH" "ZIG=$(command -v zig)" bash scripts/test_dns.sh
 

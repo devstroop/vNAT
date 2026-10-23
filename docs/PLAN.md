@@ -105,7 +105,7 @@ forward works; conntrack survives 1 h churn.
 
 - [x] DHCPv4 server: pool, MAC reservations, options, DECLINE, lease DB
       persistence and restore.
-- [ ] DHCP conflict probe (ARP before OFFER).
+- [x] DHCP conflict probe (ARP before OFFER).
 - [x] DHCP client on uplink (initial lease acquisition, connected route and
       masquerade installation).
 - [x] DNS forwarder: UDP/TCP, TTL cache, negative cache, upstream pool.
@@ -114,9 +114,10 @@ forward works; conntrack survives 1 h churn.
 - [x] netns tests: `scripts/test_dhcp.sh` (lease, ping, persistence) and
       `scripts/test_dns.sh` (query + cache hit).
 
-**Status: IN PROGRESS.** The DHCP server is integrated into the forwarding
-path (no kernel socket) and persists leases when `lease_db` is configured.
-DNS now also serves TCP, split zones and a local `vnat.` / `router.vnat.`
+**Status: COMPLETE.** The DHCP server is integrated into the forwarding path
+(no kernel socket), probes candidates before OFFER, uses option 61 client-id
+as the lease identity when present, and persists leases when `lease_db` is
+configured. DNS serves TCP, split zones and a local `vnat.` / `router.vnat.`
 status zone. `vnatd` does not apply interface addresses, so DNS requires the
 listen address to exist (use `vnat iface set` first).
 
@@ -125,23 +126,37 @@ DHCP + DNS + NAT.
 
 ### R5 — L2 bridge (3–4 weeks)
 
-- [ ] FDB learning/aging/flooding; per-VLAN keys.
-- [ ] 802.1Q: PVID, trunk, access ports, VLAN filtering.
+- [x] FDB learning/aging/flooding; per-VLAN keys.
+- [x] 802.1Q: PVID, trunk, access ports, VLAN filtering.
 - [ ] Broadcast/multicast handling; storm control; loop protection.
 - [ ] Optional STP 802.1D (port SoftEther `bridge/stp.zig`).
 - [ ] Optional Linux kernel-bridge offload backend.
 - [ ] `vnat bridge …`; netns test with veth pairs and tagged traffic.
+
+**Status: IN PROGRESS.** Userspace FDB learning/aging/flooding, broadcast
+handling, per-VLAN FDB keys, PVID/tagged/access semantics and VLAN filtering
+are implemented. STP, kernel offload, storm control and a netns VLAN test
+remain.
 
 **Exit:** Two L2 segments bridged in userspace; tagged/untagged traffic passes;
 kernel offload produces the same result.
 
 ### R6 — Firewall (2–3 weeks)
 
-- [ ] Rule parser/compiler: match fields, actions, conntrack states.
-- [ ] Default-deny inbound/forward; established/related shortcut.
-- [ ] Anti-spoofing (uRPF-lite), ICMP/ARP/DHCP rate limits.
-- [ ] `vnat firewall list/test`; counters per rule.
-- [ ] Tests: ordering, shadowing, state transitions.
+- [x] Rule parser/compiler: match fields, actions, conntrack states.
+- [x] Default-deny inbound/forward; established/related shortcut.
+- [x] Anti-spoofing (uRPF-lite, `firewall.rp_filter`).
+- [ ] ICMP/ARP/DHCP rate limits.
+- [ ] `vnat firewall test`; per-rule counters exposed at runtime.
+- [x] Tests: ordering, shadowing, state transitions.
+
+**Status: IN PROGRESS.** Ordered first-match rules support `proto`, `src`,
+`dst`, `sport`, `dport`, `iif`/`oif` (port, interface or bridge), actions
+`accept`/`drop`/`reject` and `ct_state`; established traffic from conntrack is
+accepted when no rule matches. `vnat firewall list` renders the compiled order;
+per-rule packet counters exist in the datapath but are not yet exported.
+Strict uRPF-lite is enforced when `firewall.rp_filter` is enabled; control-plane
+rate limits remain.
 
 **Exit:** A default-deny router with explicit allows; no regressions in R2–R5
 suites.

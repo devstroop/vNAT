@@ -20,6 +20,18 @@ All notable changes to vNAT are documented here. The format follows
 - Userspace L2 bridge datapath: bridge membership, MAC learning/FDB aging,
   unicast/flood forwarding, per-bridge SVI addressing, bridge ARP resolution,
   and DHCP serving on any member port.
+- VLAN-aware bridging: 802.1Q PVID/trunk/access membership, per-VLAN FDB keys,
+  egress tagging/filtering, and per-SVI VLAN addressing.
+- DHCP conflict probe: ARP the candidate address before OFFER and DECLINE on a
+  conflict; DHCP client-id (option 61) is used as the lease identity when
+  present.
+- Strict uRPF-lite anti-spoofing in the forwarding path via
+  `firewall.rp_filter`.
+- Ordered firewall rules with `proto`, `src`/`dst`, `sport`/`dport`,
+  `iif`/`oif` (port, interface or bridge), `accept`/`drop`/`reject`,
+  `ct_state`, per-rule counters, and default deny before the conntrack
+  established shortcut.
+- `vnat firewall list` prints the ordered rule set and default policies.
 
 ### Fixed
 
@@ -49,10 +61,10 @@ All notable changes to vNAT are documented here. The format follows
 - Cap supported MTUs at 1600 bytes (the 2048-byte frame buffer limit) and
   reject jumbo configuration with a typed validation error.
 - Enforce firewall default input/forward policies (`drop`/`reject`/`accept`)
-  in the datapath; allow-rule matching remains R6. Explicit port forwards are
-  treated as administrator allows, and `default_out` rejects non-accept values
-  until outbound policy is implemented. Reject bridge STP, VLAN-aware and
-  kernel-offload options until implemented instead of silently ignoring them.
+  and ordered rules in the datapath. Explicit port forwards are treated as
+  administrator allows, and `default_out` rejects non-accept values until
+  outbound policy is implemented. Reject bridge STP and kernel-offload
+  options until implemented instead of silently ignoring them.
 - Keep bridge floods running when one member is down or its MTU is exceeded,
   rate-limit bridge-wide ARP resolution, and send valid ARP probes for DHCP
   conflict detection.
@@ -66,7 +78,7 @@ All notable changes to vNAT are documented here. The format follows
 ### R2 — IPv4 forwarding (core)
 
 - Ethernet II and IPv4 parsers/builders with strict length and checksum
-  validation; single 802.1Q tag is parsed, tagged frames are dropped until R5.
+  validation; single 802.1Q tag is parsed (VLAN forwarding in R5).
 - ARP request/reply generation, learning cache with freshness and port scoping,
   and rate-limited broadcast resolution requests.
 - Longest-prefix-match FIB for connected and static routes.
@@ -107,7 +119,7 @@ All notable changes to vNAT are documented here. The format follows
   router and verifies persistence across a daemon restart.
 - `scripts/test_dns.sh`: query through `vnatd`, answer from the fake upstream,
   then a cache hit; both tests run in CI.
-- Not yet: DHCP ARP conflict probe, DNS DoH/DoT, and DHCP/DNS CLI verbs.
+- Not yet: DNS DoH/DoT.
 - Added: initial DHCP client on the uplink, DNS over TCP, split zones and a
   local `vnat.` / `router.vnat.` status zone.
 
