@@ -110,7 +110,7 @@ forward works; conntrack survives 1 h churn.
       masquerade installation).
 - [x] DNS forwarder: UDP/TCP, TTL cache, negative cache, upstream pool.
 - [x] DNS TCP listener/upstream fallback, split zones, local status zone.
-- [ ] `vnat dhcp …`, `vnat dns query/stats`.
+- [x] `vnat dhcp status`, `vnat dns query` (offline, read lease DB / send query).
 - [x] netns tests: `scripts/test_dhcp.sh` (lease, ping, persistence) and
       `scripts/test_dns.sh` (query + cache hit).
 
