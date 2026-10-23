@@ -253,7 +253,7 @@ test "ipv4 ttl expiry is rejected" {
 }
 
 test "ipv4 checksum is ones-complement" {
-    var header: [20]u8 = [_]u8{0} ** 20;
+    var header: [20]u8 = @splat(0);
     header[0] = 0x45;
     writeU16(&header, 2, 20);
     writeU16(&header, 4, 0x1234);

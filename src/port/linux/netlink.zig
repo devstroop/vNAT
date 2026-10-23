@@ -102,13 +102,13 @@ pub const Event = struct {
     kind: Kind,
     action: Action,
     index: u32,
-    name_buf: [sys.IFNAMESIZE]u8 = [_]u8{0} ** sys.IFNAMESIZE,
+    name_buf: [sys.IFNAMESIZE]u8 = @splat(0),
     name_len: u8 = 0,
     mtu: u16 = 0,
     mac: types.Mac = .{},
     up: bool = false,
     family: u8 = 0,
-    addr: [4]u8 = [_]u8{0} ** 4,
+    addr: [4]u8 = @splat(0),
     prefix_len: u8 = 0,
 
     pub fn name(self: *const Event) []const u8 {
@@ -118,7 +118,7 @@ pub const Event = struct {
 
 pub const LinkInfo = struct {
     index: u32,
-    name_buf: [sys.IFNAMESIZE]u8 = [_]u8{0} ** sys.IFNAMESIZE,
+    name_buf: [sys.IFNAMESIZE]u8 = @splat(0),
     name_len: u8 = 0,
     mtu: u16 = 1500,
     mac: types.Mac = .{},
@@ -134,7 +134,7 @@ pub const LinkInfo = struct {
 
 const LinkData = struct {
     index: u32,
-    name_buf: [sys.IFNAMESIZE]u8 = [_]u8{0} ** sys.IFNAMESIZE,
+    name_buf: [sys.IFNAMESIZE]u8 = @splat(0),
     name_len: u8 = 0,
     mtu: u16 = 1500,
     mac: types.Mac = .{},

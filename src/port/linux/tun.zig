@@ -21,7 +21,7 @@ pub const TunPort = struct {
     fd: sys.fd_t,
     id: types.PortId,
     kind: port_mod.PortKind,
-    name_buf: [sys.IFNAMESIZE]u8 = [_]u8{0} ** sys.IFNAMESIZE,
+    name_buf: [sys.IFNAMESIZE]u8 = @splat(0),
     name_len: u8 = 0,
     ifindex: u32 = 0,
     mtu: u16 = 1500,

@@ -67,7 +67,11 @@ pub fn build(b: *std.Build) void {
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| run_cmd.addArgs(args);
+        if (@hasField(std.Build, "args")) {
+            if (b.args) |args| run_cmd.addArgs(args);
+        } else {
+            run_cmd.addPassthruArgs();
+        }
 
         const run_step = b.step("run", "Run vnat");
         run_step.dependOn(&run_cmd.step);

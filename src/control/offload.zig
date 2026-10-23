@@ -232,7 +232,7 @@ fn trunkVlans(
     bridge_name: []const u8,
     bridge: schema.BridgeConfig,
 ) ![]const u16 {
-    var seen = [_]bool{false} ** 4096;
+    var seen: [4096]bool = @splat(false);
     seen[1] = true;
 
     for (bridge.ports) |port_name| {

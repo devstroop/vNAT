@@ -35,14 +35,14 @@ const PacketMreq = extern struct {
     ifindex: i32,
     type: u16,
     alen: u16,
-    address: [8]u8 = [_]u8{0} ** 8,
+    address: [8]u8 = @splat(0),
 };
 
 pub const AfPacketPort = struct {
     fd: sys.fd_t,
     id: types.PortId,
     ifindex: u32,
-    name_buf: [sys.IFNAMESIZE]u8 = [_]u8{0} ** sys.IFNAMESIZE,
+    name_buf: [sys.IFNAMESIZE]u8 = @splat(0),
     name_len: u8 = 0,
     mtu: u16 = 1500,
     mac: types.Mac = .{},
@@ -233,7 +233,7 @@ fn openSocket(ifindex: u32, promiscuous: bool, ignore_outgoing: bool) PortError!
         .hatype = 0,
         .pkttype = 0,
         .halen = 0,
-        .addr = [_]u8{0} ** 8,
+        .addr = @splat(0),
     };
     try sys.check(linux.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
 
@@ -417,7 +417,7 @@ test "restoreVlan reports a full buffer" {
 }
 
 test "auxVlanTci reads a valid auxdata cmsg" {
-    var control: [128]u8 align(@alignOf(usize)) = [_]u8{0} ** 128;
+    var control: [128]u8 align(@alignOf(usize)) = @splat(0);
     const hdr = @as(*align(1) linux.cmsghdr, @ptrCast(&control));
     hdr.level = SOL_PACKET;
     hdr.type = linux.PACKET.AUXDATA;
@@ -437,7 +437,7 @@ test "auxVlanTci reads a valid auxdata cmsg" {
 }
 
 test "auxVlanTci ignores absent or foreign tags" {
-    var control: [128]u8 align(@alignOf(usize)) = [_]u8{0} ** 128;
+    var control: [128]u8 align(@alignOf(usize)) = @splat(0);
     const hdr = @as(*align(1) linux.cmsghdr, @ptrCast(&control));
     hdr.level = SOL_PACKET;
     hdr.type = linux.PACKET.AUXDATA;

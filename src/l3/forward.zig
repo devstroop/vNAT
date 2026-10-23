@@ -347,14 +347,14 @@ pub const Forwarder = struct {
     arp: arp.Cache = .{},
     local: std.ArrayListUnmanaged(LocalAddr) = .empty,
     arp_misses: std.AutoHashMapUnmanaged(u32, i64) = .empty,
-    pending: [pending_slots]PendingPacket = [_]PendingPacket{.{}} ** pending_slots,
+    pending: [pending_slots]PendingPacket = @splat(.{}),
     conntrack: conntrack_mod.Conntrack,
     snat_rules: std.ArrayListUnmanaged(nat_mod.Rule) = .empty,
     forward_rules: std.ArrayListUnmanaged(nat_mod.ForwardRule) = .empty,
     firewall_rules: std.ArrayListUnmanaged(FirewallRule) = .empty,
     dhcp_servers: std.ArrayListUnmanaged(dhcp_server.Server) = .empty,
     dhcp_clients: std.ArrayListUnmanaged(DhcpClient) = .empty,
-    dhcp_pending: [dhcp_pending_slots]PendingDhcpOffer = [_]PendingDhcpOffer{.{}} ** dhcp_pending_slots,
+    dhcp_pending: [dhcp_pending_slots]PendingDhcpOffer = @splat(.{}),
     storm_limiters: []rate.Limiter = &.{},
     bridges: std.ArrayListUnmanaged(Bridge) = .empty,
     fdb: std.AutoHashMapUnmanaged(u128, FdbEntry) = .empty,
@@ -3639,7 +3639,7 @@ fn offloadTrunkVlans(
     bridge_name: []const u8,
     bridge: schema.BridgeConfig,
 ) ![]u16 {
-    var seen = [_]bool{false} ** 4096;
+    var seen: [4096]bool = @splat(false);
     seen[1] = true;
     for (bridge.ports) |port_name| {
         const port = cfg.ports.get(port_name) orelse return error.NotFound;
@@ -4156,7 +4156,7 @@ test "forwarder emits frag-needed above egress mtu" {
         testIp("10.0.1.2"),
         testIp("10.0.2.2"),
         64,
-        &([_]u8{0x41} ** 100),
+        &@as([100]u8, @splat(0x41)),
     );
     try fwd.handle(testing.io, frame[0..n], port_a);
     try testing.expectEqual(@as(usize, 0), b.queuedTx());
@@ -4988,7 +4988,7 @@ test "forwarder repairs offloaded udp checksums" {
     const src = testIp("10.0.1.2");
     const dst = testIp("10.0.2.2");
 
-    var udp: [12]u8 = [_]u8{0} ** 12;
+    var udp: [12]u8 = @splat(0);
     writeU16(&udp, 0, 1234);
     writeU16(&udp, 2, 53);
     writeU16(&udp, 4, 12);
@@ -5310,7 +5310,7 @@ fn buildTcpPacket(
     dport: u16,
     flags: u8,
 ) ![]u8 {
-    var tcp: [20]u8 = [_]u8{0} ** 20;
+    var tcp: [20]u8 = @splat(0);
     writeU16(&tcp, 0, sport);
     writeU16(&tcp, 2, dport);
     tcp[12] = 0x50;
@@ -5364,7 +5364,7 @@ fn buildTcpFrame(
     dport: u16,
     flags: u8,
 ) !usize {
-    var tcp: [20]u8 = [_]u8{0} ** 20;
+    var tcp: [20]u8 = @splat(0);
     writeU16(&tcp, 0, sport);
     writeU16(&tcp, 2, dport);
     tcp[12] = 0x50;

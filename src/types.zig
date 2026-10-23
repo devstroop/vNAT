@@ -9,10 +9,10 @@ const std = @import("std");
 pub const max_supported_mtu: u16 = 1600;
 
 pub const Mac = struct {
-    bytes: [6]u8 = .{0} ** 6,
+    bytes: [6]u8 = @splat(0),
 
     pub const zero: Mac = .{};
-    pub const broadcast: Mac = .{ .bytes = .{0xff} ** 6 };
+    pub const broadcast: Mac = .{ .bytes = @splat(0xff) };
 
     pub fn isZero(self: Mac) bool {
         for (self.bytes) |b| {

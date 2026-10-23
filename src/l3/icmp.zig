@@ -106,7 +106,7 @@ test "icmp echo reply mirrors request" {
 }
 
 test "icmp echo reply rejects non-requests" {
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     try testing.expectError(error.Truncated, writeEchoReply(&buf, buf[0..7]));
 
     buf[0] = Type.echo_reply;

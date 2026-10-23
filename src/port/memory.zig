@@ -256,7 +256,7 @@ test "memory port enforces mtu and queue limits" {
     var mp = MemoryPort.init(std.testing.allocator, .{ .value = 3 }, "mem2", 4);
     defer mp.deinit();
 
-    const big = [_]u8{0} ** 5;
+    const big: [5]u8 = @splat(0);
     try std.testing.expectError(error.FrameTooLarge, mp.port().write(std.testing.io, &big));
 
     mp.max_tx = 1;

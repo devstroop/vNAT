@@ -91,5 +91,5 @@ test "name validation" {
     try std.testing.expectError(error.InvalidArgument, validateName(""));
     try std.testing.expectError(error.InvalidArgument, validateName("eth0/x"));
     try std.testing.expectError(error.InvalidArgument, validateName("eth 0"));
-    try std.testing.expectError(error.InvalidArgument, validateName("a" ** 16));
+    try std.testing.expectError(error.InvalidArgument, validateName(&@as([16]u8, @splat('a'))));
 }

@@ -121,7 +121,7 @@ test "ethernet parse vlan tag" {
 
 test "ethernet rejects truncated frames" {
     try testing.expectError(error.Truncated, parse(&.{}));
-    try testing.expectError(error.Truncated, parse(&([_]u8{0} ** 13)));
+    try testing.expectError(error.Truncated, parse(&@as([13]u8, @splat(0))));
 
     var tagged: [18]u8 = undefined;
     _ = try write(&tagged, mac_a, mac_b, EtherType.ipv4, 1);

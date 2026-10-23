@@ -688,7 +688,7 @@ fn selfTestL2(io: std.Io, gpa: std.mem.Allocator, names: []const []const u8) !vo
         "ffffffffffff00112233445508004500001c00010000401100000a0000010a000002" ++
         "04d2162e00080000";
     const payload_len = 42;
-    var frame: [60]u8 = [_]u8{0} ** 60;
+    var frame: [60]u8 = @splat(0);
     _ = try std.fmt.hexToBytes(frame[0..payload_len], frame_hex);
 
     try inject.port().write(io, &frame);
