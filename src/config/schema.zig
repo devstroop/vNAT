@@ -80,11 +80,18 @@ pub const DhcpConfig = struct {
     reservations: []const DhcpReservation = &.{},
 };
 
+pub const DnsZone = struct {
+    suffix: []const u8,
+    upstreams: []const []const u8 = &.{},
+};
+
 pub const DnsConfig = struct {
     upstreams: []const []const u8 = &.{},
     cache: bool = true,
     listen: ?[]const u8 = null,
     max_entries: u32 = 1024,
+    tcp: bool = true,
+    zones: []const DnsZone = &.{},
 };
 
 pub const FirewallAction = enum { accept, drop, reject };

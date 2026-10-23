@@ -52,7 +52,8 @@ const dhcp_keys = [_][]const u8{
     "iface", "pool", "lease", "dns", "domain", "mtu", "ntp", "reservations",
 };
 const dhcp_reservation_keys = [_][]const u8{ "mac", "ip" };
-const dns_keys = [_][]const u8{ "upstreams", "cache", "listen", "max_entries" };
+const dns_zone_keys = [_][]const u8{ "suffix", "upstreams" };
+const dns_keys = [_][]const u8{ "upstreams", "cache", "listen", "max_entries", "tcp", "zones" };
 const firewall_keys = [_][]const u8{ "default_in", "default_forward", "default_out" };
 
 fn parseRoot(a: std.mem.Allocator, value: std.json.Value) ConfigError!schema.Config {
@@ -272,6 +273,20 @@ fn parseDhcpReservations(
     return out;
 }
 
+fn parseDnsZones(a: std.mem.Allocator, value: *const std.json.Value) ConfigError![]schema.DnsZone {
+    const arr = try asArray(value);
+    const zones = try a.alloc(schema.DnsZone, arr.items.len);
+    for (arr.items, 0..) |*item, i| {
+        const obj = try asObject(item);
+        try onlyKeys(obj, &dns_zone_keys);
+        zones[i] = .{
+            .suffix = try reqString(obj, "suffix"),
+            .upstreams = if (field(obj, "upstreams")) |v| try parseStringArray(a, v) else &.{},
+        };
+    }
+    return zones;
+}
+
 fn parseDns(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!schema.DnsConfig {
     const obj = try asObject(value);
     try onlyKeys(obj, &dns_keys);
@@ -280,6 +295,8 @@ fn parseDns(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!sche
         .cache = try optBool(obj, "cache", true),
         .listen = try optString(obj, "listen"),
         .max_entries = try optInt(u32, obj, "max_entries", 1024),
+        .tcp = try optBool(obj, "tcp", true),
+        .zones = if (field(obj, "zones")) |v| try parseDnsZones(a, v) else &.{},
     };
 }
 

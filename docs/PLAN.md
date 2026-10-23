@@ -106,18 +106,19 @@ forward works; conntrack survives 1 h churn.
 - [x] DHCPv4 server: pool, MAC reservations, options, DECLINE, lease DB
       persistence and restore.
 - [ ] DHCP conflict probe (ARP before OFFER).
-- [ ] DHCP client on uplink (optional but useful).
-- [x] DNS forwarder: UDP, TTL cache, negative cache, upstream pool.
-- [ ] DNS TCP listener/upstream fallback, split zones, local status zone.
+- [x] DHCP client on uplink (initial lease acquisition, connected route and
+      masquerade installation).
+- [x] DNS forwarder: UDP/TCP, TTL cache, negative cache, upstream pool.
+- [x] DNS TCP listener/upstream fallback, split zones, local status zone.
 - [ ] `vnat dhcp …`, `vnat dns query/stats`.
 - [x] netns tests: `scripts/test_dhcp.sh` (lease, ping, persistence) and
       `scripts/test_dns.sh` (query + cache hit).
 
 **Status: IN PROGRESS.** The DHCP server is integrated into the forwarding
 path (no kernel socket) and persists leases when `lease_db` is configured.
-DNS is a UDP forwarder bound to `dns.listen`; it does not yet serve TCP or a
-local status zone. `vnatd` does not apply interface addresses, so DNS requires
-the listen address to exist (use `vnat iface set` first).
+DNS now also serves TCP, split zones and a local `vnat.` / `router.vnat.`
+status zone. `vnatd` does not apply interface addresses, so DNS requires the
+listen address to exist (use `vnat iface set` first).
 
 **Exit:** `vnat` is a usable travel/home router on Linux: uplink DHCP, LAN
 DHCP + DNS + NAT.

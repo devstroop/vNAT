@@ -62,8 +62,9 @@ All notable changes to vNAT are documented here. The format follows
   router and verifies persistence across a daemon restart.
 - `scripts/test_dns.sh`: query through `vnatd`, answer from the fake upstream,
   then a cache hit; both tests run in CI.
-- Not yet: DHCP ARP conflict probe, DHCP client on the uplink, DNS over TCP,
-  split zones, local status zone, and DHCP/DNS CLI verbs.
+- Not yet: DHCP ARP conflict probe, DNS DoH/DoT, and DHCP/DNS CLI verbs.
+- Added: initial DHCP client on the uplink, DNS over TCP, split zones and a
+  local `vnat.` / `router.vnat.` status zone.
 
 ### R3 — NAT and conntrack
 

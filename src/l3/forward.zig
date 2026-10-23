@@ -70,7 +70,32 @@ pub const Counters = struct {
     dhcp_acks: u64 = 0,
     dhcp_naks: u64 = 0,
     dhcp_dropped: u64 = 0,
+    dhcp_client_bound: u64 = 0,
     nat_unsupported: u64 = 0,
+};
+
+pub const DhcpClientState = enum {
+    init,
+    selecting,
+    requesting,
+    bound,
+    failed,
+};
+
+pub const DhcpClient = struct {
+    port: types.PortId,
+    mac: types.Mac,
+    state: DhcpClientState = .init,
+    xid: u32 = 0x76543210,
+    server_ip: ?types.Ipv4 = null,
+    offered_ip: ?types.Ipv4 = null,
+    subnet_mask: ?types.Ipv4 = null,
+    router: ?types.Ipv4 = null,
+    lease_seconds: u32 = 0,
+    last_sent_ms: i64 = 0,
+    attempts: u8 = 0,
+    configured: bool = false,
+    want_masquerade: bool = true,
 };
 
 pub const Forwarder = struct {
@@ -85,6 +110,7 @@ pub const Forwarder = struct {
     snat_rules: std.ArrayListUnmanaged(nat_mod.Rule) = .empty,
     forward_rules: std.ArrayListUnmanaged(nat_mod.ForwardRule) = .empty,
     dhcp_servers: std.ArrayListUnmanaged(dhcp_server.Server) = .empty,
+    dhcp_clients: std.ArrayListUnmanaged(DhcpClient) = .empty,
     counters: Counters = .{},
 
     pub fn init(gpa: std.mem.Allocator, ports: []const PortEntry) PortError!Forwarder {
@@ -116,6 +142,7 @@ pub const Forwarder = struct {
         self.forward_rules.deinit(self.gpa);
         for (self.dhcp_servers.items) |*server| server.deinit();
         self.dhcp_servers.deinit(self.gpa);
+        self.dhcp_clients.deinit(self.gpa);
         self.conntrack.deinit();
     }
 
@@ -158,12 +185,34 @@ pub const Forwarder = struct {
         try self.dhcp_servers.append(self.gpa, server);
     }
 
+    pub fn addDhcpClient(self: *Forwarder, port: types.PortId, mac: types.Mac) PortError!void {
+        try self.dhcp_clients.append(self.gpa, .{
+            .port = port,
+            .mac = mac,
+        });
+    }
+
+    pub fn hasDhcpClient(self: *const Forwarder, port: types.PortId) bool {
+        for (self.dhcp_clients.items) |client| {
+            if (client.port.eql(port)) return true;
+        }
+        return false;
+    }
+
+    fn portMac(self: *const Forwarder, port: types.PortId) types.Mac {
+        for (self.ports) |entry| {
+            if (entry.id.eql(port)) return entry.port.info().mac;
+        }
+        return .{};
+    }
+
     pub fn tick(self: *Forwarder, io: std.Io) void {
         const now = nowMs(io);
         if (now - self.conntrack.last_gc_ms >= conntrack_mod.gc_interval_ms) {
             self.conntrack.gc(now);
         }
         for (self.dhcp_servers.items) |*server| server.gc(now);
+        self.tickDhcpClients(io, now);
     }
 
     pub fn fromConfig(
@@ -180,7 +229,10 @@ pub const Forwarder = struct {
             const port_name = itf.port orelse continue;
             const port_entry = findPort(ports, port_name) orelse return error.NotFound;
             const address = itf.address orelse continue;
-            if (std.mem.eql(u8, address, "dhcp")) continue;
+            if (std.mem.eql(u8, address, "dhcp")) {
+                try self.addDhcpClient(port_entry.id, port_entry.port.info().mac);
+                continue;
+            }
 
             const prefix = types.Prefix4.parse(address) catch return error.InvalidArgument;
             try self.addLocal(prefix, port_entry.id);
@@ -209,8 +261,21 @@ pub const Forwarder = struct {
         }
 
         for (cfg.nat.masquerade) |masquerade| {
-            const rule = resolveMasquerade(cfg, self.local.items, ports, masquerade.out) orelse
+            const rule = resolveMasquerade(cfg, self.local.items, ports, masquerade.out) orelse {
+                // Defer SNAT rule installation until a DHCP client on this port
+                // obtains a lease.
+                const out_name = masquerade.out;
+                if (cfg.interfaces.get(out_name)) |itf| {
+                    if (itf.address != null and std.mem.eql(u8, itf.address.?, "dhcp")) {
+                        continue;
+                    }
+                }
+                // Also allow port-name references that already have a client.
+                if (findPort(ports, masquerade.out)) |port_entry| {
+                    if (self.hasDhcpClient(port_entry.id)) continue;
+                }
                 return error.InvalidArgument;
+            };
             try self.addSnatRule(rule.port, rule.addr);
         }
 
@@ -397,6 +462,217 @@ pub const Forwarder = struct {
         }
     }
 
+    fn tickDhcpClients(self: *Forwarder, io: std.Io, now: i64) void {
+        for (self.dhcp_clients.items) |*client| {
+            switch (client.state) {
+                .init => {
+                    client.state = .selecting;
+                    client.last_sent_ms = 0;
+                    client.attempts = 0;
+                },
+                .selecting => {
+                    if (client.attempts >= 10) {
+                        client.state = .failed;
+                        continue;
+                    }
+                    const delay: i64 = if (client.attempts == 0) 0 else @min(@as(i64, 1000) << @intCast(@min(client.attempts, 6)), 8000);
+                    if (now - client.last_sent_ms >= delay) {
+                        self.sendDhcpClientMessage(io, client, .discover, null) catch {};
+                        client.attempts += 1;
+                        client.last_sent_ms = now;
+                    }
+                },
+                .requesting => {
+                    if (client.attempts >= 10) {
+                        client.state = .selecting;
+                        client.attempts = 0;
+                        client.last_sent_ms = 0;
+                        continue;
+                    }
+                    const delay: i64 = if (client.attempts == 0) 0 else @min(@as(i64, 1000) << @intCast(@min(client.attempts, 6)), 8000);
+                    if (now - client.last_sent_ms >= delay) {
+                        self.sendDhcpClientMessage(io, client, .request, client.offered_ip) catch {};
+                        client.attempts += 1;
+                        client.last_sent_ms = now;
+                    }
+                },
+                .bound, .failed => {},
+            }
+        }
+    }
+
+    fn handleDhcpClient(
+        self: *Forwarder,
+        io: std.Io,
+        ip: ipv4.Header,
+        ingress: types.PortId,
+        now: i64,
+    ) PortError!bool {
+        _ = io;
+        _ = now;
+        if (ip.protocol != ipv4.Protocol.udp) return false;
+        if (ip.payload.len < 8) return false;
+        const udp_len = readU16(ip.payload, 4);
+        if (udp_len < 8 or udp_len > ip.payload.len) return false;
+        if (readU16(ip.payload, 0) != 67 or readU16(ip.payload, 2) != 68) return false;
+
+        const msg = dhcp_message.Message.parse(ip.payload[8..udp_len]) catch return false;
+        const mac = msg.clientMac() orelse return false;
+        var client_ptr: ?*DhcpClient = null;
+        for (self.dhcp_clients.items) |*client| {
+            if (client.port.eql(ingress) and client.mac.eql(mac)) {
+                client_ptr = client;
+                break;
+            }
+        }
+        const client = client_ptr orelse return false;
+
+        const typ = msg.messageType() orelse return true;
+        switch (typ) {
+            .offer => {
+                if (client.state != .selecting) return true;
+                client.server_ip = msg.options.serverId() orelse ip.src;
+                client.offered_ip = msg.yiaddr;
+                client.subnet_mask = ipv4Option(msg.options.get(1));
+                client.router = ipv4Option(msg.options.get(3));
+                const lease = msg.options.get(51);
+                if (lease != null and lease.?.len == 4) {
+                    client.lease_seconds = std.mem.readInt(u32, lease.?[0..4], .big);
+                } else {
+                    client.lease_seconds = 3600;
+                }
+                client.state = .requesting;
+                client.attempts = 0;
+                client.last_sent_ms = 0;
+            },
+            .ack => {
+                if (client.state != .requesting) return true;
+                if (msg.yiaddr.isUnspecified()) return true;
+                client.offered_ip = msg.yiaddr;
+                client.subnet_mask = ipv4Option(msg.options.get(1)) orelse client.subnet_mask;
+                client.router = ipv4Option(msg.options.get(3)) orelse client.router;
+                const lease = msg.options.get(51);
+                if (lease != null and lease.?.len == 4) {
+                    client.lease_seconds = std.mem.readInt(u32, lease.?[0..4], .big);
+                }
+                if (client.lease_seconds == 0) client.lease_seconds = 3600;
+                self.applyDhcpClient(client);
+                client.state = .bound;
+                client.attempts = 0;
+            },
+            .nak => {
+                client.state = .selecting;
+                client.attempts = 0;
+                client.last_sent_ms = 0;
+                client.offered_ip = null;
+                client.server_ip = null;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn applyDhcpClient(self: *Forwarder, client: *DhcpClient) void {
+        const ip = client.offered_ip orelse return;
+        const mask = client.subnet_mask orelse types.Ipv4{ .value = 0xffffff00 };
+        const prefix_len = maskToPrefix(mask);
+        const prefix = types.Prefix4{ .addr = ip, .len = prefix_len };
+        if (!client.configured) {
+            self.addLocal(prefix, client.port) catch {};
+            self.addRoute(.{
+                .prefix = .{ .addr = prefix.network(), .len = prefix.len },
+                .port = client.port,
+                .kind = .connected,
+            }) catch {};
+            if (client.router) |router| {
+                self.addRoute(.{
+                    .prefix = .{ .addr = .{}, .len = 0 },
+                    .next_hop = router,
+                    .port = client.port,
+                    .kind = .static,
+                }) catch {};
+            }
+            if (client.want_masquerade) {
+                self.addSnatRule(client.port, ip) catch {};
+            }
+            client.configured = true;
+            self.counters.dhcp_client_bound += 1;
+        }
+        client.lease_seconds = if (client.lease_seconds == 0) 3600 else client.lease_seconds;
+    }
+
+    fn sendDhcpClientMessage(
+        self: *Forwarder,
+        io: std.Io,
+        client: *DhcpClient,
+        typ: dhcp_message.MessageType,
+        requested: ?types.Ipv4,
+    ) PortError!void {
+        var msg_buf: [512]u8 = undefined;
+        var builder = dhcp_message.Builder.init(&msg_buf, dhcp_message.op_request, typ, client.xid, client.mac, 0x8000) catch
+            return error.FrameTooLarge;
+        builder.addOption(55, &.{ 1, 3, 6, 51, 54 }) catch return error.FrameTooLarge;
+        if (requested) |ip| (builder.addIpv4(50, ip) catch return error.FrameTooLarge);
+        if (client.server_ip) |server| {
+            if (typ == .request) (builder.addIpv4(54, server) catch return error.FrameTooLarge);
+        }
+        const payload = builder.finish() catch return error.FrameTooLarge;
+
+        var udp: [576]u8 = undefined;
+        const udp_len = 8 + payload.len;
+        if (udp_len > udp.len) return error.FrameTooLarge;
+        writeU16(&udp, 0, 68);
+        writeU16(&udp, 2, 67);
+        writeU16(&udp, 4, @intCast(udp_len));
+        writeU16(&udp, 6, 0);
+        @memcpy(udp[8..udp_len], payload);
+
+        var ip_buf: [576]u8 = undefined;
+        const src_ip = types.Ipv4{ .value = 0 };
+        const dst_ip = types.Ipv4.limited_broadcast;
+        const ip_len = ipv4.write(
+            &ip_buf,
+            src_ip,
+            dst_ip,
+            ipv4.Protocol.udp,
+            64,
+            0,
+            udp[0..udp_len],
+        ) catch return error.FrameTooLarge;
+
+        const parsed = ipv4.parse(ip_buf[0..ip_len]) catch return error.InvalidArgument;
+        const udp_mut = ip_buf[parsed.header_len..ip_len];
+        var sum = transportChecksum(parsed.src, parsed.dst, ipv4.Protocol.udp, udp_mut);
+        if (sum == 0) sum = 0xffff;
+        writeU16(udp_mut, 6, sum);
+        writeU16(&ip_buf, 10, 0);
+        writeU16(&ip_buf, 10, ipv4.checksum(ip_buf[0..parsed.header_len]));
+
+        const dst_mac = if (dst_ip.eql(types.Ipv4.limited_broadcast))
+            types.Mac.broadcast
+        else blk: {
+            // fall back to broadcast if no ARP entry
+            break :blk types.Mac.broadcast;
+        };
+        try self.sendL2(io, client.port, dst_mac, ethernet.EtherType.ipv4, ip_buf[0..ip_len]);
+    }
+
+    fn maskToPrefix(mask: types.Ipv4) u8 {
+        var count: u8 = 0;
+        var value = mask.value;
+        while (value & 0x80000000 != 0) {
+            count += 1;
+            value <<= 1;
+        }
+        return count;
+    }
+
+    fn ipv4Option(data: ?[]const u8) ?types.Ipv4 {
+        const bytes = data orelse return null;
+        if (bytes.len != 4) return null;
+        return .{ .value = std.mem.readInt(u32, bytes[0..4], .big) };
+    }
+
     fn handleIpv4(
         self: *Forwarder,
         io: std.Io,
@@ -406,6 +682,7 @@ pub const Forwarder = struct {
     ) PortError!void {
         const total: usize = ip.total_len;
         const now = nowMs(io);
+        if (try self.handleDhcpClient(io, ip, ingress, now)) return;
         if (try self.handleDhcp(io, ip, ingress, now)) return;
         if (try self.translateIcmpError(io, ip, ingress, now)) return;
         const is_local = self.isLocal(ip.dst);

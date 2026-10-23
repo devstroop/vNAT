@@ -324,7 +324,7 @@ Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
 - The server is userspace-only: `vnatd` intercepts UDP/67 on configured ports
   and sends replies through the L2 egress path.
 - Not yet implemented: ARP conflict probe before OFFER, client-id lease
-  identity, DHCP relay, DHCP client on the uplink.
+  identity, DHCP relay. Initial DHCP client on the uplink is implemented.
 
 ## 8. DNS
 
@@ -342,8 +342,9 @@ Ordered, first-match. Match fields: `iif`, `oif`, `src`, `dst`, `proto`,
 - The listener is a kernel UDP socket bound to `dns.listen`; `vnatd` does not
   assign interface addresses itself, so the address must already exist
   (`vnat iface set <dev> <cidr>` or the host network manager).
-- Not yet implemented: client TCP listener, upstream TCP fallback, split
-  zones, local `vnat.`/`router.vnat.` status zone, DoH/DoT.
+- Implemented: client TCP listener, upstream TCP fallback, split zones and
+  local `vnat.`/`router.vnat.` status zone.
+- Not yet implemented: DoH/DoT.
 
 ## 9. Control plane
 

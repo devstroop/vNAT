@@ -220,6 +220,13 @@ fn validateDns(cfg: *const schema.Config) ConfigError!void {
     if (cfg.dns.max_entries == 0 or cfg.dns.max_entries > 1_000_000) {
         return error.InvalidValue;
     }
+    for (cfg.dns.zones) |zone| {
+        if (zone.suffix.len == 0 or zone.suffix.len > 255) return error.InvalidValue;
+        if (zone.upstreams.len == 0) return error.InvalidValue;
+        for (zone.upstreams) |upstream| {
+            _ = types.Ipv4.parse(upstream) catch return error.InvalidValue;
+        }
+    }
     if (cfg.lease_db) |path| {
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) {
             return error.InvalidValue;

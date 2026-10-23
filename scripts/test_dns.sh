@@ -159,14 +159,47 @@ for xid in (0x1111, 0x2222):
 print("ok: dns answer 93.184.216.34")
 PY
 
+echo "==> tcp"
+nsenter -t "$client_pid" -n python3 -u - <<'PY' || die "dns tcp query failed"
+import socket, struct
+
+def build(xid, name):
+    q = struct.pack("!HHHHHH", xid, 0x0100, 1, 0, 0, 0)
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    q += b"\x00" + struct.pack("!HH", 1, 1)
+    return q
+
+xid = 0x3333
+payload = build(xid, "tcp.example.com")
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(("10.30.0.1", 53))
+s.sendall(struct.pack("!H", len(payload)) + payload)
+length = s.recv(2)
+assert len(length) == 2
+n = struct.unpack("!H", length)[0]
+data = b""
+while len(data) < n:
+    chunk = s.recv(n - len(data))
+    assert chunk
+    data += chunk
+s.close()
+rid, flags, qd, an, _, _ = struct.unpack("!HHHHHH", data[:12])
+assert rid == xid, (rid, xid)
+assert flags & 0x8000 and flags & 0xf == 0, hex(flags)
+assert qd == 1 and an >= 1, (qd, an)
+print("ok: dns tcp answer")
+PY
+
 echo "==> cache"
 count=$(wc -l <"$UPSTREAM_LOG")
-[ "$count" -eq 1 ] || die "expected one upstream query, saw $count"
+[ "$count" -eq 2 ] || die "expected two upstream queries, saw $count"
 echo "ok: second query served from cache"
 
 kill -TERM "$vnatd_pid"
 wait "$vnatd_pid" 2>/dev/null || true
-grep -q "dns stopping queries=2 responses=2 hits=1" "$LOG" || {
+grep -q "dns stopping queries=3 responses=3 hits=1" "$LOG" || {
     cat "$LOG" >&2
     die "dns counters mismatch"
 }

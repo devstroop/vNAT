@@ -95,10 +95,11 @@ QoS shaping, macOS/Windows.
 R2 is complete for the IPv4 path (L2 and TUN), including journaled
 `vnat iface`/`vnat route` mutations and `vnat down` rollback. R3 is complete
 for conntrack, SNAT/masquerade, DNAT/port forwarding with hairpin NAT, and
-ICMP-error translation. R4 is in progress: the userspace DHCPv4 server
-(reservations, options, DECLINE, optional lease DB) and a UDP DNS forwarder
-with a TTL cache are integrated into `vnatd`; uplink DHCP, DNS TCP/split
-zones and the DHCP/DNS CLI verbs are still open.
+ICMP-error translation. R4 is in progress: the userspace DHCPv4 server (reservations, options,
+DECLINE, optional lease DB) and an initial DHCP client on the uplink are
+integrated into `vnatd`; the DNS forwarder supports UDP/TCP, split zones and
+a local status zone. DHCP/DNS CLI verbs and the DHCP conflict probe remain
+open.
 `scripts/test_route.sh`, `test_tun.sh`, `test_journal.sh`, `nat_matrix.sh`,
 `test_dhcp.sh` and `test_dns.sh` cover forwarding, TUN, rollback, NAT,
 DHCP and DNS. See [docs/PLAN.md](docs/PLAN.md).

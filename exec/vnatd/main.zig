@@ -91,13 +91,32 @@ fn run(init: std.process.Init) !void {
 
     var upstreams: ?[]vnat.types.Ipv4 = null;
     defer if (upstreams) |items| gpa.free(items);
+    var dns_zones: ?[]vnat.dns_service.Zone = null;
+    defer if (dns_zones) |zones| {
+        for (zones) |zone| gpa.free(zone.upstreams);
+        gpa.free(zones);
+    };
     var dns_service: ?vnat.dns_service.Service = null;
     defer if (dns_service) |*service| service.deinit();
-    if (parsed.config.dns.upstreams.len != 0) {
+    if (parsed.config.dns.upstreams.len != 0 or parsed.config.dns.zones.len != 0) {
         const items = try gpa.alloc(vnat.types.Ipv4, parsed.config.dns.upstreams.len);
         upstreams = items;
         for (parsed.config.dns.upstreams, 0..) |text, upstream_index| {
             items[upstream_index] = vnat.types.Ipv4.parse(text) catch return error.InvalidArgument;
+        }
+        if (parsed.config.dns.zones.len != 0) {
+            const zones = try gpa.alloc(vnat.dns_service.Zone, parsed.config.dns.zones.len);
+            dns_zones = zones;
+            for (parsed.config.dns.zones, 0..) |zone_cfg, zone_index| {
+                const zone_upstreams = try gpa.alloc(vnat.types.Ipv4, zone_cfg.upstreams.len);
+                for (zone_cfg.upstreams, 0..) |text, upstream_index| {
+                    zone_upstreams[upstream_index] = vnat.types.Ipv4.parse(text) catch return error.InvalidArgument;
+                }
+                zones[zone_index] = .{
+                    .suffix = zone_cfg.suffix,
+                    .upstreams = zone_upstreams,
+                };
+            }
         }
         const listen = vnat.types.Ipv4.parse(parsed.config.dns.listen orelse
             return error.InvalidArgument) catch return error.InvalidArgument;
@@ -106,6 +125,8 @@ fn run(init: std.process.Init) !void {
             .upstreams = items,
             .cache = parsed.config.dns.cache,
             .cache_max_entries = parsed.config.dns.max_entries,
+            .tcp = parsed.config.dns.tcp,
+            .zones = if (dns_zones) |zones| zones else &.{},
         }) catch |err| {
             logger.err(
                 "dns listen={f}: {s}; assign the address first with `vnat iface set <dev> <cidr>`",
@@ -200,7 +221,7 @@ fn run(init: std.process.Init) !void {
     }
 
     logger.info(
-        "stopping instance={s} forwarded={d} dropped={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d}",
+        "stopping instance={s} forwarded={d} dropped={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d}",
         .{
             parsed.config.instance,
             forwarder.counters.forwarded,
@@ -215,6 +236,7 @@ fn run(init: std.process.Init) !void {
             forwarder.counters.dhcp_offers,
             forwarder.counters.dhcp_acks,
             forwarder.counters.dhcp_requests,
+            forwarder.counters.dhcp_client_bound,
         },
     );
 }
