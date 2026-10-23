@@ -423,6 +423,14 @@ Rules for config:
   `vnat iface`/`vnat route` verbs).
 - Live-reload only for fields marked hot; otherwise restart required.
 
+### 9.1.1 Config field status
+
+- **validated**: parsed and semantically checked.
+- **consumed**: used by the running daemon.
+- **reserved**: accepted for forward compatibility but not yet consumed.
+
+Current reserved fields include future bridge, firewall, and VLAN keys.
+
 ### 9.2 CLI
 
 Implemented in R2:
