@@ -26,6 +26,7 @@ command -v "$ZIG" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
+export VNAT_RUN_DIR="$WORK/run"
 BIN="$ROOT/zig-out/bin"
 CFG="$WORK/vnat-nat.json"
 LOG="$WORK/vnatd.log"

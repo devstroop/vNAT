@@ -25,6 +25,7 @@ command -v "$ZIG" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
+export VNAT_RUN_DIR="$WORK/run"
 BIN="$ROOT/zig-out/bin"
 CFG="$WORK/vnat-firewall.json"
 LOG="$WORK/vnatd.log"
@@ -83,6 +84,19 @@ cat > "$CFG" <<'JSON'
   }
 }
 JSON
+
+log "offline rule evaluation"
+out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8080 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+echo "$out" | grep -q "rule 3: accept" || die "expected rule 3 accept, got: $out"
+out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8082 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+echo "$out" | grep -q "default: drop" || die "expected default drop, got: $out"
+out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8081 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+echo "$out" | grep -q "rule 4: reject" || die "expected rule 4 reject, got: $out"
+ok "ordered match, default and reject"
+
+out="$("$BIN/vnat" firewall list -c "$CFG")" || die "firewall list failed"
+echo "$out" | grep -q "rate-limit: icmp=100/s arp=512/s dhcp=100/s" ||
+    die "firewall list missing rate limits, got: $out"
 
 log "topology"
 ip link set lo up
@@ -232,6 +246,20 @@ grep -q "fw-drop=" "$LOG" || {
     cat "$LOG"
     die "missing firewall counters"
 }
+
+log "runtime counters"
+counter_out="$("$BIN/vnat" firewall counters -c "$CFG")" || {
+    cat "$LOG"
+    die "firewall counters failed"
+}
+echo "$counter_out"
+echo "$counter_out" | grep -Eq '^rule 3: [1-9][0-9]* packets$' ||
+    die "rule 3 counters not exported: $counter_out"
+echo "$counter_out" | grep -Eq '^rule 4: [1-9][0-9]* packets$' ||
+    die "rule 4 counters not exported: $counter_out"
+echo "$counter_out" | grep -Eq '^policy: dropped=[1-9]' ||
+    die "firewall drop counters not exported: $counter_out"
+ok "runtime firewall counters exported"
 
 echo "--- vnatd ---"
 cat "$LOG"

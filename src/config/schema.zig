@@ -26,6 +26,9 @@ pub const PortConfig = struct {
     pvid: ?u16 = null,
     /// VLANs accepted and emitted with an 802.1Q tag on this port.
     tagged: []const u16 = &.{},
+    /// Flooded frames (broadcast, multicast, unknown unicast) accepted from
+    /// this port per second; zero disables storm control.
+    storm_control: u32 = 1000,
 };
 
 pub const BridgeOffload = enum { none, kernel };
@@ -118,11 +121,21 @@ pub const FirewallRuleConfig = struct {
     ct_state: []const FirewallCtState = &.{},
 };
 
+pub const FirewallRateLimitConfig = struct {
+    /// Generated ICMP errors per second; zero disables the limit.
+    icmp: u32 = 100,
+    /// ARP frames accepted per second.
+    arp: u32 = 512,
+    /// DHCP server requests per second.
+    dhcp: u32 = 100,
+};
+
 pub const FirewallConfig = struct {
     default_in: FirewallAction = .drop,
     default_forward: FirewallAction = .drop,
     default_out: FirewallAction = .accept,
     rp_filter: bool = false,
+    rate_limit: FirewallRateLimitConfig = .{},
     rules: []const FirewallRuleConfig = &.{},
 };
 

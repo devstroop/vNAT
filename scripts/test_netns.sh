@@ -42,13 +42,15 @@ v3="vn3${suffix: -4}"
 cfg="/tmp/vnat-netns-${suffix}.json"
 status_log="/tmp/vnat-status-${suffix}.log"
 daemon_log="/tmp/vnatd-${suffix}.log"
+VNAT_RUN_DIR="${TMPDIR:-/tmp}/vnat-netns-run-${suffix}"
+export VNAT_RUN_DIR
 
 cleanup() {
   ip link del "$v0" 2>/dev/null || true
   ip link del "$v2" 2>/dev/null || true
   ip link del vnat-tun0 2>/dev/null || true
   ip link del vnat-tap0 2>/dev/null || true
-  rm -f "$cfg" "$status_log" "$daemon_log"
+  rm -rf "$cfg" "$status_log" "$daemon_log" "$VNAT_RUN_DIR"
 }
 trap cleanup EXIT
 

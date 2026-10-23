@@ -20,6 +20,7 @@ pub const memory_port = @import("port/memory.zig");
 pub const buffer_pool = @import("port/pool.zig");
 
 pub const journal = @import("control/journal.zig");
+pub const firewall_counters = @import("control/firewall_counters.zig");
 pub const control_host = if (builtin.os.tag == .linux)
     @import("control/host.zig")
 else
@@ -29,6 +30,7 @@ pub const ethernet = @import("l2/ethernet.zig");
 pub const ipv4 = @import("l3/ipv4.zig");
 pub const arp = @import("l3/arp.zig");
 pub const fib = @import("l3/fib.zig");
+pub const rate = @import("l3/rate.zig");
 pub const conntrack = @import("nat/conntrack.zig");
 pub const nat = @import("nat/nat.zig");
 pub const icmp = @import("l3/icmp.zig");
@@ -67,11 +69,13 @@ test {
     _ = @import("port/memory.zig");
     _ = @import("port/pool.zig");
     _ = @import("control/journal.zig");
+    _ = @import("control/firewall_counters.zig");
     if (builtin.os.tag == .linux) _ = @import("control/host.zig");
     _ = @import("l2/ethernet.zig");
     _ = @import("l3/ipv4.zig");
     _ = @import("l3/arp.zig");
     _ = @import("l3/fib.zig");
+    _ = @import("l3/rate.zig");
     _ = @import("nat/conntrack.zig");
     _ = @import("nat/nat.zig");
     _ = @import("l3/icmp.zig");

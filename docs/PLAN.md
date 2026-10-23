@@ -128,15 +128,20 @@ DHCP + DNS + NAT.
 
 - [x] FDB learning/aging/flooding; per-VLAN keys.
 - [x] 802.1Q: PVID, trunk, access ports, VLAN filtering.
-- [ ] Broadcast/multicast handling; storm control; loop protection.
+- [x] Broadcast/multicast handling.
+- [x] Reassemble 802.1Q tags stripped by `PACKET_AUXDATA` VLAN offload.
+- [x] Netns test with veth pairs and tagged traffic.
+- [x] Storm control and loop protection (per-port flooded-frame limit).
 - [ ] Optional STP 802.1D (port SoftEther `bridge/stp.zig`).
 - [ ] Optional Linux kernel-bridge offload backend.
-- [ ] `vnat bridge …`; netns test with veth pairs and tagged traffic.
+- [x] `vnat bridge list` inspection CLI (membership, PVID/tagged, SVI).
 
-**Status: IN PROGRESS.** Userspace FDB learning/aging/flooding, broadcast
-handling, per-VLAN FDB keys, PVID/tagged/access semantics and VLAN filtering
-are implemented. STP, kernel offload, storm control and a netns VLAN test
-remain.
+**Status: IN PROGRESS.** Userspace FDB learning/aging/flooding, broadcast and
+multicast handling, per-VLAN FDB keys, PVID/tagged/access semantics, VLAN
+filtering and offload tag recovery are implemented and covered by a veth
+access/trunk netns test; `vnat bridge list` renders membership and SVIs.
+Per-port storm control (broadcast/multicast/unknown-unicast) is enforced in the
+bridge datapath. STP and kernel offload remain.
 
 **Exit:** Two L2 segments bridged in userspace; tagged/untagged traffic passes;
 kernel offload produces the same result.
@@ -146,17 +151,18 @@ kernel offload produces the same result.
 - [x] Rule parser/compiler: match fields, actions, conntrack states.
 - [x] Default-deny inbound/forward; established/related shortcut.
 - [x] Anti-spoofing (uRPF-lite, `firewall.rp_filter`).
-- [ ] ICMP/ARP/DHCP rate limits.
-- [ ] `vnat firewall test`; per-rule counters exposed at runtime.
+- [x] ICMP/ARP/DHCP rate limits.
+- [x] `vnat firewall test`; per-rule counters exported at runtime.
 - [x] Tests: ordering, shadowing, state transitions.
 
-**Status: IN PROGRESS.** Ordered first-match rules support `proto`, `src`,
+**Status: COMPLETE.** Ordered first-match rules support `proto`, `src`,
 `dst`, `sport`, `dport`, `iif`/`oif` (port, interface or bridge), actions
 `accept`/`drop`/`reject` and `ct_state`; established traffic from conntrack is
 accepted when no rule matches. `vnat firewall list` renders the compiled order;
-per-rule packet counters exist in the datapath but are not yet exported.
-Strict uRPF-lite is enforced when `firewall.rp_filter` is enabled; control-plane
-rate limits remain.
+`vnat firewall test` evaluates a synthetic packet; `vnat firewall counters`
+reads the periodic counter snapshot written by `vnatd`. Strict uRPF-lite is
+enforced when `firewall.rp_filter` is enabled and ICMP/ARP/DHCP rate limits
+are configurable.
 
 **Exit:** A default-deny router with explicit allows; no regressions in R2–R5
 suites.

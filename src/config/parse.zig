@@ -42,7 +42,7 @@ const config_keys = [_][]const u8{
     "routes",  "nat",      "dhcp", "dns",   "firewall", "lease_db",
 };
 const log_keys = [_][]const u8{ "level", "format" };
-const port_keys = [_][]const u8{ "kind", "device", "create", "mtu", "pvid", "tagged" };
+const port_keys = [_][]const u8{ "kind", "device", "create", "mtu", "pvid", "tagged", "storm_control" };
 const bridge_keys = [_][]const u8{ "ports", "stp", "vlan_aware", "offload" };
 const interface_keys = [_][]const u8{ "bridge", "port", "address", "vlan" };
 const route_keys = [_][]const u8{ "dst", "via", "dev", "metric", "table" };
@@ -56,8 +56,9 @@ const dhcp_reservation_keys = [_][]const u8{ "mac", "ip" };
 const dns_zone_keys = [_][]const u8{ "suffix", "upstreams" };
 const dns_keys = [_][]const u8{ "upstreams", "cache", "listen", "max_entries", "tcp", "zones" };
 const firewall_keys = [_][]const u8{
-    "default_in", "default_forward", "default_out", "rp_filter", "rules",
+    "default_in", "default_forward", "default_out", "rp_filter", "rate_limit", "rules",
 };
+const firewall_rate_keys = [_][]const u8{ "icmp", "arp", "dhcp" };
 const firewall_rule_keys = [_][]const u8{
     "action", "proto", "src", "dst", "sport", "dport", "iif", "oif", "ct_state",
 };
@@ -136,6 +137,7 @@ fn parsePort(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!sch
         .mtu = mtu,
         .pvid = if (field(obj, "pvid")) |v| try asInt(u16, v) else null,
         .tagged = if (field(obj, "tagged")) |v| try parseIntArray(a, v) else &.{},
+        .storm_control = try optInt(u32, obj, "storm_control", 1000),
     };
 }
 
@@ -318,6 +320,10 @@ fn parseFirewall(a: std.mem.Allocator, value: *const std.json.Value) ConfigError
         .default_forward = try optEnum(schema.FirewallAction, obj, "default_forward", .drop),
         .default_out = try optEnum(schema.FirewallAction, obj, "default_out", .accept),
         .rp_filter = try optBool(obj, "rp_filter", false),
+        .rate_limit = if (field(obj, "rate_limit")) |rate_value|
+            try parseFirewallRate(rate_value)
+        else
+            .{},
     };
     if (field(obj, "rules")) |rules_value| {
         const arr = try asArray(rules_value);
@@ -326,6 +332,17 @@ fn parseFirewall(a: std.mem.Allocator, value: *const std.json.Value) ConfigError
         firewall.rules = rules;
     }
     return firewall;
+}
+
+fn parseFirewallRate(value: *const std.json.Value) ConfigError!schema.FirewallRateLimitConfig {
+    const obj = try asObject(value);
+    try onlyKeys(obj, &firewall_rate_keys);
+    const default = schema.FirewallRateLimitConfig{};
+    return .{
+        .icmp = try optInt(u32, obj, "icmp", default.icmp),
+        .arp = try optInt(u32, obj, "arp", default.arp),
+        .dhcp = try optInt(u32, obj, "dhcp", default.dhcp),
+    };
 }
 
 fn parseFirewallRule(a: std.mem.Allocator, value: *const std.json.Value) ConfigError!schema.FirewallRuleConfig {
@@ -497,7 +514,7 @@ const example =
     \\  "log": { "level": "debug", "format": "text" },
     \\  "ports": {
     \\    "wan": { "kind": "l2", "device": "eth0" },
-    \\    "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 }
+    \\    "lan": { "kind": "l2", "device": "eth1", "mtu": 1500, "storm_control": 250 }
     \\  },
     \\  "bridges": {
     \\    "lan-br": { "ports": ["lan"], "stp": false }
@@ -520,6 +537,7 @@ const example =
     \\  "firewall": {
     \\    "default_in": "drop", "default_forward": "drop", "default_out": "accept",
     \\    "rp_filter": true,
+    \\    "rate_limit": { "icmp": 50, "arp": 256, "dhcp": 25 },
     \\    "rules": [
     \\      { "action": "accept", "proto": "tcp", "src": "10.10.0.0/24",
     \\        "dst": "0.0.0.0/0", "dport": 443, "iif": "lan-br",
@@ -538,6 +556,8 @@ test "parses a full config" {
     try std.testing.expectEqualStrings("travel-router", cfg.instance);
     try std.testing.expectEqual(@as(usize, 2), cfg.ports.count());
     try std.testing.expectEqual(schema.PortKind.l2, cfg.ports.get("wan").?.kind);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.ports.get("wan").?.storm_control);
+    try std.testing.expectEqual(@as(u32, 250), cfg.ports.get("lan").?.storm_control);
     try std.testing.expectEqual(@as(usize, 1), cfg.bridges.count());
     try std.testing.expectEqual(@as(usize, 1), cfg.routes.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.nat.masquerade.len);
@@ -545,6 +565,9 @@ test "parses a full config" {
     try std.testing.expectEqual(@as(usize, 1), cfg.dhcp.len);
     try std.testing.expectEqualStrings("12h", cfg.dhcp[0].lease);
     try std.testing.expect(cfg.firewall.rp_filter);
+    try std.testing.expectEqual(@as(u32, 50), cfg.firewall.rate_limit.icmp);
+    try std.testing.expectEqual(@as(u32, 256), cfg.firewall.rate_limit.arp);
+    try std.testing.expectEqual(@as(u32, 25), cfg.firewall.rate_limit.dhcp);
     try std.testing.expectEqual(@as(usize, 1), cfg.firewall.rules.len);
     try std.testing.expectEqual(schema.FirewallAction.accept, cfg.firewall.rules[0].action);
     try std.testing.expectEqual(schema.Proto.tcp, cfg.firewall.rules[0].proto.?);
@@ -584,6 +607,24 @@ test "rejects wrong types" {
     try std.testing.expectError(error.InvalidType, parse(std.testing.allocator,
         \\{ "version": "1", "instance": "x" }
     ));
+}
+
+test "parses firewall rate limits and rejects unknown keys" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rate_limit": { "icmp": 0, "arp": 10 } } }
+    ;
+    var parsed = try parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 0), parsed.config.firewall.rate_limit.icmp);
+    try std.testing.expectEqual(@as(u32, 10), parsed.config.firewall.rate_limit.arp);
+    try std.testing.expectEqual(@as(u32, 100), parsed.config.firewall.rate_limit.dhcp);
+
+    const bad =
+        \\{ "version": 1, "instance": "x",
+        \\  "firewall": { "rate_limit": { "dns": 10 } } }
+    ;
+    try std.testing.expectError(error.UnknownField, parse(std.testing.allocator, bad));
 }
 
 test "rejects invalid firewall values" {

@@ -1,9 +1,10 @@
 //! AF_PACKET L2 ports.
 //!
 //! One raw socket per interface, bound to `ETH_P_ALL`. `PACKET_IGNORE_OUTGOING`
-//! prevents the datapath from reading frames it just transmitted, and
+//! prevents the datapath from reading frames it just transmitted,
 //! `PACKET_MR_PROMISC` is enabled so a userspace bridge sees unicast frames
-//! addressed to other hosts.
+//! addressed to other hosts, and `PACKET_AUXDATA` recovers 802.1Q tags that
+//! VLAN offload stripped before the frame reached the packet socket.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -17,6 +18,18 @@ const ETH_P_ALL: u16 = 0x0003;
 const SOL_PACKET: i32 = 263;
 const PACKET_IGNORE_OUTGOING: u32 = 23;
 const PACKET_MR_PROMISC: u16 = 1;
+const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
+const TP_STATUS_VLAN_TPID_VALID: u32 = 1 << 6;
+
+const TpacketAuxdata = extern struct {
+    tp_status: u32,
+    tp_len: u32,
+    tp_snaplen: u32,
+    tp_mac: u16,
+    tp_net: u16,
+    tp_vlan_tci: u16,
+    tp_vlan_tpid: u16,
+};
 
 const PacketMreq = extern struct {
     ifindex: i32,
@@ -91,15 +104,21 @@ pub const AfPacketPort = struct {
 
         while (true) {
             var src: linux.sockaddr.ll = std.mem.zeroes(linux.sockaddr.ll);
-            var addr_len: linux.socklen_t = @sizeOf(@TypeOf(src));
-            const rc = linux.recvfrom(
-                self.fd,
-                buf.ptr,
-                buf.len,
-                0,
-                @ptrCast(&src),
-                &addr_len,
-            );
+            var iov = [1]std.posix.iovec{.{
+                .base = buf.ptr,
+                .len = buf.len,
+            }};
+            var control: [128]u8 align(@alignOf(usize)) = undefined;
+            var msg: linux.msghdr = .{
+                .name = @ptrCast(&src),
+                .namelen = @sizeOf(@TypeOf(src)),
+                .iov = &iov,
+                .iovlen = 1,
+                .control = &control,
+                .controllen = control.len,
+                .flags = 0,
+            };
+            const rc = linux.recvmsg(self.fd, &msg, 0);
             switch (std.posix.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) return null;
@@ -108,9 +127,16 @@ pub const AfPacketPort = struct {
                         self.stats.drops += 1;
                         continue;
                     }
+                    var len: usize = rc;
+                    if (auxVlanTci(control[0..msg.controllen])) |tci| {
+                        len = restoreVlan(buf, len, tci) orelse {
+                            self.stats.drops += 1;
+                            continue;
+                        };
+                    }
                     self.stats.rx_packets += 1;
-                    self.stats.rx_bytes += rc;
-                    return rc;
+                    self.stats.rx_bytes += len;
+                    return len;
                 },
                 .AGAIN, .INTR => return null,
                 else => |e| return sys.mapErr(e),
@@ -212,6 +238,7 @@ fn openSocket(ifindex: u32, promiscuous: bool, ignore_outgoing: bool) PortError!
     try sys.check(linux.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
 
     if (ignore_outgoing) setIgnoreOutgoing(fd);
+    try setAuxdata(fd);
     if (promiscuous) try setPromiscuous(fd, ifindex);
     return fd;
 }
@@ -227,6 +254,60 @@ fn setIgnoreOutgoing(fd: sys.fd_t) void {
         std.mem.asBytes(&one).ptr,
         @sizeOf(u32),
     );
+}
+
+fn setAuxdata(fd: sys.fd_t) PortError!void {
+    var one: u32 = 1;
+    try sys.check(linux.setsockopt(
+        fd,
+        SOL_PACKET,
+        linux.PACKET.AUXDATA,
+        std.mem.asBytes(&one).ptr,
+        @sizeOf(u32),
+    ));
+}
+
+fn auxVlanTci(control: []const u8) ?u16 {
+    var off: usize = 0;
+    while (off + @sizeOf(linux.cmsghdr) <= control.len) {
+        const hdr = @as(*align(1) const linux.cmsghdr, @ptrCast(control[off..].ptr));
+        if (hdr.len < @sizeOf(linux.cmsghdr)) return null;
+        if (hdr.level == SOL_PACKET and hdr.type == linux.PACKET.AUXDATA) {
+            const data_off = off + cmsgAlign(@sizeOf(linux.cmsghdr));
+            const data_end = @min(control.len, off + hdr.len);
+            if (data_off + @sizeOf(TpacketAuxdata) <= data_end) {
+                const aux = @as(*align(1) const TpacketAuxdata, @ptrCast(control[data_off..].ptr));
+                if (aux.tp_status & TP_STATUS_VLAN_VALID == 0) return null;
+                if (aux.tp_status & TP_STATUS_VLAN_TPID_VALID != 0 and
+                    aux.tp_vlan_tpid != 0x8100)
+                {
+                    return null;
+                }
+                return aux.tp_vlan_tci & 0x0fff;
+            }
+        }
+        off += cmsgAlign(hdr.len);
+    }
+    return null;
+}
+
+fn cmsgAlign(len: usize) usize {
+    const align_size: usize = @sizeOf(usize);
+    return (len + align_size - 1) & ~(align_size - 1);
+}
+
+/// VLAN offload can remove the 802.1Q header and report the TCI through
+/// PACKET_AUXDATA. Reinsert it so the datapath sees one canonical frame format.
+fn restoreVlan(buf: []u8, len: usize, tci: u16) ?usize {
+    if (len < 14) return len;
+    if ((@as(u16, buf[12]) << 8) | buf[13] == 0x8100) return len;
+    if (len + 4 > buf.len) return null;
+    std.mem.copyBackwards(u8, buf[16 .. len + 4], buf[12..len]);
+    buf[12] = 0x81;
+    buf[13] = 0x00;
+    buf[14] = @truncate(tci >> 8);
+    buf[15] = @truncate(tci);
+    return len + 4;
 }
 
 fn setPromiscuous(fd: sys.fd_t, ifindex: u32) PortError!void {
@@ -299,4 +380,81 @@ fn vClose(ctx: *anyopaque, io: std.Io) void {
     _ = io;
     const self: *AfPacketPort = @ptrCast(@alignCast(ctx));
     self.closeImpl();
+}
+
+const testing = std.testing;
+
+test "restoreVlan inserts an offloaded 802.1q tag" {
+    var buf: [64]u8 = undefined;
+    @memset(buf[0..22], 0);
+    buf[12] = 0x08;
+    buf[13] = 0x00;
+    @memcpy(buf[14..18], "data");
+    const out = restoreVlan(&buf, 18, 0x2064).?;
+    try testing.expectEqual(@as(usize, 22), out);
+    try testing.expectEqual(@as(u8, 0x81), buf[12]);
+    try testing.expectEqual(@as(u8, 0x00), buf[13]);
+    try testing.expectEqual(@as(u8, 0x20), buf[14]);
+    try testing.expectEqual(@as(u8, 0x64), buf[15]);
+    try testing.expectEqual(@as(u8, 0x08), buf[16]);
+    try testing.expectEqual(@as(u8, 0x00), buf[17]);
+    try testing.expectEqualSlices(u8, "data", buf[18..22]);
+}
+
+test "restoreVlan keeps an existing tag" {
+    var buf: [64]u8 = undefined;
+    @memset(buf[0..22], 0);
+    buf[12] = 0x81;
+    buf[13] = 0x00;
+    const out = restoreVlan(&buf, 22, 10).?;
+    try testing.expectEqual(@as(usize, 22), out);
+}
+
+test "restoreVlan reports a full buffer" {
+    var buf: [18]u8 = undefined;
+    @memset(&buf, 0);
+    try testing.expectEqual(@as(?usize, null), restoreVlan(&buf, 18, 10));
+}
+
+test "auxVlanTci reads a valid auxdata cmsg" {
+    var control: [128]u8 align(@alignOf(usize)) = [_]u8{0} ** 128;
+    const hdr = @as(*align(1) linux.cmsghdr, @ptrCast(&control));
+    hdr.level = SOL_PACKET;
+    hdr.type = linux.PACKET.AUXDATA;
+    const data_off = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const aux = @as(*align(1) TpacketAuxdata, @ptrCast(control[data_off..].ptr));
+    aux.* = .{
+        .tp_status = TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID,
+        .tp_len = 0,
+        .tp_snaplen = 0,
+        .tp_mac = 0,
+        .tp_net = 0,
+        .tp_vlan_tci = 0x2064,
+        .tp_vlan_tpid = 0x8100,
+    };
+    hdr.len = data_off + @sizeOf(TpacketAuxdata);
+    try testing.expectEqual(@as(?u16, 0x64), auxVlanTci(control[0..hdr.len]));
+}
+
+test "auxVlanTci ignores absent or foreign tags" {
+    var control: [128]u8 align(@alignOf(usize)) = [_]u8{0} ** 128;
+    const hdr = @as(*align(1) linux.cmsghdr, @ptrCast(&control));
+    hdr.level = SOL_PACKET;
+    hdr.type = linux.PACKET.AUXDATA;
+    const data_off = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const aux = @as(*align(1) TpacketAuxdata, @ptrCast(control[data_off..].ptr));
+    aux.* = .{
+        .tp_status = TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID,
+        .tp_len = 0,
+        .tp_snaplen = 0,
+        .tp_mac = 0,
+        .tp_net = 0,
+        .tp_vlan_tci = 10,
+        .tp_vlan_tpid = 0x88a8,
+    };
+    hdr.len = data_off + @sizeOf(TpacketAuxdata);
+    try testing.expectEqual(@as(?u16, null), auxVlanTci(control[0..hdr.len]));
+
+    aux.tp_status = 0;
+    try testing.expectEqual(@as(?u16, null), auxVlanTci(control[0..hdr.len]));
 }

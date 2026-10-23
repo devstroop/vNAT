@@ -73,6 +73,12 @@ fn run(init: std.process.Init) !void {
     var forwarder = try vnat.forward.Forwarder.fromConfig(gpa, io, &parsed.config, port_entries);
     defer forwarder.deinit();
 
+    const run_dir = init.environ_map.get("VNAT_RUN_DIR") orelse "/run/vnat";
+    const counter_packets = try gpa.alloc(u64, forwarder.firewallRuleCount());
+    defer gpa.free(counter_packets);
+    var counter_save_ms = nowMs(io);
+    var counter_warned = false;
+
     var lease_store: ?vnat.dhcp_leases.Store = null;
     defer if (lease_store) |*store| store.deinit();
     if (parsed.config.lease_db) |db_path| {
@@ -164,8 +170,24 @@ fn run(init: std.process.Init) !void {
     var lease_save_ms = nowMs(io);
     while (!stop.load(.acquire)) {
         forwarder.tick(io);
+        const now = nowMs(io);
+        if (now - counter_save_ms >= 5_000) {
+            saveFirewallCounters(
+                io,
+                gpa,
+                run_dir,
+                parsed.config.instance,
+                &forwarder,
+                counter_packets,
+            ) catch |err| {
+                if (!counter_warned) {
+                    logger.warn("firewall counters {s}: {s}", .{ run_dir, @errorName(err) });
+                    counter_warned = true;
+                }
+            };
+            counter_save_ms = now;
+        }
         if (lease_store) |*store| {
-            const now = nowMs(io);
             if (now - lease_save_ms >= 60_000) {
                 store.save(forwarder.dhcpServers()) catch |err| {
                     logger.warn("lease db save: {s}", .{@errorName(err)});
@@ -210,6 +232,17 @@ fn run(init: std.process.Init) !void {
         };
     }
 
+    saveFirewallCounters(
+        io,
+        gpa,
+        run_dir,
+        parsed.config.instance,
+        &forwarder,
+        counter_packets,
+    ) catch |err| {
+        if (!counter_warned) logger.warn("firewall counters {s}: {s}", .{ run_dir, @errorName(err) });
+    };
+
     if (dns_service) |service| {
         logger.info("dns stopping queries={d} responses={d} hits={d} errors={d} dropped={d}", .{
             service.counters.queries.load(.monotonic),
@@ -221,7 +254,7 @@ fn run(init: std.process.Init) !void {
     }
 
     logger.info(
-        "stopping instance={s} forwarded={d} bridged={d} dropped={d} fw-drop={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d}",
+        "stopping instance={s} forwarded={d} bridged={d} dropped={d} fw-drop={d} pending={d}/{d} ct={d}/{d} snat={d} dnat={d} icmp={d} dhcp={d}/{d}/{d} dhcp-client={d} storm-drop={d} rate-limit={d}/{d}/{d}",
         .{
             parsed.config.instance,
             forwarder.counters.forwarded,
@@ -238,13 +271,35 @@ fn run(init: std.process.Init) !void {
             forwarder.counters.dhcp_offers,
             forwarder.counters.dhcp_acks,
             forwarder.counters.dhcp_requests,
+            forwarder.counters.icmp_rate_limited,
+            forwarder.counters.arp_rate_limited,
+            forwarder.counters.dhcp_rate_limited,
             forwarder.counters.dhcp_client_bound,
+            forwarder.counters.storm_dropped,
         },
     );
 }
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toMilliseconds();
+}
+
+fn saveFirewallCounters(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state_dir: []const u8,
+    instance: []const u8,
+    forwarder: *const vnat.forward.Forwarder,
+    packets: []u64,
+) !void {
+    const count = forwarder.snapshotFirewallPackets(packets);
+    try vnat.firewall_counters.save(io, gpa, state_dir, instance, packets[0..count], .{
+        .firewall_dropped = forwarder.counters.firewall_dropped,
+        .firewall_spoofed = forwarder.counters.firewall_spoofed,
+        .icmp_rate_limited = forwarder.counters.icmp_rate_limited,
+        .arp_rate_limited = forwarder.counters.arp_rate_limited,
+        .dhcp_rate_limited = forwarder.counters.dhcp_rate_limited,
+    });
 }
 
 fn logEvent(logger: *const vnat.log.Logger, event: *const vnat.linux_ports.netlink.Event) void {

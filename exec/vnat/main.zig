@@ -93,6 +93,11 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "bridge")) {
+        try bridgeCommand(init, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         const path = configPath(args[2..]) catch {
             try usage(io);
@@ -531,6 +536,79 @@ fn statusFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u8 {
     return 0;
 }
 
+fn bridgeCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len != 1 or !std.mem.eql(u8, cfg.rest[0], "list")) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+    const config = &parsed.config;
+
+    try print(io, gpa, "BRIDGE       VLAN STP OFFLOAD MEMBERS SVIS\n", .{});
+    var it = config.bridges.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const bridge = entry.value_ptr.*;
+        var svi_count: usize = 0;
+        var iface_it = config.interfaces.iterator();
+        while (iface_it.next()) |iface_entry| {
+            if (iface_entry.value_ptr.bridge) |bridge_name| {
+                if (std.mem.eql(u8, bridge_name, name)) svi_count += 1;
+            }
+        }
+        try print(io, gpa, "{s:<12} {s:<4} {s:<3} {s:<7} {d:>7} {d:>4}\n", .{
+            name,
+            if (bridge.vlan_aware) "yes" else "no",
+            if (bridge.stp) "on" else "off",
+            @tagName(bridge.offload),
+            bridge.ports.len,
+            svi_count,
+        });
+        for (bridge.ports) |port_name| {
+            const port = config.ports.get(port_name) orelse continue;
+            const pvid: ?u16 = port.pvid orelse
+                if (bridge.vlan_aware) 1 else null;
+            try print(io, gpa, "  port {s:<10} pvid=", .{port_name});
+            if (pvid) |vlan| {
+                try print(io, gpa, "{d}", .{vlan});
+            } else {
+                try print(io, gpa, "-", .{});
+            }
+            try print(io, gpa, " tagged=", .{});
+            if (port.tagged.len == 0) {
+                try print(io, gpa, "-\n", .{});
+            } else {
+                for (port.tagged, 0..) |vlan, i| {
+                    if (i != 0) try print(io, gpa, ",", .{});
+                    try print(io, gpa, "{d}", .{vlan});
+                }
+                try print(io, gpa, "\n", .{});
+            }
+        }
+        iface_it = config.interfaces.iterator();
+        while (iface_it.next()) |iface_entry| {
+            const iface_name = iface_entry.key_ptr.*;
+            const iface = iface_entry.value_ptr.*;
+            if (iface.bridge) |bridge_name| {
+                if (!std.mem.eql(u8, bridge_name, name)) continue;
+                try print(io, gpa, "  svi {s:<11} vlan={d} address={s}\n", .{
+                    iface_name,
+                    iface.vlan orelse 1,
+                    iface.address orelse "-",
+                });
+            }
+        }
+    }
+}
+
 fn portList(io: std.Io, gpa: std.mem.Allocator) !u8 {
     const links = vnat.linux_ports.netlink.listLinks(io, gpa) catch |err| {
         try printErr(io, gpa, "netlink: {s}\n", .{@errorName(err)});
@@ -677,6 +755,22 @@ fn firewallCommand(init: std.process.Init, args: []const []const u8) !void {
     const io = init.io;
     const gpa = init.gpa;
     const cfg = splitConfig(args);
+    if (cfg.rest.len == 0) {
+        try usage(io);
+        std.process.exit(2);
+    }
+    if (std.mem.eql(u8, cfg.rest[0], "test")) {
+        try firewallTest(init, cfg.path, cfg.rest[1..]);
+        return;
+    }
+    if (std.mem.eql(u8, cfg.rest[0], "counters")) {
+        if (cfg.rest.len != 1) {
+            try usage(io);
+            std.process.exit(2);
+        }
+        try firewallCounters(init, cfg.path);
+        return;
+    }
     if (cfg.rest.len != 1 or !std.mem.eql(u8, cfg.rest[0], "list")) {
         try usage(io);
         std.process.exit(2);
@@ -694,6 +788,11 @@ fn firewallCommand(init: std.process.Init, args: []const []const u8) !void {
         @tagName(firewall.default_forward),
         @tagName(firewall.default_out),
         if (firewall.rp_filter) "on" else "off",
+    });
+    try print(io, gpa, "rate-limit: icmp={d}/s arp={d}/s dhcp={d}/s\n", .{
+        firewall.rate_limit.icmp,
+        firewall.rate_limit.arp,
+        firewall.rate_limit.dhcp,
     });
     for (firewall.rules, 0..) |rule, i| {
         try print(io, gpa, "{d}: {s}", .{ i + 1, @tagName(rule.action) });
@@ -713,6 +812,198 @@ fn firewallCommand(init: std.process.Init, args: []const []const u8) !void {
         }
         try print(io, gpa, "\n", .{});
     }
+}
+
+fn firewallCounters(init: std.process.Init, path: []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var parsed = loadConfig(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    var loaded = vnat.firewall_counters.load(
+        io,
+        gpa,
+        stateDir(init),
+        parsed.config.instance,
+    ) catch |err| {
+        try printErr(io, gpa, "cannot read firewall counters: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    } orelse {
+        try printErr(io, gpa, "no firewall counters for {s} (is vnatd running?)\n", .{
+            parsed.config.instance,
+        });
+        std.process.exit(1);
+    };
+    defer loaded.deinit();
+
+    const value = &loaded.value;
+    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+    const age_ms = @max(@as(i64, 0), now_ms - value.updated_ms);
+    try print(io, gpa, "instance: {s}\nupdated: {d}ms ago\n", .{
+        value.instance,
+        age_ms,
+    });
+    for (value.rules, 0..) |packets, i| {
+        try print(io, gpa, "rule {d}: {d} packets\n", .{ i + 1, packets });
+    }
+    try print(
+        io,
+        gpa,
+        "policy: dropped={d} spoofed={d} rate-limit={d}/{d}/{d}\n",
+        .{
+            value.firewall_dropped,
+            value.firewall_spoofed,
+            value.icmp_rate_limited,
+            value.arp_rate_limited,
+            value.dhcp_rate_limited,
+        },
+    );
+}
+
+fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var proto: ?u8 = null;
+    var src: ?vnat.types.Ipv4 = null;
+    var dst: ?vnat.types.Ipv4 = null;
+    var sport: ?u16 = null;
+    var dport: ?u16 = null;
+    var iif: ?[]const u8 = null;
+    var oif: ?[]const u8 = null;
+    var state: vnat.config_schema.FirewallCtState = .new;
+    var hook: vnat.forward.Forwarder.FirewallHook = .forward;
+
+    var i: usize = 0;
+    while (i < args.len) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--help")) {
+            try usage(io);
+            return;
+        }
+        if (i + 1 >= args.len) {
+            try printErr(io, gpa, "vnat: firewall test: missing value for {s}\n", .{flag});
+            std.process.exit(2);
+        }
+        const value = args[i + 1];
+        if (std.mem.eql(u8, flag, "--proto")) {
+            proto = parseProto(value) orelse {
+                try printErr(io, gpa, "vnat: firewall test: invalid protocol '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--src")) {
+            src = vnat.types.Ipv4.parse(value) catch {
+                try printErr(io, gpa, "vnat: firewall test: invalid source '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--dst")) {
+            dst = vnat.types.Ipv4.parse(value) catch {
+                try printErr(io, gpa, "vnat: firewall test: invalid destination '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--sport")) {
+            sport = parsePort(value) orelse {
+                try printErr(io, gpa, "vnat: firewall test: invalid source port '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--dport")) {
+            dport = parsePort(value) orelse {
+                try printErr(io, gpa, "vnat: firewall test: invalid destination port '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--iif")) {
+            iif = value;
+        } else if (std.mem.eql(u8, flag, "--oif")) {
+            oif = value;
+        } else if (std.mem.eql(u8, flag, "--state")) {
+            state = parseCtState(value) orelse {
+                try printErr(io, gpa, "vnat: firewall test: invalid state '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, flag, "--hook")) {
+            hook = parseHook(value) orelse {
+                try printErr(io, gpa, "vnat: firewall test: invalid hook '{s}'\n", .{value});
+                std.process.exit(2);
+            };
+        } else {
+            try printErr(io, gpa, "vnat: firewall test: unknown option '{s}'\n", .{flag});
+            std.process.exit(2);
+        }
+        i += 2;
+    }
+
+    if (proto == null or src == null or dst == null) {
+        try printErr(io, gpa, "vnat: firewall test requires --proto, --src and --dst\n", .{});
+        std.process.exit(2);
+    }
+    if ((sport != null or dport != null) and proto != 6 and proto != 17) {
+        try printErr(io, gpa, "vnat: firewall test: ports require --proto tcp|udp\n", .{});
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    const result = vnat.forward.Forwarder.probeFirewallConfig(
+        gpa,
+        io,
+        &parsed.config,
+        .{
+            .proto = proto.?,
+            .src = src.?,
+            .dst = dst.?,
+            .sport = sport,
+            .dport = dport,
+            .iif = iif,
+            .oif = oif,
+            .state = state,
+            .hook = hook,
+        },
+    ) catch |err| {
+        try printErr(io, gpa, "vnat: firewall test: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    if (result.rule) |index| {
+        try print(io, gpa, "rule {d}: {s}\n", .{ index + 1, @tagName(result.action) });
+    } else {
+        try print(io, gpa, "default: {s}\n", .{@tagName(result.action)});
+    }
+}
+
+fn parseProto(text: []const u8) ?u8 {
+    if (std.mem.eql(u8, text, "tcp")) return 6;
+    if (std.mem.eql(u8, text, "udp")) return 17;
+    if (std.mem.eql(u8, text, "icmp")) return 1;
+    return null;
+}
+
+fn parsePort(text: []const u8) ?u16 {
+    const value = std.fmt.parseInt(u16, text, 10) catch return null;
+    if (value == 0) return null;
+    return value;
+}
+
+fn parseCtState(text: []const u8) ?vnat.config_schema.FirewallCtState {
+    if (std.mem.eql(u8, text, "new")) return .new;
+    if (std.mem.eql(u8, text, "established")) return .established;
+    if (std.mem.eql(u8, text, "related")) return .related;
+    if (std.mem.eql(u8, text, "invalid")) return .invalid;
+    return null;
+}
+
+fn parseHook(text: []const u8) ?vnat.forward.Forwarder.FirewallHook {
+    if (std.mem.eql(u8, text, "input")) return .input;
+    if (std.mem.eql(u8, text, "forward")) return .forward;
+    if (std.mem.eql(u8, text, "output")) return .output;
+    return null;
 }
 
 fn dhcpCommand(init: std.process.Init, args: []const []const u8) !void {
@@ -889,7 +1180,10 @@ fn usage(io: std.Io) !void {
         \\  vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
         \\  vnat down [-c <config>]
         \\  vnat journal [-c <config>]
+        \\  vnat bridge list [-c <config>]
         \\  vnat firewall list [-c <config>]
+        \\  vnat firewall counters [-c <config>]
+        \\  vnat firewall test --proto tcp|udp|icmp --src <ip> --dst <ip> [--sport <n>] [--dport <n>] [--iif <name>] [--oif <name>] [--state new|established|related|invalid] [--hook input|forward|output] [-c <config>]
         \\  vnat selftest l2 <inject> <port-a> <port-b> <recv>
         \\  vnat selftest tun|tap <name>
         \\  vnat help

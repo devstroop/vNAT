@@ -31,10 +31,25 @@ All notable changes to vNAT are documented here. The format follows
   `iif`/`oif` (port, interface or bridge), `accept`/`drop`/`reject`,
   `ct_state`, per-rule counters, and default deny before the conntrack
   established shortcut.
-- `vnat firewall list` prints the ordered rule set and default policies.
+- `vnat firewall list` prints the ordered rule set, default policies and
+  control-plane rate limits.
+- `vnat firewall test` evaluates a synthetic packet against the configured
+  rules and prints the matching rule or default action.
+- `vnat firewall counters` reads the per-rule packet and drop snapshot that
+  `vnatd` writes to the run directory every 5 s and on shutdown.
+- Token-bucket limits for generated ICMP errors, ARP processing and DHCP
+  server requests (`firewall.rate_limit`); `0` disables a limit.
+- `vnat bridge list` shows bridge membership, effective PVID/tagged VLANs,
+  tri-state STP/offload and SVI addressing.
+- Per-port storm control (`ports.<name>.storm_control`, default 1000
+  flooded frames/s, `0` disables) with a `storm_dropped` counter.
+- VLAN netns test covering access/trunk forwarding, SVI reachability and
+  per-port VLAN isolation.
 
 ### Fixed
 
+- Recover 802.1Q tags stripped by VLAN offload using `PACKET_AUXDATA` before
+  ingress classification, and add a veth access/trunk netns test.
 - Bound the ARP neighbour cache and miss-rate map; stale entries are pruned and
   the oldest entry is evicted at capacity (spoofed-ARP memory exhaustion).
 - Synchronize the DNS cache between UDP/TCP workers, use separate upstream

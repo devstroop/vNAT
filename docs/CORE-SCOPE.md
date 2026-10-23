@@ -137,17 +137,23 @@ pub const Frame = struct {
 - STP: 802.1D basic (blocking/listening/learning/forwarding) **optional**;
   default off for small trusted topologies. `bridge.stp = true` is rejected
   until the implementation lands (R5).
-- Loop protection: per-port ingress rate limit + storm control.
+- Loop protection: per-port ingress flooded-frame rate limit (storm control).
+  `ports.<name>.storm_control` caps broadcast/multicast/unknown-unicast
+  frames per second (default 1000, `0` disables); excess is dropped and
+  counted as `storm`. Mirroring/MAC-flap loop detection remains future work.
 - Port isolation and per-port VLAN membership.
 
 ### 3.2 VLAN
 
 - 802.1Q parse/insert; TPID 0x8100 (0x88A8 optional later).
-- Per-port `pvid` (untagged ingress VLAN) and `tagged` set.
+- Per-port `pvid` (untagged ingress VLAN), `tagged` set and
+  `storm_control`.
 - Trunk ports carry multiple VLANs; access ports carry one.
 - VLAN-aware bridging: FDB keyed by `(vlan, mac)`. `vlan_aware = true`
   enables filtering; non-VLAN bridges reject `pvid`/`tagged` and drop tagged
   frames. Interface SVIs default to VLAN 1 on a VLAN-aware bridge.
+- Receive-side offload may strip the 802.1Q header; the AF_PACKET port
+  reconstructs it from `PACKET_AUXDATA` before ingress classification.
 - No QinQ in v1.
 
 ### 3.3 Offload
@@ -340,10 +346,22 @@ Implementing actions: `accept`, `drop`, `reject` (ICMP admin-prohibited).
   when no rule matches; rules may still target them by `ct_state`.
 - Stateful by default for TCP/UDP; stateless option per rule is not yet
   exposed in config.
+- Control-plane rate limits (`firewall.rate_limit`) are token buckets, one
+  second of burst: `icmp` for generated ICMP errors, `arp` for ARP frames and
+  `dhcp` for DHCP server requests. `0` disables a limit; excess packets are
+  dropped and counted.
+- `vnat firewall test` evaluates a synthetic packet against the ordered rules
+  offline (same compiler as the datapath) and prints the match.
+- `vnatd` rewrites `<run>/<instance>.firewall.json` atomically every 5 s and
+  on shutdown with per-rule packet counts and drop/rate-limit aggregates;
+  `vnat firewall counters` reads it. Export is best-effort so an unwritable
+  run directory never stops forwarding.
 
 ### 6.2 Limits
 
 - Rule count cap (4,096) with compile-time validation.
+- Runtime counters are a periodic snapshot, not a live stream; a stopped
+  daemon leaves the last snapshot in place.
 - No L7/app identification, no IPS, no geo-IP.
 
 ## 7. DHCPv4 server
@@ -401,14 +419,15 @@ machine-checked configs live in `examples/`):
   "lease_db": "/var/lib/vnat/leases.json",
   "ports": {
     "uplink":  { "kind": "l2", "device": "wlan0" },
-    "lan":     { "kind": "l2", "device": "usb0", "pvid": 10, "tagged": [20] },
+    "lan":     { "kind": "l2", "device": "usb0", "pvid": 10, "tagged": [20],
+                 "storm_control": 1000 },
     "vpn0":    { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
-    "lan-br": { "ports": ["lan"] }
+    "lan-br": { "ports": ["lan"], "vlan_aware": true }
   },
   "interfaces": {
-    "lan0": { "bridge": "lan-br", "address": "10.10.0.1/24" },
+    "lan0": { "bridge": "lan-br", "address": "10.10.0.1/24", "vlan": 10 },
     "wan0": { "port": "uplink", "address": "dhcp" }
   },
   "routes": [
@@ -442,6 +461,7 @@ machine-checked configs live in `examples/`):
     "default_in": "drop",
     "default_forward": "drop",
     "rp_filter": true,
+    "rate_limit": { "icmp": 100, "arp": 512, "dhcp": 100 },
     "rules": [
       { "action": "accept", "proto": "tcp", "iif": "lan0", "oif": "wan0",
         "src": "10.10.0.0/24", "dport": 443, "ct_state": "new" },
@@ -454,10 +474,13 @@ machine-checked configs live in `examples/`):
 Rules for config:
 - `ports.<name>.pvid` and `ports.<name>.tagged` configure VLAN membership on a
   `vlan_aware` bridge; `interfaces.<name>.vlan` selects the SVI VLAN.
+- `ports.<name>.storm_control` caps flooded frames per second from that port
+  (default 1000, `0` disables).
 - `firewall.rules` is evaluated in order before the default policy. Each rule
   may match `proto`, `src`/`dst` CIDRs, `sport`/`dport` (TCP/UDP only),
   `iif`/`oif` (port, interface or bridge name) and `ct_state`, and applies
-  `accept`, `drop` or `reject`.
+  `accept`, `drop` or `reject`. `firewall.rate_limit` sets per-second caps for
+  generated ICMP errors, ARP and DHCP requests (zero disables).
 - Unknown keys are errors (catches typos).
 - Version 1 grows by adding *optional* keys in the milestone that implements
   them (R4 DHCP/DNS, R5 VLAN/STP, R6 firewall); existing keys never change
@@ -475,8 +498,9 @@ Rules for config:
   typed error instead of silently falling back.
 
 Current reserved fields include bridge STP/kernel offload. Bridge membership,
-VLAN membership, the DHCP client, firewall rules, and
-`default_in`/`default_forward` are consumed by the datapath; `default_out`
+VLAN membership, per-port storm control, the DHCP client, firewall rules,
+control-plane rate limits, and `default_in`/`default_forward` are consumed by
+the datapath; `default_out`
 only accepts `"accept"` until outbound policy is implemented. Explicit
 `port_forward` rules are treated as administrator allows and bypass
 `default_forward` for the flow they create; ordered `firewall.rules` still
@@ -496,6 +520,12 @@ vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <conf
 vnat down [-c <config>]
 vnat journal [-c <config>]
 vnat selftest ...
+vnat bridge list [-c <config>]
+vnat dhcp status
+vnat dns query example.com
+vnat firewall list [-c <config>]
+vnat firewall counters [-c <config>]
+vnat firewall test --proto tcp --src 10.0.0.2 --dst 1.1.1.1 --dport 443 [--iif lan0] [-c <config>]
 ```
 
 Planned with their milestones:
@@ -504,10 +534,7 @@ Planned with their milestones:
 vnat up -c /etc/vnat/vnat.json          # R7 control plane
 vnat bridge create lan                   # R5
 vnat nat add masquerade --out wan0       # R3
-vnat dhcp status                         # R4
-vnat dns query example.com               # R4
 vnat conntrack list [--state established] # R3
-vnat firewall list [-c <config>]         # R6
 vnat pcap --iface lan --write cap.pcap   # R9
 vnat doctor                              # R7
 ```

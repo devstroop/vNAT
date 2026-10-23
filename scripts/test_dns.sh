@@ -18,6 +18,7 @@ fi
 ZIG="${ZIG:-zig}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
+export VNAT_RUN_DIR="$WORK/run"
 INSTANCE=dns-test
 CONFIG=$WORK/config.json
 LOG=$WORK/vnatd.log

@@ -18,6 +18,8 @@ const conntrack_mod = @import("../nat/conntrack.zig");
 const nat_mod = @import("../nat/nat.zig");
 const dhcp_message = @import("../services/dhcp/message.zig");
 const dhcp_server = @import("../services/dhcp/server.zig");
+const memory_port = @import("../port/memory.zig");
+const rate = @import("rate.zig");
 
 const PortError = @import("../errors.zig").PortError;
 
@@ -86,6 +88,10 @@ pub const Counters = struct {
     nat_unsupported: u64 = 0,
     firewall_dropped: u64 = 0,
     firewall_spoofed: u64 = 0,
+    storm_dropped: u64 = 0,
+    icmp_rate_limited: u64 = 0,
+    arp_rate_limited: u64 = 0,
+    dhcp_rate_limited: u64 = 0,
 };
 
 pub const BridgePortVlan = struct {
@@ -210,9 +216,13 @@ pub const Forwarder = struct {
     dhcp_servers: std.ArrayListUnmanaged(dhcp_server.Server) = .empty,
     dhcp_clients: std.ArrayListUnmanaged(DhcpClient) = .empty,
     dhcp_pending: [dhcp_pending_slots]PendingDhcpOffer = [_]PendingDhcpOffer{.{}} ** dhcp_pending_slots,
+    storm_limiters: []rate.Limiter = &.{},
     bridges: std.ArrayListUnmanaged(Bridge) = .empty,
     fdb: std.AutoHashMapUnmanaged(u128, FdbEntry) = .empty,
     last_maintenance_ms: i64 = 0,
+    icmp_limiter: rate.Limiter = .{},
+    arp_limiter: rate.Limiter = .{},
+    dhcp_limiter: rate.Limiter = .{},
     firewall: schema.FirewallConfig = .{
         .default_in = .accept,
         .default_forward = .accept,
@@ -238,6 +248,9 @@ pub const Forwarder = struct {
         try self.arp.reserve(gpa, 64);
         errdefer self.arp.deinit(gpa);
         try self.arp_misses.ensureTotalCapacity(gpa, arp_miss_max_entries);
+        errdefer self.arp_misses.deinit(gpa);
+        self.storm_limiters = try gpa.alloc(rate.Limiter, ports.len);
+        for (self.storm_limiters) |*limiter| limiter.* = rate.Limiter.init(0);
         return self;
     }
 
@@ -252,6 +265,7 @@ pub const Forwarder = struct {
         for (self.dhcp_servers.items) |*server| server.deinit();
         self.dhcp_servers.deinit(self.gpa);
         self.dhcp_clients.deinit(self.gpa);
+        if (self.storm_limiters.len != 0) self.gpa.free(self.storm_limiters);
         for (self.bridges.items) |bridge| {
             for (bridge.vlans) |vlan| self.gpa.free(vlan.tagged);
             self.gpa.free(bridge.vlans);
@@ -397,6 +411,14 @@ pub const Forwarder = struct {
         var self = try initInner(gpa, ports, conntrack_default_entries);
         errdefer self.deinit();
         self.firewall = cfg.firewall;
+        self.icmp_limiter = rate.Limiter.init(cfg.firewall.rate_limit.icmp);
+        self.arp_limiter = rate.Limiter.init(cfg.firewall.rate_limit.arp);
+        self.dhcp_limiter = rate.Limiter.init(cfg.firewall.rate_limit.dhcp);
+        for (self.ports, 0..) |entry, i| {
+            if (cfg.ports.get(entry.config_name)) |port_cfg| {
+                self.storm_limiters[i] = rate.Limiter.init(port_cfg.storm_control);
+            }
+        }
 
         var bridge_it = cfg.bridges.iterator();
         var bridge_id: u32 = 0;
@@ -606,6 +628,114 @@ pub const Forwarder = struct {
         return self;
     }
 
+    pub const FirewallHook = enum { input, forward, output };
+
+    pub const FirewallProbe = struct {
+        proto: u8,
+        src: types.Ipv4,
+        dst: types.Ipv4,
+        sport: ?u16 = null,
+        dport: ?u16 = null,
+        iif: ?[]const u8 = null,
+        oif: ?[]const u8 = null,
+        state: schema.FirewallCtState = .new,
+        hook: FirewallHook = .forward,
+    };
+
+    pub const FirewallProbeResult = struct {
+        /// Zero-based rule index, or null when the default policy applies.
+        rule: ?usize,
+        action: schema.FirewallAction,
+    };
+
+    /// Evaluates a synthetic packet against the compiled rule set. Intended for
+    /// `vnat firewall test`; it never touches a real port.
+    pub fn probeFirewallConfig(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cfg: *const schema.Config,
+        probe: FirewallProbe,
+    ) PortError!FirewallProbeResult {
+        const port_count = cfg.ports.count();
+        const dummy_ports = try gpa.alloc(memory_port.MemoryPort, port_count);
+        defer gpa.free(dummy_ports);
+        const entries = try gpa.alloc(PortEntry, port_count);
+        defer gpa.free(entries);
+
+        var it = cfg.ports.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            const id = types.PortId{ .value = @intCast(i + 1) };
+            dummy_ports[i] = memory_port.MemoryPort.init(
+                gpa,
+                id,
+                entry.key_ptr.*,
+                entry.value_ptr.mtu orelse 1500,
+            );
+            entries[i] = .{
+                .id = id,
+                .config_name = entry.key_ptr.*,
+                .port = dummy_ports[i].port(),
+            };
+        }
+
+        var fwd = try Forwarder.fromConfig(gpa, io, cfg, entries);
+        defer fwd.deinit();
+
+        const iif = if (probe.iif) |name|
+            fwd.probeIfacePort(cfg, name) orelse return error.NotFound
+        else
+            types.PortId.invalid;
+        const oif = if (probe.oif) |name|
+            fwd.probeIfacePort(cfg, name) orelse return error.NotFound
+        else
+            null;
+
+        var l4: [4]u8 = .{ 0, 0, 0, 0 };
+        if (probe.sport) |port| std.mem.writeInt(u16, l4[0..2], port, .big);
+        if (probe.dport) |port| std.mem.writeInt(u16, l4[2..4], port, .big);
+        const ip = ipv4.Header{
+            .header_len = 20,
+            .total_len = 24,
+            .id = 0,
+            .flags_frag = 0,
+            .ttl = 64,
+            .protocol = probe.proto,
+            .src = probe.src,
+            .dst = probe.dst,
+            .payload = &l4,
+            .packet = &l4,
+        };
+
+        if (fwd.firewallMatch(iif, oif, ip, probe.state)) |matched| {
+            return .{ .rule = matched.index, .action = matched.action };
+        }
+        return .{
+            .rule = null,
+            .action = switch (probe.hook) {
+                .input => cfg.firewall.default_in,
+                .forward => cfg.firewall.default_forward,
+                .output => cfg.firewall.default_out,
+            },
+        };
+    }
+
+    fn probeIfacePort(
+        self: *const Forwarder,
+        cfg: *const schema.Config,
+        name: []const u8,
+    ) ?types.PortId {
+        const iface = self.firewallIface(cfg, name) orelse return null;
+        return switch (iface) {
+            .port => |id| id,
+            .bridge => |bridge_id| blk: {
+                const bridge = self.bridgeById(bridge_id) orelse break :blk null;
+                if (bridge.members.len == 0) break :blk null;
+                break :blk bridge.members[0];
+            },
+        };
+    }
+
     /// Sends a gratuitous ARP request for every local address so peers refresh
     /// their neighbor caches after an address change or daemon restart.
     pub fn announce(self: *Forwarder, io: std.Io) PortError!void {
@@ -776,7 +906,8 @@ pub const Forwarder = struct {
         now: i64,
     ) PortError!void {
         _ = frame;
-        if (!eth.dst.isMulticast()) {
+        const multicast = eth.dst.isMulticast();
+        if (!multicast) {
             if (self.fdb.get(fdbKey(bridge.id, vlan, eth.dst))) |entry| {
                 if (!entry.port.eql(ingress)) {
                     self.sendBridgeFrame(io, bridge, entry.port, eth, vlan) catch {
@@ -785,6 +916,11 @@ pub const Forwarder = struct {
                 }
                 return;
             }
+        }
+        if (!self.stormAllow(ingress, now)) {
+            self.counters.storm_dropped += 1;
+            self.counters.dropped += 1;
+            return;
         }
         // A down or misconfigured member must not stop the flood to the
         // remaining members.
@@ -795,7 +931,14 @@ pub const Forwarder = struct {
                 continue;
             };
         }
-        if (eth.dst.isMulticast()) self.learnFdb(bridge.id, vlan, eth.src, ingress, now);
+        if (multicast) self.learnFdb(bridge.id, vlan, eth.src, ingress, now);
+    }
+
+    fn stormAllow(self: *Forwarder, port: types.PortId, now: i64) bool {
+        for (self.ports, 0..) |entry, i| {
+            if (entry.id.eql(port)) return self.storm_limiters[i].allow(now);
+        }
+        return true;
     }
 
     const EgressVlan = union(enum) { untagged, tagged: u16, filtered };
@@ -862,6 +1005,10 @@ pub const Forwarder = struct {
             return;
         };
         const info = entry.port.info();
+        if (!self.arp_limiter.allow(nowMs(io))) {
+            self.counters.arp_rate_limited += 1;
+            return;
+        }
 
         const learned = !packet.sender_ip.isUnspecified() and !packet.sender_mac.isZero();
         if (learned) {
@@ -1806,6 +1953,10 @@ pub const Forwarder = struct {
         if (readU16(ip.payload, 2) != 67) return false;
 
         const server = self.dhcpServerFor(ingress, vlan) orelse return false;
+        if (!self.dhcp_limiter.allow(now)) {
+            self.counters.dhcp_rate_limited += 1;
+            return true;
+        }
         self.counters.dhcp_requests += 1;
         const msg = dhcp_message.Message.parse(ip.payload[8..udp_len]) catch {
             self.counters.dhcp_dropped += 1;
@@ -2402,6 +2553,10 @@ pub const Forwarder = struct {
         const local = self.localForPeer(ingress, ip.src, vlan) orelse return;
         const entry = self.portById(ingress) orelse return;
         const info = entry.port.info();
+        if (!self.icmp_limiter.allow(nowMs(io))) {
+            self.counters.icmp_rate_limited += 1;
+            return;
+        }
 
         var msg_buf: [576]u8 = undefined;
         const msg_len = icmp.writeError(&msg_buf, typ, code, ip.packet, rest) catch return;
@@ -2666,6 +2821,17 @@ pub const Forwarder = struct {
         return null;
     }
 
+    pub fn firewallRuleCount(self: *const Forwarder) usize {
+        return self.firewall_rules.items.len;
+    }
+
+    /// Copies per-rule packet counters in rule order and returns the count.
+    pub fn snapshotFirewallPackets(self: *const Forwarder, out: []u64) usize {
+        const count = @min(out.len, self.firewall_rules.items.len);
+        for (self.firewall_rules.items[0..count], 0..) |rule, i| out[i] = rule.packets;
+        return count;
+    }
+
     fn compileFirewall(self: *Forwarder, cfg: *const schema.Config) PortError!void {
         for (cfg.firewall.rules) |rule| {
             var compiled = FirewallRule{
@@ -2709,6 +2875,11 @@ pub const Forwarder = struct {
         return null;
     }
 
+    const FirewallMatch = struct {
+        index: usize,
+        action: schema.FirewallAction,
+    };
+
     fn firewallAction(
         self: *Forwarder,
         iif: types.PortId,
@@ -2716,8 +2887,19 @@ pub const Forwarder = struct {
         ip: ipv4.Header,
         state: schema.FirewallCtState,
     ) ?schema.FirewallAction {
+        const matched = self.firewallMatch(iif, oif, ip, state) orelse return null;
+        return matched.action;
+    }
+
+    fn firewallMatch(
+        self: *Forwarder,
+        iif: types.PortId,
+        oif: ?types.PortId,
+        ip: ipv4.Header,
+        state: schema.FirewallCtState,
+    ) ?FirewallMatch {
         const ports = firewallPorts(ip);
-        for (self.firewall_rules.items) |*rule| {
+        for (self.firewall_rules.items, 0..) |*rule, index| {
             if (rule.proto) |proto| {
                 if (proto != ip.protocol) continue;
             }
@@ -2742,7 +2924,7 @@ pub const Forwarder = struct {
             }
             if (rule.ct_mask != 0 and rule.ct_mask & firewallCtBit(state) == 0) continue;
             rule.packets += 1;
-            return rule.action;
+            return .{ .index = index, .action = rule.action };
         }
         return null;
     }
@@ -3949,6 +4131,152 @@ test "firewall rules are ordered and match interfaces and addresses" {
     try testing.expectEqual(@as(u64, 1), fwd.counters.forwarded);
 }
 
+test "firewall probe reports the matching rule or default policy" {
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "fw-probe",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a" },
+        \\    "b": { "kind": "l2", "device": "b" }
+        \\  },
+        \\  "interfaces": {
+        \\    "lan": { "port": "a" },
+        \\    "wan": { "port": "b" }
+        \\  },
+        \\  "firewall": {
+        \\    "default_in": "accept",
+        \\    "default_forward": "drop",
+        \\    "rules": [
+        \\      { "action": "accept", "proto": "tcp", "dport": 443, "iif": "lan", "oif": "wan" },
+        \\      { "action": "reject", "proto": "tcp", "dport": 8080 }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+
+    const accepted = try Forwarder.probeFirewallConfig(
+        testing.allocator,
+        testing.io,
+        &parsed.config,
+        .{
+            .proto = ipv4.Protocol.tcp,
+            .src = testIp("10.0.1.2"),
+            .dst = testIp("10.0.2.2"),
+            .dport = 443,
+            .iif = "lan",
+            .oif = "wan",
+        },
+    );
+    try testing.expectEqual(@as(?usize, 0), accepted.rule);
+    try testing.expectEqual(schema.FirewallAction.accept, accepted.action);
+
+    const rejected = try Forwarder.probeFirewallConfig(
+        testing.allocator,
+        testing.io,
+        &parsed.config,
+        .{
+            .proto = ipv4.Protocol.tcp,
+            .src = testIp("10.0.1.2"),
+            .dst = testIp("10.0.2.2"),
+            .dport = 8080,
+        },
+    );
+    try testing.expectEqual(@as(?usize, 1), rejected.rule);
+    try testing.expectEqual(schema.FirewallAction.reject, rejected.action);
+
+    const fallthrough = try Forwarder.probeFirewallConfig(
+        testing.allocator,
+        testing.io,
+        &parsed.config,
+        .{
+            .proto = ipv4.Protocol.udp,
+            .src = testIp("10.0.1.2"),
+            .dst = testIp("10.0.2.2"),
+            .dport = 53,
+        },
+    );
+    try testing.expectEqual(@as(?usize, null), fallthrough.rule);
+    try testing.expectEqual(schema.FirewallAction.drop, fallthrough.action);
+
+    const inbound = try Forwarder.probeFirewallConfig(
+        testing.allocator,
+        testing.io,
+        &parsed.config,
+        .{
+            .proto = ipv4.Protocol.icmp,
+            .src = testIp("10.0.1.2"),
+            .dst = testIp("10.0.1.1"),
+            .hook = .input,
+        },
+    );
+    try testing.expectEqual(@as(?usize, null), inbound.rule);
+    try testing.expectEqual(schema.FirewallAction.accept, inbound.action);
+}
+
+test "icmp error rate limit drops excess replies" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+    fwd.icmp_limiter = rate.Limiter.init(1);
+
+    try fwd.arp.put(testing.allocator, testIp("10.0.2.2"), .{
+        .mac = host_b_mac,
+        .port = port_b,
+        .updated_ms = nowMs(testing.io),
+    });
+
+    var frame: [512]u8 = undefined;
+    const n = try buildEchoRequest(
+        &frame,
+        port_a_mac,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.2.2"),
+        1,
+        "ttl",
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+    try fwd.handle(testing.io, frame[0..n], port_a);
+    try testing.expectEqual(@as(usize, 1), a.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.icmp_errors);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.icmp_rate_limited);
+}
+
+test "arp rate limit drops excess requests" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a: MemoryPort = undefined;
+    var b: MemoryPort = undefined;
+    var entries: [2]PortEntry = undefined;
+    var fwd: Forwarder = undefined;
+    try setup(&a, &b, &entries, &fwd);
+    defer fwd.deinit();
+    defer b.deinit();
+    defer a.deinit();
+    fwd.arp_limiter = rate.Limiter.init(1);
+
+    var frame: [128]u8 = undefined;
+    const n = try buildArpRequest(
+        &frame,
+        host_a_mac,
+        testIp("10.0.1.2"),
+        testIp("10.0.1.1"),
+    );
+    try fwd.handle(testing.io, frame[0..n], port_a);
+    try fwd.handle(testing.io, frame[0..n], port_a);
+    try testing.expectEqual(@as(usize, 1), a.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.arp_replies);
+    try testing.expectEqual(@as(u64, 1), fwd.counters.arp_rate_limited);
+}
+
 test "rp_filter drops sources not reachable from the ingress port" {
     const MemoryPort = @import("../port/memory.zig").MemoryPort;
     var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
@@ -4012,6 +4340,50 @@ test "rp_filter drops sources not reachable from the ingress port" {
     try fwd.handle(testing.io, frame[0..allowed], port_a);
     try testing.expectEqual(@as(usize, 1), b.queuedTx());
     try testing.expectEqual(@as(u64, 1), fwd.counters.firewall_spoofed);
+}
+
+test "bridge storm control drops excess flooded frames" {
+    const MemoryPort = @import("../port/memory.zig").MemoryPort;
+    var a = MemoryPort.init(testing.allocator, port_a, "a", 1500);
+    defer a.deinit();
+    a.mac = port_a_mac;
+    var b = MemoryPort.init(testing.allocator, port_b, "b", 1500);
+    defer b.deinit();
+    b.mac = port_b_mac;
+
+    const entries = [2]PortEntry{
+        .{ .id = port_a, .config_name = "a", .port = a.port() },
+        .{ .id = port_b, .config_name = "b", .port = b.port() },
+    };
+    const json =
+        \\{
+        \\  "version": 1,
+        \\  "instance": "storm",
+        \\  "ports": {
+        \\    "a": { "kind": "l2", "device": "a", "storm_control": 1 },
+        \\    "b": { "kind": "l2", "device": "b" }
+        \\  },
+        \\  "bridges": { "br0": { "ports": ["a", "b"] } }
+        \\}
+    ;
+    var parsed = try config_parse.parse(testing.allocator, json);
+    defer parsed.deinit();
+    var fwd = try Forwarder.fromConfig(testing.allocator, testing.io, &parsed.config, &entries);
+    defer fwd.deinit();
+
+    var frame: [128]u8 = undefined;
+    const hlen = try ethernet.write(
+        &frame,
+        types.Mac.broadcast,
+        host_a_mac,
+        0x88b5,
+        null,
+    );
+    @memcpy(frame[hlen..][0..4], "floo");
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_a);
+    try fwd.handle(testing.io, frame[0 .. hlen + 4], port_a);
+    try testing.expectEqual(@as(usize, 1), b.queuedTx());
+    try testing.expectEqual(@as(u64, 1), fwd.counters.storm_dropped);
 }
 
 test "bridge forwards frames and serves dhcp on any member" {
