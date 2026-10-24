@@ -1,8 +1,8 @@
 const std = @import("std");
-const vnat = @import("vnat");
+const vrouter = @import("vrouter");
 
 const max_config_bytes = 4 * 1024 * 1024;
-const default_config = "/etc/vnat/vnat.json";
+const default_config = "/etc/vrouter/vrouter.json";
 
 var stop = std.atomic.Value(bool).init(false);
 
@@ -13,7 +13,7 @@ fn handleSignal(_: std.posix.SIG) callconv(.c) void {
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "vnatd: {s}\n", .{@errorName(err)}) catch "vnatd: error\n";
+        const msg = std.fmt.bufPrint(&buf, "vrouterd: {s}\n", .{@errorName(err)}) catch "vrouterd: error\n";
         std.Io.File.stderr().writeStreamingAll(init.io, msg) catch {};
         std.process.exit(1);
     };
@@ -49,9 +49,9 @@ fn run(init: std.process.Init) !void {
     );
     defer gpa.free(source);
 
-    var parsed = try vnat.config_parse.parse(gpa, source);
+    var parsed = try vrouter.config_parse.parse(gpa, source);
     defer parsed.deinit();
-    try vnat.config_validate.validate(&parsed.config);
+    try vrouter.config_validate.validate(&parsed.config);
 
     const action = std.posix.Sigaction{
         .handler = .{ .handler = handleSignal },
@@ -61,20 +61,20 @@ fn run(init: std.process.Init) !void {
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
 
-    const run_dir = init.environ_map.get("VNAT_RUN_DIR") orelse "/run/vnat";
-    try vnat.app_service.run(io, gpa, &parsed.config, &stop, .{
+    const run_dir = init.environ_map.get("VROUTER_RUN_DIR") orelse "/run/vrouter";
+    try vrouter.app_service.run(io, gpa, &parsed.config, &stop, .{
         .state_dir = run_dir,
     });
 }
 
 fn usage(io: std.Io) !void {
     try std.Io.File.stdout().writeStreamingAll(io,
-        \\vnatd — vNAT daemon
+        \\vrouterd — vRouter daemon
         \\
         \\Usage:
-        \\  vnatd [-c <config.json>]
+        \\  vrouterd [-c <config.json>]
         \\
-        \\Defaults to /etc/vnat/vnat.json. Stops on SIGINT or SIGTERM.
+        \\Defaults to /etc/vrouter/vrouter.json. Stops on SIGINT or SIGTERM.
         \\
     );
 }

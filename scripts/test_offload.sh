@@ -6,16 +6,16 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ "${VNAT_OFFLOAD_NETNS:-0}" != "1" ]; then
+if [ "${VROUTER_OFFLOAD_NETNS:-0}" != "1" ]; then
     ZIG="${ZIG:-zig}"
     command -v "$ZIG" >/dev/null 2>&1 || {
         echo "FAIL: zig not found (set ZIG=/path/to/zig)" >&2
         exit 1
     }
     if [ "${EUID}" -eq 0 ]; then
-        exec unshare -n env VNAT_OFFLOAD_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+        exec unshare -n env VROUTER_OFFLOAD_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
     fi
-    exec unshare -rn env VNAT_OFFLOAD_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+    exec unshare -rn env VROUTER_OFFLOAD_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
 fi
 
 ZIG="${ZIG:-zig}"
@@ -25,12 +25,12 @@ command -v "$ZIG" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
-export VNAT_RUN_DIR="$WORK/run"
+export VROUTER_RUN_DIR="$WORK/run"
 BIN="$ROOT/zig-out/bin"
 CFG="$WORK/offload.json"
 CFG_STP="$WORK/offload-stp.json"
-LOG="$WORK/vnatd.log"
-LOG_STP="$WORK/vnatd-stp.log"
+LOG="$WORK/vrouterd.log"
+LOG_STP="$WORK/vrouterd-stp.log"
 
 vpid=""
 pidA=""
@@ -39,8 +39,8 @@ pidU=""
 
 cleanup() {
     [ -n "$vpid" ] && kill -TERM "$vpid" 2>/dev/null || true
-    if [ -f "$CFG" ] && [ -x "$BIN/vnat" ]; then
-        "$BIN/vnat" down -c "$CFG" >/dev/null 2>&1 || true
+    if [ -f "$CFG" ] && [ -x "$BIN/vrouter" ]; then
+        "$BIN/vrouter" down -c "$CFG" >/dev/null 2>&1 || true
     fi
     [ -n "$pidA" ] && kill "$pidA" 2>/dev/null || true
     [ -n "$pidB" ] && kill "$pidB" 2>/dev/null || true
@@ -182,25 +182,25 @@ done
 ip link set pw up || die "bring wan port up"
 ok "clients 10.30.40.2/3 and upstream 192.0.2.2"
 
-log "vnatd"
-"$BIN/vnatd" -c "$CFG" >"$LOG" 2>&1 &
+log "vrouterd"
+"$BIN/vrouterd" -c "$CFG" >"$LOG" 2>&1 &
 vpid=$!
 for i in $(seq 1 100); do
     grep -q "started instance" "$LOG" && break
     if ! kill -0 "$vpid" 2>/dev/null; then
         cat "$LOG"
-        die "vnatd exited"
+        die "vrouterd exited"
     fi
     sleep 0.02
 done
 grep -q "started instance" "$LOG" || {
     cat "$LOG"
-    die "vnatd did not start"
+    die "vrouterd did not start"
 }
 
 BR="$(sed -n 's/.*kernel=\([^ ]*\).*/\1/p' "$LOG" | head -1)"
 TRUNK="$(sed -n 's/.*trunk=\([^ ]*\).*/\1/p' "$LOG" | head -1)"
-BRIDGE_SIDE="vnatb${TRUNK#vnatp}"
+BRIDGE_SIDE="vrbs${TRUNK#vrpt}"
 [ -n "$BR" ] && [ -n "$TRUNK" ] || {
     cat "$LOG"
     die "missing offload device names"
@@ -263,15 +263,15 @@ vpid=""
 grep -Eq "snat=[1-9][0-9]*" "$LOG" || die "no SNAT counters"
 ok "10.30.40.2 -> 192.0.2.2 with masquerade"
 
-"$BIN/vnat" down -c "$CFG" || die "first vnat down failed"
+"$BIN/vrouter" down -c "$CFG" || die "first vrouter down failed"
 log "kernel STP"
-"$BIN/vnatd" -c "$CFG_STP" >"$LOG_STP" 2>&1 &
+"$BIN/vrouterd" -c "$CFG_STP" >"$LOG_STP" 2>&1 &
 vpid=$!
 for i in $(seq 1 100); do
     grep -q "started instance" "$LOG_STP" && break
     if ! kill -0 "$vpid" 2>/dev/null; then
         cat "$LOG_STP"
-        die "vnatd (STP) exited"
+        die "vrouterd (STP) exited"
     fi
     sleep 0.02
 done
@@ -287,23 +287,23 @@ log "rollback"
 kill -TERM "$vpid"
 wait "$vpid" 2>/dev/null || true
 vpid=""
-"$BIN/vnat" down -c "$CFG_STP" || die "vnat down failed"
+"$BIN/vrouter" down -c "$CFG_STP" || die "vrouter down failed"
 for dev in "$BR" "$BR_STP" "$TRUNK"; do
     if ip link show dev "$dev" >/dev/null 2>&1; then
-        die "$dev survived vnat down"
+        die "$dev survived vrouter down"
     fi
 done
 for dev in pa pb; do
     if ip -o link show dev "$dev" | grep -q "master "; then
-        die "$dev kept its master after vnat down"
+        die "$dev kept its master after vrouter down"
     fi
     ip -o link show dev "$dev" | grep -q "state DOWN" ||
         die "$dev was not restored to down"
 done
-[ "$("$BIN/vnat" journal -c "$CFG" 2>&1)" = "no journal" ] ||
+[ "$("$BIN/vrouter" journal -c "$CFG" 2>&1)" = "no journal" ] ||
     die "journal was not truncated"
 ok "kernel bridge, veth, VLANs, and link state restored"
 
-echo "--- vnatd ---"
+echo "--- vrouterd ---"
 cat "$LOG"
 ok "test_offload"

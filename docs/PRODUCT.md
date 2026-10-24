@@ -1,4 +1,4 @@
-# vNAT — Product Definition
+# vRouter — Product Definition
 
 > Status: planning. Supersedes the overlay-first framing in the earlier draft.
 > Companion docs: [CORE-SCOPE.md](./CORE-SCOPE.md),
@@ -7,7 +7,7 @@
 
 ## 1. One sentence
 
-**vNAT turns a Linux machine or an Android device into an opt-in, portable
+**vRouter turns a Linux machine or an Android device into an opt-in, portable
 virtual router**: it attaches to L2/L3 interfaces, bridges or routes between
 them, and provides NAT, DHCP, DNS, firewall and port forwarding — with no GUI
 in v1, just a daemon and a CLI/API. An optional local web admin is post-v1.
@@ -20,14 +20,14 @@ has multiple NICs. What is missing is a **portable, scriptable, auditable
 routing engine** that can use those interfaces on demand, without flashing
 OpenWrt, without a cloud account, and without a GUI in v1.
 
-vNAT is that engine. It is *opt-in*: nothing changes on the host until the user
+vRouter is that engine. It is *opt-in*: nothing changes on the host until the user
 starts it, and everything it changes is journaled and rolled back.
 
 ## 3. Target user and use cases
 
 | Persona | Scenario |
 |---|---|
-| Traveler | Phone on hotel Wi-Fi; laptop and tablet connect over hotspot/USB tethering; vNAT is the router doing DHCP/NAT/DNS/firewall |
+| Traveler | Phone on hotel Wi-Fi; laptop and tablet connect over hotspot/USB tethering; vRouter is the router doing DHCP/NAT/DNS/firewall |
 | Field engineer | USB-C Ethernet on a phone/laptop; share link to a small LAN; capture traffic; port-forward a device |
 | Homelab / dev | Linux box with 2–4 NICs; bridge a lab segment, route between VLANs, NAT to uplink |
 | Privacy-conscious user | Android VPN-mode router that applies per-app routing/NAT/firewall on-device |
@@ -37,7 +37,7 @@ starts it, and everything it changes is journaled and rolled back.
 
 ```
                  ┌──────────────────────────────────────────┐
-   uplink ───────┤  vNAT core (userspace router)            │
+   uplink ───────┤  vRouter core (userspace router)         │
    (eth/wlan/    │                                          │
     usb/wwan)    │  L2 bridge · L3 router · NAT · firewall  │──── LAN ports
                  │  DHCPv4 · DNS · conntrack · port forward │     (eth/usb/ap)
@@ -48,11 +48,11 @@ starts it, and everything it changes is journaled and rolled back.
 ```
 
 - **Core:** Zig library implementing the datapath and control plane.
-- **`vnatd`:** headless daemon, config-driven, journaled side effects.
-- **`vnat`:** CLI (also embeds the daemon for foreground use).
+- **`vrouterd`:** headless daemon, config-driven, journaled side effects.
+- **`vrouter`:** CLI (also embeds the daemon for foreground use).
 - **Android:** host app is thin — it supplies `VpnService` fd / root
   capabilities and renders status; all routing logic is in the core.
-- **No GUI in v1.** JSON output + `vnat status --watch` is the UI. An optional
+- **No GUI in v1.** JSON output + `vrouter status --watch` is the UI. An optional
   post-v1 local web admin consumes the same Unix-socket API; it is not part of
   v1 and never mutates host state directly (ADR-011).
 
@@ -74,7 +74,7 @@ starts it, and everything it changes is journaled and rolled back.
 
 ## 6. Capability tiers
 
-| Tier | Platform | What vNAT can do |
+| Tier | Platform | What vRouter can do |
 |---|---|---|
 | **T1 — Linux native** | Linux (root or `CAP_NET_ADMIN`+`CAP_NET_RAW`) | Everything: L2 AF_PACKET, TUN/TAP, netlink, bridge, NAT, DHCP, DNS, firewall, namespaces |
 | **T2 — Android VPN** | Android, no root | On-device router: `VpnService` L3 port + protected uplink sockets; NAT/DNS/firewall for apps in the VPN profile |
@@ -99,24 +99,24 @@ release if root testing hardware is available; **T4** is post-v1.
 
 ## 8. Success criteria for v1
 
-1. Linux: two NICs + NAT + DHCP + DNS works on a bare box; `vnat down` leaves
+1. Linux: two NICs + NAT + DHCP + DNS works on a bare box; `vrouter down` leaves
    the host exactly as it was.
 2. Linux: L2 bridge between two NICs passes tagged and untagged traffic; STP
    optional.
-3. Android (no root): apps under the VPN reach the internet through vNAT's NAT;
+3. Android (no root): apps under the VPN reach the internet through vRouter's NAT;
    per-app include/exclude works; survives network switch and reboot.
-4. Android (root): a tethered laptop gets DHCP from vNAT and reaches the
-   internet through vNAT's NAT, not the OS tethering NAT.
+4. Android (root): a tethered laptop gets DHCP from vRouter and reaches the
+   internet through vRouter's NAT, not the OS tethering NAT.
 5. 24 h soak with interface flaps, no leaks, no stale rules.
 6. Throughput: Linux ≥ 1 Gbps forwarded on loopback/veth; Android ≥ 150 Mbps
    in VPN mode, ≥ 300 Mbps in root mode (device-dependent).
-7. Every mutation is visible in `vnat journal` and reversible.
+7. Every mutation is visible in `vrouter journal` and reversible.
 
 ## 9. Naming and packaging
 
-- Project: `vnat`
-- Binaries: `vnat`, `vnatd`
-- Library: `libvnat` / `libvnat.a`
-- Config: `/etc/vnat/vnat.json` (Linux), app-private dir (Android)
-- State/journal: `/var/lib/vnat/` (Linux)
+- Project: `vrouter`
+- Binaries: `vrouter`, `vrouterd`
+- Library: `libvrouter` / `libvrouter.a`
+- Config: `/etc/vrouter/vrouter.json` (Linux), app-private dir (Android)
+- State/journal: `/var/lib/vrouter/` (Linux)
 - License: Apache-2.0

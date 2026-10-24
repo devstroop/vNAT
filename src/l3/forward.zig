@@ -839,7 +839,7 @@ pub const Forwarder = struct {
     };
 
     /// Evaluates a synthetic packet against the compiled rule set. Intended for
-    /// `vnat firewall test`; it never touches a real port.
+    /// `vrouter firewall test`; it never touches a real port.
     pub fn probeFirewallConfig(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -4409,7 +4409,7 @@ test "forwarder builds state from config" {
 
 test "kernel offload bridge maps its veth trunk as one synthetic member" {
     const MemoryPort = @import("../port/memory.zig").MemoryPort;
-    var trunk = MemoryPort.init(testing.allocator, port_a, "vnatp0", 1500);
+    var trunk = MemoryPort.init(testing.allocator, port_a, "vrouterp0", 1500);
     defer trunk.deinit();
     trunk.mac = port_a_mac;
 

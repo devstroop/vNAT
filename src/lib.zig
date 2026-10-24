@@ -1,4 +1,4 @@
-//! vNAT core library root.
+//! vRouter core library root.
 
 const std = @import("std");
 const builtin = @import("builtin");

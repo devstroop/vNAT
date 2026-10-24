@@ -1,8 +1,8 @@
 const std = @import("std");
-const vnat = @import("vnat");
+const vrouter = @import("vrouter");
 
 const max_config_bytes = 4 * 1024 * 1024;
-const default_config = "/etc/vnat/vnat.json";
+const default_config = "/etc/vrouter/vrouter.json";
 
 const DhcpLeaseWire = struct {
     server: []const u8,
@@ -21,7 +21,7 @@ const DhcpLeaseDbWire = struct {
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "vnat: {s}\n", .{@errorName(err)}) catch "vnat: error\n";
+        const msg = std.fmt.bufPrint(&buf, "vrouter: {s}\n", .{@errorName(err)}) catch "vrouter: error\n";
         std.Io.File.stderr().writeStreamingAll(init.io, msg) catch {};
         std.process.exit(1);
     };
@@ -43,7 +43,7 @@ fn run(init: std.process.Init) !void {
         std.mem.eql(u8, cmd, "--version") or
         std.mem.eql(u8, cmd, "-V"))
     {
-        try print(io, gpa, "vnat {s}\n", .{vnat.version});
+        try print(io, gpa, "vrouter {s}\n", .{vrouter.version});
         return;
     }
 
@@ -172,21 +172,21 @@ fn splitConfig(args: []const []const u8) ConfigArgs {
 }
 
 fn stateDir(init: std.process.Init) []const u8 {
-    return init.environ_map.get("VNAT_RUN_DIR") orelse "/run/vnat";
+    return init.environ_map.get("VROUTER_RUN_DIR") orelse "/run/vrouter";
 }
 
-fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !vnat.config_parse.Parsed {
+fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !vrouter.config_parse.Parsed {
     const source = try readConfig(io, gpa, path);
     defer gpa.free(source);
 
-    var parsed = try vnat.config_parse.parse(gpa, source);
+    var parsed = try vrouter.config_parse.parse(gpa, source);
     errdefer parsed.deinit();
-    try vnat.config_validate.validate(&parsed.config);
+    try vrouter.config_validate.validate(&parsed.config);
     return parsed;
 }
 
-fn openHost(init: std.process.Init, parsed: *const vnat.config_parse.Parsed) !vnat.control_host.Host {
-    return vnat.control_host.Host.init(
+fn openHost(init: std.process.Init, parsed: *const vrouter.config_parse.Parsed) !vrouter.control_host.Host {
+    return vrouter.control_host.Host.init(
         init.io,
         init.gpa,
         stateDir(init),
@@ -196,10 +196,10 @@ fn openHost(init: std.process.Init, parsed: *const vnat.config_parse.Parsed) !vn
 
 fn reportHostError(io: std.Io, gpa: std.mem.Allocator, action: []const u8, err: anyerror) !void {
     if (err == error.NotManaged) {
-        try printErr(io, gpa, "vnat: {s}: not managed by vnat (use ip addr/route del)\n", .{action});
+        try printErr(io, gpa, "vrouter: {s}: not managed by vrouter (use ip addr/route del)\n", .{action});
         return;
     }
-    try printErr(io, gpa, "vnat: {s}: {s}\n", .{ action, @errorName(err) });
+    try printErr(io, gpa, "vrouter: {s}: {s}\n", .{ action, @errorName(err) });
 }
 
 fn ifaceCommand(init: std.process.Init, args: []const []const u8) !void {
@@ -231,7 +231,7 @@ fn ifaceCommand(init: std.process.Init, args: []const []const u8) !void {
         }
         const change = host.ifaceSet(cfg.rest[1], cfg.rest[2]) catch |err| {
             if (err == error.Busy) {
-                try printErr(io, gpa, "vnat: iface set: address already exists and is not managed by vnat\n", .{});
+                try printErr(io, gpa, "vrouter: iface set: address already exists and is not managed by vrouter\n", .{});
                 std.process.exit(1);
             }
             try reportHostError(io, gpa, "iface set", err);
@@ -371,7 +371,7 @@ fn routeCommand(init: std.process.Init, args: []const []const u8) !void {
     const change = if (add)
         host.routeAdd(dst_text, via, dev_text, metric, table) catch |err| {
             if (err == error.Busy) {
-                try printErr(io, gpa, "vnat: route add: route already exists and is not managed by vnat\n", .{});
+                try printErr(io, gpa, "vrouter: route add: route already exists and is not managed by vrouter\n", .{});
                 std.process.exit(1);
             }
             try reportHostError(io, gpa, "route add", err);
@@ -486,7 +486,7 @@ fn upCommand(init: std.process.Init, args: []const []const u8) !void {
     }
 
     var log_buf: [512]u8 = undefined;
-    const log_path = std.fmt.bufPrint(&log_buf, "{s}/vnatd.log", .{state_dir}) catch {
+    const log_path = std.fmt.bufPrint(&log_buf, "{s}/vrouterd.log", .{state_dir}) catch {
         try printErr(io, gpa, "daemon log path is too long\n", .{});
         std.process.exit(1);
     };
@@ -499,18 +499,18 @@ fn upCommand(init: std.process.Init, args: []const []const u8) !void {
     };
     defer log_file.close(io);
 
-    const configured = init.environ_map.get("VNATD");
+    const configured = init.environ_map.get("VROUTERD");
     var daemon_alloc: ?[]u8 = null;
     defer if (daemon_alloc) |value| gpa.free(value);
     const daemon = configured orelse blk: {
         const executable = std.process.executablePathAlloc(io, gpa) catch |err| {
-            try printErr(io, gpa, "locate vnat: {s}\n", .{@errorName(err)});
+            try printErr(io, gpa, "locate vrouter: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         defer gpa.free(executable);
         const dir = std.fs.path.dirname(executable) orelse ".";
-        const sibling = std.fs.path.join(gpa, &.{ dir, "vnatd" }) catch |err| {
-            try printErr(io, gpa, "locate vnatd: {s}\n", .{@errorName(err)});
+        const sibling = std.fs.path.join(gpa, &.{ dir, "vrouterd" }) catch |err| {
+            try printErr(io, gpa, "locate vrouterd: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         daemon_alloc = sibling;
@@ -560,14 +560,14 @@ fn waitForDaemon(
                 std.process.exit(1);
             }
             if (log_path) |lp| {
-                try print(io, gpa, "ok: vnatd pid={d} instance={s} socket={s} log={s}\n", .{
+                try print(io, gpa, "ok: vrouterd pid={d} instance={s} socket={s} log={s}\n", .{
                     status.value.status.?.pid,
                     status.value.status.?.instance,
                     path,
                     lp,
                 });
             } else {
-                try print(io, gpa, "ok: vnatd pid={d} instance={s} socket={s}\n", .{
+                try print(io, gpa, "ok: vrouterd pid={d} instance={s} socket={s}\n", .{
                     status.value.status.?.pid,
                     status.value.status.?.instance,
                     path,
@@ -578,21 +578,21 @@ fn waitForDaemon(
     }
 
     if (spawned_pid) |pid| {
-        try printErr(io, gpa, "vnat: vnatd pid={d} did not publish {s} within 5s; log: {s}\n", .{
+        try printErr(io, gpa, "vrouter: vrouterd pid={d} did not publish {s} within 5s; log: {s}\n", .{
             pid,
             path,
             log_path.?,
         });
         try printLogTail(io, gpa, log_path.?);
     } else {
-        try printErr(io, gpa, "vnat: another vnatd is starting but did not publish {s} within 5s\n", .{path});
+        try printErr(io, gpa, "vrouter: another vrouterd is starting but did not publish {s} within 5s\n", .{path});
     }
     std.process.exit(1);
 }
 
 fn printLogTail(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
-        try printErr(io, gpa, "vnat: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        try printErr(io, gpa, "vrouter: cannot read {s}: {s}\n", .{ path, @errorName(err) });
         return;
     };
     defer file.close(io);
@@ -694,7 +694,7 @@ fn natCommand(init: std.process.Init, args: []const []const u8) !void {
     const gpa = init.gpa;
     const cfg = splitConfig(args);
     if (cfg.rest.len != 1 or !std.mem.eql(u8, cfg.rest[0], "list")) {
-        try printErr(io, gpa, "usage: vnat nat list [-c <config>]\n", .{});
+        try printErr(io, gpa, "usage: vrouter nat list [-c <config>]\n", .{});
         std.process.exit(2);
     }
 
@@ -757,7 +757,7 @@ fn conntrackCommand(init: std.process.Init, args: []const []const u8) !void {
     const gpa = init.gpa;
     const cfg = splitConfig(args);
     if (cfg.rest.len == 0 or !std.mem.eql(u8, cfg.rest[0], "list")) {
-        try printErr(io, gpa, "usage: vnat conntrack list [--state <state>] [--limit <n>] [-c <config>]\n", .{});
+        try printErr(io, gpa, "usage: vrouter conntrack list [--state <state>] [--limit <n>] [-c <config>]\n", .{});
         std.process.exit(2);
     }
 
@@ -872,8 +872,8 @@ fn controlCall(
     op: []const u8,
     state_filter: ?[]const u8,
     limit: ?u32,
-) !std.json.Parsed(vnat.control_protocol.Response) {
-    var client = try vnat.control_client.Client.connect(io, gpa, path);
+) !std.json.Parsed(vrouter.control_protocol.Response) {
+    var client = try vrouter.control_client.Client.connect(io, gpa, path);
     defer client.deinit();
     return client.callOp(op, state_filter, limit);
 }
@@ -882,7 +882,7 @@ fn queryStatus(
     io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
-) !std.json.Parsed(vnat.control_protocol.Response) {
+) !std.json.Parsed(vrouter.control_protocol.Response) {
     return controlCall(io, gpa, path, "status", null, null);
 }
 
@@ -945,7 +945,7 @@ fn downCommand(init: std.process.Init, args: []const []const u8) !void {
         std.process.exit(1);
     };
     if (locked) {
-        try printErr(io, gpa, "vnat: daemon is running or starting; stop vnatd first\n", .{});
+        try printErr(io, gpa, "vrouter: daemon is running or starting; stop vrouterd first\n", .{});
         std.process.exit(1);
     }
     if (queryStatus(io, gpa, path)) |response| {
@@ -954,7 +954,7 @@ fn downCommand(init: std.process.Init, args: []const []const u8) !void {
         if (status.value.ok and
             std.mem.eql(u8, status.value.status.?.instance, parsed.config.instance))
         {
-            try printErr(io, gpa, "vnat: daemon pid={d} is running; stop vnatd first\n", .{
+            try printErr(io, gpa, "vrouter: daemon pid={d} is running; stop vrouterd first\n", .{
                 status.value.status.?.pid,
             });
             std.process.exit(1);
@@ -979,7 +979,7 @@ fn downCommand(init: std.process.Init, args: []const []const u8) !void {
     };
 
     if (result.failed != 0) {
-        try printErr(io, gpa, "vnat: restored {d}, failed {d}; journal retained\n", .{
+        try printErr(io, gpa, "vrouter: restored {d}, failed {d}; journal retained\n", .{
             result.restored,
             result.failed,
         });
@@ -1043,13 +1043,13 @@ fn validateFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u8 {
     };
     defer gpa.free(source);
 
-    var parsed = vnat.config_parse.parse(gpa, source) catch |err| {
+    var parsed = vrouter.config_parse.parse(gpa, source) catch |err| {
         try printErr(io, gpa, "{s}: invalid config: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     defer parsed.deinit();
 
-    vnat.config_validate.validate(&parsed.config) catch |err| {
+    vrouter.config_validate.validate(&parsed.config) catch |err| {
         try printErr(io, gpa, "{s}: invalid config: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
@@ -1070,18 +1070,18 @@ fn statusFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u8 {
     };
     defer gpa.free(source);
 
-    var parsed = vnat.config_parse.parse(gpa, source) catch |err| {
+    var parsed = vrouter.config_parse.parse(gpa, source) catch |err| {
         try printErr(io, gpa, "{s}: invalid config: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     defer parsed.deinit();
 
-    vnat.config_validate.validate(&parsed.config) catch |err| {
+    vrouter.config_validate.validate(&parsed.config) catch |err| {
         try printErr(io, gpa, "{s}: invalid config: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
 
-    var manager = vnat.manager.Manager.openFromConfig(gpa, io, &parsed.config) catch |err| {
+    var manager = vrouter.manager.Manager.openFromConfig(gpa, io, &parsed.config) catch |err| {
         try printErr(io, gpa, "open ports: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -1188,7 +1188,7 @@ fn bridgeCommand(init: std.process.Init, args: []const []const u8) !void {
 }
 
 fn portList(io: std.Io, gpa: std.mem.Allocator) !u8 {
-    const links = vnat.linux_ports.netlink.listLinks(io, gpa) catch |err| {
+    const links = vrouter.linux_ports.netlink.listLinks(io, gpa) catch |err| {
         try printErr(io, gpa, "netlink: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -1214,13 +1214,13 @@ fn portList(io: std.Io, gpa: std.mem.Allocator) !u8 {
 
 fn selfTest(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     if (args.len == 0) {
-        try printErr(io, gpa, "usage: vnat selftest l2 <inject> <port-a> <port-b> <recv>\n", .{});
+        try printErr(io, gpa, "usage: vrouter selftest l2 <inject> <port-a> <port-b> <recv>\n", .{});
         return 2;
     }
 
     if (std.mem.eql(u8, args[0], "l2")) {
         if (args.len != 5) {
-            try printErr(io, gpa, "usage: vnat selftest l2 <inject> <port-a> <port-b> <recv>\n", .{});
+            try printErr(io, gpa, "usage: vrouter selftest l2 <inject> <port-a> <port-b> <recv>\n", .{});
             return 2;
         }
         selfTestL2(io, gpa, args[1..5]) catch |err| {
@@ -1232,7 +1232,7 @@ fn selfTest(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
 
     if (std.mem.eql(u8, args[0], "tun") or std.mem.eql(u8, args[0], "tap")) {
         if (args.len != 2) {
-            try printErr(io, gpa, "usage: vnat selftest tun|tap <name>\n", .{});
+            try printErr(io, gpa, "usage: vrouter selftest tun|tap <name>\n", .{});
             return 2;
         }
         const tap = std.mem.eql(u8, args[0], "tap");
@@ -1252,7 +1252,7 @@ fn selfTestL2(io: std.Io, gpa: std.mem.Allocator, names: []const []const u8) !vo
     defer arena.deinit();
     const a = arena.allocator();
 
-    const af = vnat.linux_ports.af_packet;
+    const af = vrouter.linux_ports.af_packet;
     const inject = try af.AfPacketPort.open(a, io, .{ .value = 1 }, .{ .name = names[0] });
     defer inject.port().deinit(io);
     const in_port = try af.AfPacketPort.open(a, io, .{ .value = 2 }, .{ .name = names[1] });
@@ -1285,7 +1285,7 @@ fn selfTestTun(io: std.Io, gpa: std.mem.Allocator, name: []const u8, tap: bool) 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const tun = vnat.linux_ports.tun;
+    const tun = vrouter.linux_ports.tun;
     const p = try tun.TunPort.open(arena.allocator(), io, .{ .value = 1 }, .{
         .name = name,
         .tap = tap,
@@ -1308,7 +1308,7 @@ fn selfTestTun(io: std.Io, gpa: std.mem.Allocator, name: []const u8, tap: bool) 
 /// unrelated IPv6/ND traffic). Returns the matching frame length.
 fn readMatching(
     io: std.Io,
-    port: vnat.Port,
+    port: vrouter.Port,
     buf: []u8,
     expected: []const u8,
     timeout_ms: u64,
@@ -1402,7 +1402,7 @@ fn firewallCounters(init: std.process.Init, path: []const u8) !void {
     };
     defer parsed.deinit();
 
-    var loaded = vnat.firewall_counters.load(
+    var loaded = vrouter.firewall_counters.load(
         io,
         gpa,
         stateDir(init),
@@ -1411,7 +1411,7 @@ fn firewallCounters(init: std.process.Init, path: []const u8) !void {
         try printErr(io, gpa, "cannot read firewall counters: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     } orelse {
-        try printErr(io, gpa, "no firewall counters for {s} (is vnatd running?)\n", .{
+        try printErr(io, gpa, "no firewall counters for {s} (is vrouterd running?)\n", .{
             parsed.config.instance,
         });
         std.process.exit(1);
@@ -1447,14 +1447,14 @@ fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const 
     const gpa = init.gpa;
 
     var proto: ?u8 = null;
-    var src: ?vnat.types.Ipv4 = null;
-    var dst: ?vnat.types.Ipv4 = null;
+    var src: ?vrouter.types.Ipv4 = null;
+    var dst: ?vrouter.types.Ipv4 = null;
     var sport: ?u16 = null;
     var dport: ?u16 = null;
     var iif: ?[]const u8 = null;
     var oif: ?[]const u8 = null;
-    var state: vnat.config_schema.FirewallCtState = .new;
-    var hook: vnat.forward.Forwarder.FirewallHook = .forward;
+    var state: vrouter.config_schema.FirewallCtState = .new;
+    var hook: vrouter.forward.Forwarder.FirewallHook = .forward;
 
     var i: usize = 0;
     while (i < args.len) {
@@ -1464,33 +1464,33 @@ fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const 
             return;
         }
         if (i + 1 >= args.len) {
-            try printErr(io, gpa, "vnat: firewall test: missing value for {s}\n", .{flag});
+            try printErr(io, gpa, "vrouter: firewall test: missing value for {s}\n", .{flag});
             std.process.exit(2);
         }
         const value = args[i + 1];
         if (std.mem.eql(u8, flag, "--proto")) {
             proto = parseProto(value) orelse {
-                try printErr(io, gpa, "vnat: firewall test: invalid protocol '{s}'\n", .{value});
+                try printErr(io, gpa, "vrouter: firewall test: invalid protocol '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--src")) {
-            src = vnat.types.Ipv4.parse(value) catch {
-                try printErr(io, gpa, "vnat: firewall test: invalid source '{s}'\n", .{value});
+            src = vrouter.types.Ipv4.parse(value) catch {
+                try printErr(io, gpa, "vrouter: firewall test: invalid source '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--dst")) {
-            dst = vnat.types.Ipv4.parse(value) catch {
-                try printErr(io, gpa, "vnat: firewall test: invalid destination '{s}'\n", .{value});
+            dst = vrouter.types.Ipv4.parse(value) catch {
+                try printErr(io, gpa, "vrouter: firewall test: invalid destination '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--sport")) {
             sport = parsePort(value) orelse {
-                try printErr(io, gpa, "vnat: firewall test: invalid source port '{s}'\n", .{value});
+                try printErr(io, gpa, "vrouter: firewall test: invalid source port '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--dport")) {
             dport = parsePort(value) orelse {
-                try printErr(io, gpa, "vnat: firewall test: invalid destination port '{s}'\n", .{value});
+                try printErr(io, gpa, "vrouter: firewall test: invalid destination port '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--iif")) {
@@ -1499,27 +1499,27 @@ fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const 
             oif = value;
         } else if (std.mem.eql(u8, flag, "--state")) {
             state = parseCtState(value) orelse {
-                try printErr(io, gpa, "vnat: firewall test: invalid state '{s}'\n", .{value});
+                try printErr(io, gpa, "vrouter: firewall test: invalid state '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, flag, "--hook")) {
             hook = parseHook(value) orelse {
-                try printErr(io, gpa, "vnat: firewall test: invalid hook '{s}'\n", .{value});
+                try printErr(io, gpa, "vrouter: firewall test: invalid hook '{s}'\n", .{value});
                 std.process.exit(2);
             };
         } else {
-            try printErr(io, gpa, "vnat: firewall test: unknown option '{s}'\n", .{flag});
+            try printErr(io, gpa, "vrouter: firewall test: unknown option '{s}'\n", .{flag});
             std.process.exit(2);
         }
         i += 2;
     }
 
     if (proto == null or src == null or dst == null) {
-        try printErr(io, gpa, "vnat: firewall test requires --proto, --src and --dst\n", .{});
+        try printErr(io, gpa, "vrouter: firewall test requires --proto, --src and --dst\n", .{});
         std.process.exit(2);
     }
     if ((sport != null or dport != null) and proto != 6 and proto != 17) {
-        try printErr(io, gpa, "vnat: firewall test: ports require --proto tcp|udp\n", .{});
+        try printErr(io, gpa, "vrouter: firewall test: ports require --proto tcp|udp\n", .{});
         std.process.exit(2);
     }
 
@@ -1529,7 +1529,7 @@ fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const 
     };
     defer parsed.deinit();
 
-    const result = vnat.forward.Forwarder.probeFirewallConfig(
+    const result = vrouter.forward.Forwarder.probeFirewallConfig(
         gpa,
         io,
         &parsed.config,
@@ -1545,7 +1545,7 @@ fn firewallTest(init: std.process.Init, path: []const u8, args: []const []const 
             .hook = hook,
         },
     ) catch |err| {
-        try printErr(io, gpa, "vnat: firewall test: {s}\n", .{@errorName(err)});
+        try printErr(io, gpa, "vrouter: firewall test: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
@@ -1569,7 +1569,7 @@ fn parsePort(text: []const u8) ?u16 {
     return value;
 }
 
-fn parseCtState(text: []const u8) ?vnat.config_schema.FirewallCtState {
+fn parseCtState(text: []const u8) ?vrouter.config_schema.FirewallCtState {
     if (std.mem.eql(u8, text, "new")) return .new;
     if (std.mem.eql(u8, text, "established")) return .established;
     if (std.mem.eql(u8, text, "related")) return .related;
@@ -1577,7 +1577,7 @@ fn parseCtState(text: []const u8) ?vnat.config_schema.FirewallCtState {
     return null;
 }
 
-fn parseHook(text: []const u8) ?vnat.forward.Forwarder.FirewallHook {
+fn parseHook(text: []const u8) ?vrouter.forward.Forwarder.FirewallHook {
     if (std.mem.eql(u8, text, "input")) return .input;
     if (std.mem.eql(u8, text, "forward")) return .forward;
     if (std.mem.eql(u8, text, "output")) return .output;
@@ -1648,7 +1648,7 @@ fn dnsCommand(init: std.process.Init, args: []const []const u8) !void {
     defer parsed.deinit();
 
     const listen_text = parsed.config.dns.listen orelse "127.0.0.1";
-    const listen_ip = vnat.types.Ipv4.parse(listen_text) catch {
+    const listen_ip = vrouter.types.Ipv4.parse(listen_text) catch {
         try printErr(io, gpa, "invalid dns listen address\n", .{});
         std.process.exit(1);
     };
@@ -1746,31 +1746,31 @@ fn dnsCommand(init: std.process.Init, args: []const []const u8) !void {
 
 fn usage(io: std.Io) !void {
     try std.Io.File.stdout().writeStreamingAll(io,
-        \\vnat — portable virtual router
+        \\vrouter — portable virtual router
         \\
         \\Usage:
-        \\  vnat version
-        \\  vnat validate <config.json>
-        \\  vnat port list
-        \\  vnat status [-c] <config.json>
-        \\  vnat up [-c <config>]
-        \\  vnat doctor [-c <config>]
-        \\  vnat nat list [-c <config>]
-        \\  vnat conntrack list [--state new|established|closing] [--limit <n>] [-c <config>]
-        \\  vnat iface set|del <dev> <cidr> [-c <config>]
-        \\  vnat iface up|down <dev> [-c <config>]
-        \\  vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
-        \\  vnat down [-c <config>]
-        \\  vnat journal [-c <config>]
-        \\  vnat bridge list [-c <config>]
-        \\  vnat firewall list [-c <config>]
-        \\  vnat firewall counters [-c <config>]
-        \\  vnat firewall test --proto tcp|udp|icmp --src <ip> --dst <ip> [--sport <n>] [--dport <n>] [--iif <name>] [--oif <name>] [--state new|established|related|invalid] [--hook input|forward|output] [-c <config>]
-        \\  vnat selftest l2 <inject> <port-a> <port-b> <recv>
-        \\  vnat selftest tun|tap <name>
-        \\  vnat help
+        \\  vrouter version
+        \\  vrouter validate <config.json>
+        \\  vrouter port list
+        \\  vrouter status [-c] <config.json>
+        \\  vrouter up [-c <config>]
+        \\  vrouter doctor [-c <config>]
+        \\  vrouter nat list [-c <config>]
+        \\  vrouter conntrack list [--state new|established|closing] [--limit <n>] [-c <config>]
+        \\  vrouter iface set|del <dev> <cidr> [-c <config>]
+        \\  vrouter iface up|down <dev> [-c <config>]
+        \\  vrouter route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
+        \\  vrouter down [-c <config>]
+        \\  vrouter journal [-c <config>]
+        \\  vrouter bridge list [-c <config>]
+        \\  vrouter firewall list [-c <config>]
+        \\  vrouter firewall counters [-c <config>]
+        \\  vrouter firewall test --proto tcp|udp|icmp --src <ip> --dst <ip> [--sport <n>] [--dport <n>] [--iif <name>] [--oif <name>] [--state new|established|related|invalid] [--hook input|forward|output] [-c <config>]
+        \\  vrouter selftest l2 <inject> <port-a> <port-b> <recv>
+        \\  vrouter selftest tun|tap <name>
+        \\  vrouter help
         \\
-        \\Host mutations are journaled under $VNAT_RUN_DIR (default /run/vnat).
+        \\Host mutations are journaled under $VROUTER_RUN_DIR (default /run/vrouter).
         \\
     );
 }

@@ -1,10 +1,13 @@
-# vNAT
+# vRouter
 
 Headless virtual router implemented in Zig 0.16.x.
 
-vNAT attaches network interfaces, forwards Ethernet and IPv4 traffic, and
+vRouter attaches network interfaces, forwards Ethernet and IPv4 traffic, and
 provides NAT, DHCP, DNS, and journal-backed host configuration. It runs as a
 daemon with a command-line interface and exposes a C ABI for embedded hosts.
+
+> **Renamed:** vRouter was previously vNAT. The 0.1.0 release changes binary,
+> ABI and default path names; see [ADR-012](docs/adr/012-project-rename.md).
 
 ## Capabilities
 
@@ -56,26 +59,26 @@ zig build -Dtarget=arm-linux-androideabi
 Validate a configuration:
 
 ```sh
-./zig-out/bin/vnat validate examples/minimal.json
+./zig-out/bin/vrouter validate examples/minimal.json
 ```
 
 Start the daemon:
 
 ```sh
-./zig-out/bin/vnatd -c examples/minimal.json
+./zig-out/bin/vrouterd -c examples/minimal.json
 ```
 
 Common commands:
 
 ```sh
-vnat status [-c <config>]
-vnat port list
-vnat iface set <dev> <cidr> [-c <config>]
-vnat route add <dst> [via <ip>] dev <dev> [-c <config>]
-vnat down [-c <config>]
-vnat journal [-c <config>]
-vnat dhcp status [-c <config>]
-vnat dns query <name> [-c <config>]
+vrouter status [-c <config>]
+vrouter port list
+vrouter iface set <dev> <cidr> [-c <config>]
+vrouter route add <dst> [via <ip>] dev <dev> [-c <config>]
+vrouter down [-c <config>]
+vrouter journal [-c <config>]
+vrouter dhcp status [-c <config>]
+vrouter dns query <name> [-c <config>]
 ```
 
 ## Configuration
@@ -101,7 +104,7 @@ Contributor rules: `AGENTS.md`.
 
 - R0-R4: complete
 - R5-R6: in progress (VLAN bridging and firewall core wired)
-- R7: foundation in progress (C ABI, injected fd port, service lifecycle);
+- R7: Linux control socket and C ABI foundation complete; Android
   JNI/VpnService host and proxy NAT pending
 - R8-R9: planned
 - R10 (post-v1): optional local web admin via HTMX and the Unix-socket API

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # TUN ingress/egress test: a kernel peer sends IPv4 through a TUN owned by
-# vnatd; vnatd forwards to a veth host and back. Covers bare-IP ingress, local
+# vrouterd; vrouterd forwards to a veth host and back. Covers bare-IP ingress, local
 # ARP resolution, pending-packet flush, TCP checksum repair and TUN egress.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ "${VNAT_TUN_NETNS:-0}" != "1" ]; then
+if [ "${VROUTER_TUN_NETNS:-0}" != "1" ]; then
     ZIG="${ZIG:-zig}"
     command -v "$ZIG" >/dev/null 2>&1 || {
         echo "FAIL: zig not found (set ZIG=/path/to/zig)" >&2
         exit 1
     }
     if [ "${EUID}" -eq 0 ]; then
-        exec unshare -n env VNAT_TUN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+        exec unshare -n env VROUTER_TUN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
     fi
-    exec unshare -rn env VNAT_TUN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+    exec unshare -rn env VROUTER_TUN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
 fi
 
 ZIG="${ZIG:-zig}"
@@ -30,7 +30,7 @@ done
 WORK="$(mktemp -d)"
 CFG="$WORK/tun.json"
 BIN="$ROOT/zig-out/bin"
-export VNAT_RUN_DIR="$WORK/run"
+export VROUTER_RUN_DIR="$WORK/run"
 
 dev="tr$$"
 peer="ta$$"
@@ -74,8 +74,8 @@ cat > "$CFG" <<'EOF'
   "version": 1,
   "instance": "tun-test",
   "ports": {
-    "lan": { "kind": "l2", "device": "vnat-lan" },
-    "vpn": { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1400 }
+    "lan": { "kind": "l2", "device": "vrouter-lan" },
+    "vpn": { "kind": "l3", "device": "vrouter0", "create": "tun", "mtu": 1400 }
   },
   "interfaces": {
     "lan0": { "port": "lan", "address": "10.0.1.1/24" },
@@ -88,26 +88,26 @@ cat > "$CFG" <<'EOF'
 }
 EOF
 
-# The config uses a stable port name; rename the veth end before vnatd starts.
-ip link set "$dev" name vnat-lan
-dev="vnat-lan"
+# The config uses a stable port name; rename the veth end before vrouterd starts.
+ip link set "$dev" name vrouter-lan
+dev="vrouter-lan"
 
-log "vnatd"
-"$BIN/vnatd" -c "$CFG" >"$WORK/vnatd.log" 2>&1 &
+log "vrouterd"
+"$BIN/vrouterd" -c "$CFG" >"$WORK/vrouterd.log" 2>&1 &
 pid_d=$!
 
 for _ in $(seq 1 100); do
-    ip link show vnat0 >/dev/null 2>&1 && break
+    ip link show vrouter0 >/dev/null 2>&1 && break
     sleep 0.02
 done
-ip link show vnat0 >/dev/null 2>&1 || {
-    cat "$WORK/vnatd.log"
-    die "vnat0 was not created"
+ip link show vrouter0 >/dev/null 2>&1 || {
+    cat "$WORK/vrouterd.log"
+    die "vrouter0 was not created"
 }
 
-ip link set vnat0 up
-ip addr add 10.0.3.2/24 dev vnat0
-ip route add 10.0.2.0/24 via 10.0.3.1 dev vnat0
+ip link set vrouter0 up
+ip addr add 10.0.3.2/24 dev vrouter0
+ip route add 10.0.2.0/24 via 10.0.3.1 dev vrouter0
 
 nsenter -t "$pid_a" -n python3 -m http.server 8080 --bind 10.0.2.2 \
     </dev/null >"$WORK/http.log" 2>&1 &
@@ -121,7 +121,7 @@ done
 
 log "icmp over tun"
 ping -c 3 -W 2 10.0.2.2 >"$WORK/ping.log" 2>&1 || {
-    cat "$WORK/ping.log" "$WORK/vnatd.log"
+    cat "$WORK/ping.log" "$WORK/vrouterd.log"
     die "ping over tun failed"
 }
 grep -q '3 received' "$WORK/ping.log" || die "ping loss over tun"
@@ -141,13 +141,13 @@ for _ in $(seq 1 50); do
     sleep 0.05
 done
 if [ -z "$status" ]; then
-    cat "$WORK/vnatd.log"
+    cat "$WORK/vrouterd.log"
     die "tcp over tun timed out"
 fi
 case "$status" in
     *200*) ;;
     *)
-        cat "$WORK/vnatd.log"
+        cat "$WORK/vrouterd.log"
         die "unexpected http status: $status"
         ;;
 esac
@@ -161,8 +161,8 @@ for _ in $(seq 1 100); do
 done
 wait "$pid_d" 2>/dev/null || true
 pid_d=""
-grep -q 'forwarded=' "$WORK/vnatd.log" || die "missing forwarding counters"
-ok "vnatd stopped"
+grep -q 'forwarded=' "$WORK/vrouterd.log" || die "missing forwarding counters"
+ok "vrouterd stopped"
 
 kill "$pid_http" 2>/dev/null || true
 pid_http=""

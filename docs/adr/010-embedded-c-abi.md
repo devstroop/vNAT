@@ -14,36 +14,38 @@ app is not allowed to expose JNI types to the core. A host must therefore:
 - start and stop the data plane, and
 - receive lifecycle state without calling into Java per packet.
 
-The daemon already had the required lifecycle inline in `exec/vnatd/main.zig`.
+The daemon already had the required lifecycle inline in `exec/vrouterd/main.zig`.
 Duplicating it in a second host path would drift, so the lifecycle was extracted
-into `src/app/service.zig` and both `vnatd` and the C ABI use it.
+into `src/app/service.zig` and both `vrouterd` and the C ABI use it.
 
 ## Decision
 
-Expose a versioned C ABI in `src/ffi.zig` and `include/vnat.h`:
+Expose a versioned C ABI in `src/ffi.zig` and `include/vrouter.h`:
 
-- Opaque `vnat_t`, fixed-width status struct, stable error codes and event
-  codes. `VNAT_ABI_VERSION` is 1.
-- `vnat_create` parses and validates JSON. It accepts configured existing L3
+- Opaque `vrouter_t`, fixed-width status struct, stable error codes and event
+  codes. `VROUTER_ABI_VERSION` is 2.
+- ABI 2 renames the exported symbols and types from `vnat_*` to `vrouter_*`
+  as part of the project rename (ADR-012); layout and lifecycle are unchanged.
+- `vrouter_create` parses and validates JSON. It accepts configured existing L3
   ports (`kind = "l3"`, no `create`) so the host can bind a descriptor.
-- `vnat_set_port_fd` binds a host-owned descriptor to a named L3 port before
-  startup. The descriptor is borrowed; vNAT duplicates it with
-  `F_DUPFD_CLOEXEC` during `vnat_start`, so the host can close the original
+- `vrouter_set_port_fd` binds a host-owned descriptor to a named L3 port before
+  startup. The descriptor is borrowed; vRouter duplicates it with
+  `F_DUPFD_CLOEXEC` during `vrouter_start`, so the host can close the original
   after startup. The duplicate is set non-blocking, which also affects the
   original descriptor because both share one open file description. A stopped
   handle reuses its bindings when restarted, so the descriptor must remain
-  valid for every `vnat_start`. Only L3 ports without `create` are eligible.
-- `vnat_start` blocks until the service is ready or startup fails.
-  `vnat_stop` is idempotent and joins the data-plane thread. `vnat_destroy`
+  valid for every `vrouter_start`. Only L3 ports without `create` are eligible.
+- `vrouter_start` blocks until the service is ready or startup fails.
+  `vrouter_stop` is idempotent and joins the data-plane thread. `vrouter_destroy`
   stops first and then releases native resources; it must not be called from
   an event callback.
 - Events are delivered on the data-plane thread. `STARTED` is delivered
-  before `vnat_start` returns. Callbacks must not call `vnat_*` functions other
-  than `vnat_get_status`; `vnat_stop` and `vnat_destroy` would deadlock.
+  before `vrouter_start` returns. Callbacks must not call `vrouter_*` functions other
+  than `vrouter_get_status`; `vrouter_stop` and `vrouter_destroy` would deadlock.
 - The FFI profile disables host mutations and hotplug monitoring
   (`allow_host_changes = false`, `enable_monitor = false`) and does not write
   daemon counter snapshots. A configured kernel offload requiring host
-  mutation fails with `VNAT_ERR_UNSUPPORTED` instead of silently falling back.
+  mutation fails with `VROUTER_ERR_UNSUPPORTED` instead of silently falling back.
 - The library is built from `src/ffi.zig`; the CLI/daemon are built from
   `src/lib.zig`. The FFI module uses host pthreads for its service and DNS
   worker threads, without linking libc. It does not use Zig's raw-clone thread

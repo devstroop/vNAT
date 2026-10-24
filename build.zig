@@ -51,33 +51,33 @@ pub fn build(b: *std.Build) void {
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "vnat",
+        .name = "vrouter",
         .root_module = ffi_mod,
     });
     b.installArtifact(static_lib);
-    static_lib.installHeader(b.path("include/vnat.h"), "vnat.h");
+    static_lib.installHeader(b.path("include/vrouter.h"), "vrouter.h");
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,
-        .name = "vnat",
+        .name = "vrouter",
         .root_module = ffi_mod,
-        .version = .{ .major = 0, .minor = 0, .patch = 1 },
+        .version = .{ .major = 0, .minor = 1, .patch = 0 },
     });
     shared_lib.linker_allow_shlib_undefined = true;
     b.installArtifact(shared_lib);
 
     if (is_linux and !is_android) {
         const exe_mod = b.createModule(.{
-            .root_source_file = b.path("exec/vnat/main.zig"),
+            .root_source_file = b.path("exec/vrouter/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vnat", .module = core_mod },
+                .{ .name = "vrouter", .module = core_mod },
             },
         });
 
         const exe = b.addExecutable(.{
-            .name = "vnat",
+            .name = "vrouter",
             .root_module = exe_mod,
         });
         b.installArtifact(exe);
@@ -90,20 +90,20 @@ pub fn build(b: *std.Build) void {
             run_cmd.addPassthruArgs();
         }
 
-        const run_step = b.step("run", "Run vnat");
+        const run_step = b.step("run", "Run vRouter");
         run_step.dependOn(&run_cmd.step);
 
         const daemon_mod = b.createModule(.{
-            .root_source_file = b.path("exec/vnatd/main.zig"),
+            .root_source_file = b.path("exec/vrouterd/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vnat", .module = core_mod },
+                .{ .name = "vrouter", .module = core_mod },
             },
         });
 
         const daemon = b.addExecutable(.{
-            .name = "vnatd",
+            .name = "vrouterd",
             .root_module = daemon_mod,
         });
         b.installArtifact(daemon);

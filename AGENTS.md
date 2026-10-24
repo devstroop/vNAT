@@ -1,4 +1,4 @@
-# vNAT — Agent Guide
+# vRouter — Agent Guide
 
 Portable virtual router in Zig 0.16+: L2/L3 forwarding, bridging, NAT, DHCP,
 DNS and firewall for Linux and Android. No GUI in v1; an optional post-v1 web
@@ -14,10 +14,10 @@ the contract for any agent working in this repo.
 | NAT / firewall | `src/nat/`, `src/firewall/` | conntrack, SNAT/DNAT, rules |
 | Services | `src/services/` | DHCPv4, DNS forwarder |
 | CLI / daemon | `src/cli/`, `src/app/` | Zig |
-| Executables | `exec/` | `vnat`, `vnatd`; `vnat-web` post-v1 |
-| C ABI | `src/ffi.zig`, `include/vnat.h` | for Android/iOS/desktop hosts |
+| Executables | `exec/` | `vrouter`, `vrouterd`; `vrouter-web` post-v1 |
+| C ABI | `src/ffi.zig`, `include/vrouter.h` | for Android/iOS/desktop hosts |
 | Control plane | `src/control/` | config diff, journal, unix socket API |
-| Web admin (post-v1) | `src/web/`, `exec/vnatweb/` | Zig HTTP, server-rendered HTMX, Unix-socket client |
+| Web admin (post-v1) | `src/web/`, `exec/vrouterweb/` | Zig HTTP, server-rendered HTMX, Unix-socket client |
 | Tests | `test/` | unit, netns, fuzz, Android smoke |
 
 ## Commands
@@ -32,7 +32,7 @@ zig build static-lib -Dtarget=aarch64-linux-android
 bash scripts/test_netns.sh     # Linux L2/hotplug topology tests
 bash scripts/test_route.sh     # IPv4 forwarding (ping + TCP)
 bash scripts/test_tun.sh       # TUN ingress/egress (ICMP + TCP)
-bash scripts/test_journal.sh   # iface/route journal + vnat down
+bash scripts/test_journal.sh   # iface/route journal + vrouter down
 bash scripts/nat_matrix.sh     # NAT/port-forward matrix (R3+)
 bash scripts/test_firewall.sh  # ordered rules/default drop (R6)
 bash scripts/test_vlan.sh      # 802.1Q access/trunk + SVI isolation (R5)
@@ -55,11 +55,11 @@ Always run `zig build test`. For port/forwarding changes, also run
 5. **Hostile input.** No `unreachable` on frames, packets or config. Use
    bounds-checked readers returning typed errors. Every parser is fuzzed.
 6. **Journal before mutation.** Every host change (route, address, link,
-   bridge membership, NAT rule) is recorded with its inverse. `vnat down` must
+   bridge membership, NAT rule) is recorded with its inverse. `vrouter down` must
    restore the pre-start state.
 7. **No silent fallback.** If a configured backend or capability is missing,
    fail with an actionable typed error.
-8. **ABI stability.** `include/vnat.h` mirrors `src/ffi.zig`; changing an export
+8. **ABI stability.** `include/vrouter.h` mirrors `src/ffi.zig`; changing an export
    updates the header, version and changelog.
 9. **No secrets in logs.** Never log packet payloads, keys or tokens above
    debug level.
@@ -94,7 +94,7 @@ Always run `zig build test`. For port/forwarding changes, also run
 
 | Pitfall | Symptom | Fix |
 |---|---|---|
-| Stale routes/rules after crash | Blackholed or leaked traffic | Journal + `vnat doctor --repair` |
+| Stale routes/rules after crash | Blackholed or leaked traffic | Journal + `vrouter doctor --repair` |
 | AF_PACKET sees kernel-handled packets too | Double processing | Understand tap vs packet socket semantics; use AF_PACKET carefully |
 | TUN/AF_PACKET checksum offload mismatch | Corrupt TCP checksums | Software repair on forward (ADR-007); offload only when negotiated |
 | Android `addAddress` without `addRoute` | No traffic reaches TUN | Add the virtual-subnet route explicitly |
@@ -148,5 +148,5 @@ Installed in `.opencode/skills/`:
 - `doc-coauthoring` — write ADRs, specs, proposals.
 - `webapp-testing` — Playwright testing for the post-v1 web admin.
 
-Use `skill-creator` to add a `vnat-networking` skill once the port/packet
+Use `skill-creator` to add a `vrouter-networking` skill once the port/packet
 interfaces stabilize.

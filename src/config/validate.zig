@@ -10,7 +10,7 @@ const ConfigError = @import("../errors.zig").ConfigError;
 
 pub const Options = struct {
     /// Hosts that inject L3 descriptors (Android VpnService) may configure an
-    /// existing L3 port without asking vNAT to create a TUN device.
+    /// existing L3 port without asking vRouter to create a TUN device.
     allow_existing_l3: bool = false,
 };
 
@@ -99,7 +99,7 @@ fn validatePorts(cfg: *const schema.Config, options: Options) ConfigError!void {
         const port = entry.value_ptr.*;
         if (port.device.len == 0 or port.device.len >= 16) return error.InvalidValue;
         if (port.kind == .l3 and port.create == null and !options.allow_existing_l3) {
-            // Existing L3 devices have no fd vNAT can adopt; only TUN can be
+            // Existing L3 devices have no fd vRouter can adopt; only TUN can be
             // created and owned by the daemon.
             return error.InvalidValue;
         }
@@ -145,7 +145,7 @@ fn validateBridges(cfg: *const schema.Config) ConfigError!void {
 
             if (bridge.offload != .none) {
                 // A kernel bridge member must already exist and is not opened
-                // by the port manager, so vNAT cannot apply these settings.
+                // by the port manager, so vRouter cannot apply these settings.
                 if (port.create != null) return error.InvalidValue;
                 if (port.mtu != null) return error.InvalidValue;
                 if (bridge.vlan_aware) {
@@ -620,7 +620,7 @@ test "rejects dhcp reservation outside subnet" {
 
 test "accepts a lease database path" {
     const input =
-        \\{ "version": 1, "instance": "x", "lease_db": "/var/lib/vnat/leases.json" }
+        \\{ "version": 1, "instance": "x", "lease_db": "/var/lib/vrouter/leases.json" }
     ;
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();

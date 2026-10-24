@@ -1,4 +1,4 @@
-//! Reusable vNAT runtime lifecycle shared by `vnatd` and the C ABI.
+//! Reusable vRouter runtime lifecycle shared by `vrouterd` and the C ABI.
 
 const std = @import("std");
 const schema = @import("../config/schema.zig");
@@ -31,7 +31,7 @@ pub const Runtime = struct {
 pub const ReadyFn = *const fn (ctx: ?*anyopaque) void;
 
 pub const Options = struct {
-    state_dir: ?[]const u8 = "/run/vnat",
+    state_dir: ?[]const u8 = "/run/vrouter",
     allow_host_changes: bool = true,
     enable_monitor: bool = true,
     injected: []const manager_mod.InjectedPort = &.{},
@@ -78,7 +78,7 @@ pub fn run(
     defer offload_plan.deinit();
     if (host) |*h| {
         offload_plan = control_offload.apply(io, gpa, h, cfg) catch |err| {
-            logger.err("kernel offload: {s}; run `vnat down -c <config>` to repair", .{
+            logger.err("kernel offload: {s}; run `vrouter down -c <config>` to repair", .{
                 @errorName(err),
             });
             return err;
@@ -87,7 +87,7 @@ pub fn run(
             logger.info("offload bridge={s} kernel={s} trunk={s}", .{
                 device.bridge_name,
                 device.kernel_bridge,
-                device.veth_vnat,
+                device.veth_vrouter,
             });
         }
         for (offload_plan.skipped) |port_name| {
@@ -194,7 +194,7 @@ pub fn run(
             .zones = if (dns_zones) |zones| zones else &.{},
         }) catch |err| {
             logger.err(
-                "dns listen={f}: {s}; assign the address first with `vnat iface set <dev> <cidr>`",
+                "dns listen={f}: {s}; assign the address first with `vrouter iface set <dev> <cidr>`",
                 .{ listen, @errorName(err) },
             );
             return err;

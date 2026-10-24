@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# DNS forwarder netns test: client query -> vnatd cache/forwarder -> fake
+# DNS forwarder netns test: client query -> vrouterd cache/forwarder -> fake
 # upstream, plus a second query served from cache.
 set -euo pipefail
 
-if [ "${VNAT_DNS_NETNS:-0}" != "1" ]; then
+if [ "${VROUTER_DNS_NETNS:-0}" != "1" ]; then
     ZIG="${ZIG:-zig}"
     command -v "$ZIG" >/dev/null 2>&1 || {
         echo "FAIL: zig not found (set ZIG=/path/to/zig)" >&2
         exit 1
     }
     if [ "${EUID}" -eq 0 ]; then
-        exec unshare -n env VNAT_DNS_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+        exec unshare -n env VROUTER_DNS_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
     fi
-    exec unshare -rn env VNAT_DNS_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+    exec unshare -rn env VROUTER_DNS_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
 fi
 
 ZIG="${ZIG:-zig}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-export VNAT_RUN_DIR="$WORK/run"
+export VROUTER_RUN_DIR="$WORK/run"
 INSTANCE=dns-test
 CONFIG=$WORK/config.json
-LOG=$WORK/vnatd.log
+LOG=$WORK/vrouterd.log
 UPSTREAM_LOG=$WORK/upstream.count
 CLIENT_LOG=$WORK/client.log
 SERVER_LOG=$WORK/upstream.log
 
 cleanup() {
     set +e
-    [ -n "${vnatd_pid:-}" ] && kill "$vnatd_pid" 2>/dev/null
+    [ -n "${vrouterd_pid:-}" ] && kill "$vrouterd_pid" 2>/dev/null
     [ -n "${client_pid:-}" ] && kill "$client_pid" 2>/dev/null
     [ -n "${upstream_pid:-}" ] && kill "$upstream_pid" 2>/dev/null
     wait 2>/dev/null
@@ -115,12 +115,12 @@ upstream_pid=$!
 
 for _ in $(seq 1 100); do [ -s "$SERVER_LOG" ] && break; sleep 0.02; done
 
-echo "==> vnatd"
-"$ROOT/zig-out/bin/vnatd" -c "$CONFIG" >"$LOG" 2>&1 &
-vnatd_pid=$!
+echo "==> vrouterd"
+"$ROOT/zig-out/bin/vrouterd" -c "$CONFIG" >"$LOG" 2>&1 &
+vrouterd_pid=$!
 for _ in $(seq 1 250); do
     grep -q "dns listening" "$LOG" 2>/dev/null && break
-    kill -0 "$vnatd_pid" 2>/dev/null || die "vnatd exited during startup"
+    kill -0 "$vrouterd_pid" 2>/dev/null || die "vrouterd exited during startup"
     sleep 0.02
 done
 grep -q "dns listening" "$LOG" || die "dns listener did not start"
@@ -199,8 +199,8 @@ count=$(wc -l <"$UPSTREAM_LOG")
 [ "$count" -eq 2 ] || die "expected two upstream queries, saw $count"
 echo "ok: second query served from cache"
 
-kill -TERM "$vnatd_pid"
-wait "$vnatd_pid" 2>/dev/null || true
+kill -TERM "$vrouterd_pid"
+wait "$vrouterd_pid" 2>/dev/null || true
 grep -q "dns stopping queries=3 responses=3 hits=1" "$LOG" || {
     cat "$LOG" >&2
     die "dns counters mismatch"

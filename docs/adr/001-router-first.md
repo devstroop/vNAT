@@ -6,7 +6,7 @@
 
 ## Context
 
-The earlier planning round framed vNAT as a P2P overlay VPN (virtual IPs,
+The earlier planning round framed vRouter as a P2P overlay VPN (virtual IPs,
 NAT traversal, relay), following SoftEtherVPN and VNT. The new direction is a
 **portable virtual router**: a device — Linux or Android — that attaches to
 L2/L3 interfaces, bridges/routes between them, and provides NAT, DHCP, DNS and

@@ -6,16 +6,16 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ "${VNAT_VLAN_NETNS:-0}" != "1" ]; then
+if [ "${VROUTER_VLAN_NETNS:-0}" != "1" ]; then
     ZIG="${ZIG:-zig}"
     command -v "$ZIG" >/dev/null 2>&1 || {
         echo "FAIL: zig not found (set ZIG=/path/to/zig)" >&2
         exit 1
     }
     if [ "${EUID}" -eq 0 ]; then
-        exec unshare -n env VNAT_VLAN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+        exec unshare -n env VROUTER_VLAN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
     fi
-    exec unshare -rn env VNAT_VLAN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+    exec unshare -rn env VROUTER_VLAN_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
 fi
 
 ZIG="${ZIG:-zig}"
@@ -25,10 +25,10 @@ command -v "$ZIG" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
-export VNAT_RUN_DIR="$WORK/run"
+export VROUTER_RUN_DIR="$WORK/run"
 BIN="$ROOT/zig-out/bin"
-CFG="$WORK/vnat-vlan.json"
-LOG="$WORK/vnatd.log"
+CFG="$WORK/vrouter-vlan.json"
+LOG="$WORK/vrouterd.log"
 
 vpid=""
 pidA=""
@@ -76,7 +76,7 @@ cat > "$CFG" <<'JSON'
 JSON
 
 log "bridge inspection"
-bridge_out="$("$BIN/vnat" bridge list -c "$CFG")" || die "bridge list failed"
+bridge_out="$("$BIN/vrouter" bridge list -c "$CFG")" || die "bridge list failed"
 echo "$bridge_out"
 echo "$bridge_out" | grep -Eq '^br +yes +off +none +2 +1$' ||
     die "unexpected bridge summary: $bridge_out"
@@ -133,21 +133,21 @@ done
 [ -f "$WORK/b.ready" ] || die "host B did not configure"
 ok "hosts 10.0.10.2/24, 10.0.20.2/24 and peers configured"
 
-log "vnatd"
-"$BIN/vnatd" -c "$CFG" >"$LOG" 2>&1 &
+log "vrouterd"
+"$BIN/vrouterd" -c "$CFG" >"$LOG" 2>&1 &
 vpid=$!
 
 for i in $(seq 1 100); do
     grep -q "started instance" "$LOG" && break
     if ! kill -0 "$vpid" 2>/dev/null; then
         cat "$LOG"
-        die "vnatd exited"
+        die "vrouterd exited"
     fi
     sleep 0.02
 done
 grep -q "started instance" "$LOG" || {
     cat "$LOG"
-    die "vnatd did not start"
+    die "vrouterd did not start"
 }
 
 log "access to trunk"
@@ -179,7 +179,7 @@ if nsenter -t "$pidA" -n ping -c 1 -W 1 10.0.20.3 >/dev/null 2>&1; then
 fi
 ok "vlan 20 tagged traffic dropped on access port"
 
-kill -0 "$vpid" 2>/dev/null || die "vnatd exited during test"
+kill -0 "$vpid" 2>/dev/null || die "vrouterd exited during test"
 kill -TERM "$vpid"
 for i in $(seq 1 100); do
     kill -0 "$vpid" 2>/dev/null || break
@@ -194,6 +194,6 @@ grep -q "bridged=" "$LOG" || {
     die "missing bridge counters"
 }
 
-echo "--- vnatd ---"
+echo "--- vrouterd ---"
 cat "$LOG"
 ok "test_vlan"

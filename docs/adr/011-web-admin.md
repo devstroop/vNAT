@@ -25,13 +25,13 @@ A web admin must not weaken the existing contract:
 
 Add an **optional, post-v1 local web admin for Linux**:
 
-1. **Separate unprivileged adapter.** `vnat-web` is a standalone executable
-   (planned `exec/vnatweb`, `src/web/`), not part of the core library or
-   `vnatd`. It speaks the same line-delimited JSON Unix-socket API as the CLI.
+1. **Separate unprivileged adapter.** `vrouter-web` is a standalone executable
+   (planned `exec/vrouterweb`, `src/web/`), not part of the core library or
+   `vrouterd`. It speaks the same line-delimited JSON Unix-socket API as the CLI.
    It never opens ports, writes journals, calls netlink or edits config files
    directly.
-2. **Privilege separation.** `vnatd` remains the sole mutator. The web process
-   runs as an unprivileged service account in the `vnat` group and uses the
+2. **Privilege separation.** `vrouterd` remains the sole mutator. The web process
+   runs as an unprivileged service account in the `vrouter` group and uses the
    control socket (`0660`, peer credentials). Read and write capabilities are
    distinct API scopes; a read-only deployment must not receive write access.
 3. **Server-rendered HTMX.** The UI is server-rendered HTML with templates and
@@ -82,7 +82,7 @@ Add an **optional, post-v1 local web admin for Linux**:
   a build pipeline, a larger dependency surface and an unnecessary client-side
   state layer. It could be appropriate for a future hosted multi-router
   controller, which is explicitly out of scope.
-- **Embed the HTTP server in `vnatd`:** rejected. It would put browser parsing
+- **Embed the HTTP server in `vrouterd`:** rejected. It would put browser parsing
   and session state in the privileged daemon.
 - **HTMX from a CDN:** rejected. Offline deployments cannot depend on a third
   party, and the CSP should remain `self`-only.

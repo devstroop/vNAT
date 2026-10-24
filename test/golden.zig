@@ -4,7 +4,7 @@
 //! structural vectors (checksums are zero); R2 adds checksum-valid vectors.
 
 const std = @import("std");
-const vnat = @import("../src/lib.zig");
+const vrouter = @import("../src/lib.zig");
 
 /// Ethernet II + IPv4 + UDP: 10.0.0.1:1234 -> 10.0.0.2:5678.
 pub const ipv4_udp =
@@ -35,7 +35,7 @@ test "golden ethernet/ipv4/udp frame round-trips through the memory port" {
     const frame = try decodeHex(std.testing.allocator, ipv4_udp);
     defer std.testing.allocator.free(frame);
 
-    var mp = vnat.MemoryPort.init(std.testing.allocator, .{ .value = 1 }, "golden0", 1500);
+    var mp = vrouter.MemoryPort.init(std.testing.allocator, .{ .value = 1 }, "golden0", 1500);
     defer mp.deinit();
 
     try mp.inject(frame);
@@ -50,7 +50,7 @@ test "golden vlan frame round-trips" {
     defer std.testing.allocator.free(frame);
     try std.testing.expectEqual(@as(usize, 46), frame.len);
 
-    var mp = vnat.MemoryPort.init(std.testing.allocator, .{ .value = 2 }, "golden1", 1500);
+    var mp = vrouter.MemoryPort.init(std.testing.allocator, .{ .value = 2 }, "golden1", 1500);
     defer mp.deinit();
 
     try mp.inject(frame);

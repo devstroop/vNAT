@@ -2,12 +2,12 @@
   "version": 1,
   "instance": "travel-router",
   "log": { "level": "info", "format": "text" },
-  "lease_db": "/var/lib/vnat/leases.json",
+  "lease_db": "/var/lib/vrouter/leases.json",
   "ports": {
     "wan": { "kind": "l2", "device": "eth0" },
     "lan": { "kind": "l2", "device": "eth1", "mtu": 1500 },
     "usb-lan": { "kind": "l2", "device": "usb0" },
-    "vpn0": { "kind": "l3", "device": "vnat0", "create": "tun", "mtu": 1380 }
+    "vpn0": { "kind": "l3", "device": "vrouter0", "create": "tun", "mtu": 1380 }
   },
   "bridges": {
     "lan-br": { "ports": ["lan", "usb-lan"] }

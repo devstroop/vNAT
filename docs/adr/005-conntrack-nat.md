@@ -7,7 +7,7 @@
 ## Context
 
 NAT, port forwarding, hairpin and the firewall all need connection state.
-Linux offers nf_conntrack, but vNAT must work on unrooted Android (no netfilter)
+Linux offers nf_conntrack, but vRouter must work on unrooted Android (no netfilter)
 and must be testable without privileges. Doing NAT correctly also means
 handling ICMP query translation, fragments, TCP teardown and port exhaustion.
 
@@ -112,7 +112,7 @@ GC runs every second; a sweep is O(expired), not O(table).
 - One source of truth for NAT/firewall state, identical on Linux and Android.
 - Must be fuzzed and soak-tested; a bug here is a security bug.
 - Kernel NAT offload must publish its state into the same accounting view or
-  be marked `opaque` in `vnat status`.
+  be marked `opaque` in `vrouter status`.
 - No ALGs in v1 (FTP/SIP/PPTP); document the limitation.
 
 ## Alternatives considered

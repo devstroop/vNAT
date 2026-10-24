@@ -5,9 +5,9 @@
 
 ## Context
 
-vNAT reads frames from `AF_PACKET`. Locally generated packets can reach the
+vRouter reads frames from `AF_PACKET`. Locally generated packets can reach the
 packet socket while the kernel still carries `CHECKSUM_PARTIAL`: the NIC (or
-veth peer) is expected to finish the TCP/UDP checksum. vNAT copies the bytes,
+veth peer) is expected to finish the TCP/UDP checksum. vRouter copies the bytes,
 rewrites the Ethernet header on another port and transmits them through a new
 packet socket, so the offload metadata is lost and the peer receives an
 invalid L4 checksum. ICMP is unaffected because the kernel computes its
@@ -17,7 +17,7 @@ This was observed as successful ICMP but failed TCP through two veth pairs.
 
 ## Decision
 
-For every forwarded, non-fragmented IPv4 packet, vNAT recomputes the TCP or
+For every forwarded, non-fragmented IPv4 packet, vRouter recomputes the TCP or
 UDP checksum in software after decrementing TTL. The IPv4 header checksum is
 always recomputed. UDP checksum `0` remains "no checksum" as allowed by
 RFC 768; fragmented packets are forwarded as-is because their L4 checksum

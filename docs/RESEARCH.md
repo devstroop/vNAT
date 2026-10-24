@@ -1,4 +1,4 @@
-# vNAT — Knowledge Base
+# vRouter — Knowledge Base
 
 > Compiled 2026-10-22. Sources: local `~/Documents/SoftEtherVPN` (commit `f20c61a`),
 > GitHub `devstroop/SoftEtherVPN` (now `devstroop/SE`, HEAD `8f6d657`),
@@ -17,7 +17,7 @@
 
 ---
 
-## 0. What "vNAT" can mean — scope decision
+## 0. What "vRouter" can mean — scope decision
 
 Three distinct meanings exist in the wild:
 
@@ -28,7 +28,7 @@ Three distinct meanings exist in the wild:
 | **Overlay / P2P virtual network with a NAT gateway** | Devices join a virtual L2/L3 network, get virtual IPs, reach each other and the internet through a virtual NAT | **Matches the SoftEtherVPN lineage and the Linux+Android→macOS+Windows target list** |
 
 **Working definition for planning (updated):**
-> vNAT is a cross-platform, Zig-native **portable virtual router**. It attaches
+> vRouter is a cross-platform, Zig-native **portable virtual router**. It attaches
 > directly to L2/L3 interfaces, bridges or routes between them, and provides
 > NAT, DHCP, DNS, firewall and port forwarding. An overlay/P2P transport is a
 > future uplink port, not the core.
@@ -73,7 +73,7 @@ src/
 
 ### 1.2 NAT engine (`src/cedar/server/nat.zig`, 1,597 lines)
 
-This is the most directly reusable design for vNAT's NAT component.
+This is the most directly reusable design for vRouter's NAT component.
 
 **Model:** outbound-only, **socket-per-flow** NAT. It does *not* implement a
 userspace TCP/IP stack; for each flow it opens a real OS socket and splices
@@ -111,7 +111,7 @@ Default virtual network: `192.168.30.1/24`, DNS `192.168.30.1` + `8.8.8.8`,
 1 s polling loop. The polling thread owns sub-component state; the hub mutex
 guards queues.
 
-**Limitations to fix in vNAT:**
+**Limitations to fix in vRouter:**
 - No inbound port mapping (was deferred; VNT has it).
 - No full TCP/IP stack → cannot terminate arbitrary IP protocols or do
   packet-level NAT without a real socket.
@@ -128,7 +128,7 @@ guards queues.
   HMAC key derived as `SHA1(AES key)` (weak), and `performHandshake()` passes
   `null` bulk keys so the feature was silently off for that path.
 
-> This RCA is effectively the requirements document for vNAT's transport.
+> This RCA is effectively the requirements document for vRouter's transport.
 
 ### 1.4 Platform adapters — concrete API knowledge
 
@@ -241,7 +241,7 @@ punch scheduler). Port this concept, not the code.
 
 ---
 
-## 3. NAT fundamentals (the physics vNAT must handle)
+## 3. NAT fundamentals (the physics vRouter must handle)
 
 ### 3.1 Stateful firewall + SNAT
 
@@ -381,7 +381,7 @@ Two deployment models:
    - System extension approval UX on macOS 10.15+.
    - No raw `utun` from a sandboxed app.
 
-For vNAT: ship the CLI/daemon path first (Linux parity), then the
+For vRouter: ship the CLI/daemon path first (Linux parity), then the
 NetworkExtension wrapper for the GUI/App Store build.
 
 ### 4.4 Windows
@@ -454,7 +454,7 @@ NetworkExtension wrapper for the GUI/App Store build.
 - Build: local package override, project-local fetch, test timeouts,
   `--error-style`, `--multiline-errors`.
 
-**Implications for vNAT:**
+**Implications for vRouter:**
 - Design every module to take `io: std.Io` (store it on context structs).
 - Prefer `std.Io.net` for UDP/TCP; it is the only path that is portable and
   future-proof across backends.
@@ -519,7 +519,7 @@ the 0.17 bump is a mechanical change. Add a CI job that builds both.
 ┌──────────────────────────────────────────────────────────┐
 │ app / CLI / GUI                                          │
 ├──────────────────────────────────────────────────────────┤
-│ vNAT API (Zig) + C ABI (FFI for Android/iOS/desktop)     │
+│ vRouter API (Zig) + C ABI (FFI for Android/iOS/desktop)  │
 ├──────────────────────────────────────────────────────────┤
 │ session: virtual IP, routes, DNS, policies               │
 ├──────────────────────────────────────────────────────────┤
@@ -659,7 +659,7 @@ CI matrix:
 - **Stable identity:** `device_id` persists; IP is sticky.
 - **Self-hosted control plane + relay;** public service optional.
 - **Headless daemon** + CLI + native GUI + Android app.
-- **Observability:** `vnat status`, Prometheus metrics, structured logs,
+- **Observability:** `vrouter status`, Prometheus metrics, structured logs,
   per-peer RTT/loss/path, traffic accounting.
 - **Updates:** signed binaries, in-app update or package managers
   (Homebrew/winget/apt/Play Store).

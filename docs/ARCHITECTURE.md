@@ -1,4 +1,4 @@
-# vNAT — Architecture
+# vRouter — Architecture
 
 > Router-first design. The overlay/P2P work from the earlier draft is deferred
 > to a future uplink module (ADR-004); the engine described here is the product.
@@ -18,7 +18,7 @@
    tables and swapped atomically.
 5. **Journal before mutation.** Every host change has a recorded inverse.
 6. **No GUI in v1, one API.** CLI and a Unix-socket API are the only v1
-   interfaces; the C ABI is for hosts (Android). A post-v1 optional `vnat-web`
+   interfaces; the C ABI is for hosts (Android). A post-v1 optional `vrouter-web`
    adapter is an unprivileged client of the same API (ADR-011).
 7. **Hostile input.** Decoders are bounds-checked and fuzzed; no `unreachable`
    on wire data.
@@ -26,7 +26,7 @@
 ## 2. Repository layout
 
 ```
-vnat/
+vrouter/
 ├── build.zig
 ├── build.zig.zon
 ├── AGENTS.md
@@ -103,10 +103,10 @@ vnat/
 │   ├── web/                     POST-V1: HTTP, templates, auth (ADR-011)
 │   └── overlay/                 FUTURE: uplink overlay (ADR-004)
 ├── exec/
-│   ├── vnat/main.zig            CLI (`validate`, `port`, `status`, `iface`, `route`, `down`, `journal`, `selftest`)
-│   ├── vnatd/main.zig           daemon (config, netlink, IPv4 forwarding loop)
-│   └── vnatweb/main.zig         POST-V1: unprivileged web admin (ADR-011)
-├── include/vnat.h
+│   ├── vrouter/main.zig            CLI (`validate`, `port`, `status`, `iface`, `route`, `down`, `journal`, `selftest`)
+│   ├── vrouterd/main.zig           daemon (config, netlink, IPv4 forwarding loop)
+│   └── vrouterweb/main.zig         POST-V1: unprivileged web admin (ADR-011)
+├── include/vrouter.h
 ├── test/
 │   ├── unit/
 │   ├── netns/                   Linux topologies
@@ -304,7 +304,7 @@ CLI / API ──▶ config::diff ──▶ mutation list ──▶ journal ─�
   Restart-required: ports, bridges, addresses.
 - Events: `port_up/down`, `link_change`, `addr_change`, `dhcp_lease`,
   `nat_expired`, `config_applied`, `error`.
-- Post-v1, an optional `vnat-web` adapter may expose this API over
+- Post-v1, an optional `vrouter-web` adapter may expose this API over
   authenticated HTTP. It remains an unprivileged client of the Unix socket and
   never mutates host state directly (ADR-011).
 
@@ -383,11 +383,11 @@ Wintun/Npcap, IP Helper, WFP/New-NetNat.
 
 - Strict schema, versioned; unknown keys rejected.
 - Validation is pure (no side effects) and runs before apply.
-- R2 journal: `$VNAT_RUN_DIR/<instance>.journal` (default `/run/vnat`),
+- R2 journal: `$VROUTER_RUN_DIR/<instance>.journal` (default `/run/vrouter`),
   one forward op per JSON line, fsynced and atomically replaced before the
-  netlink mutation. `vnat down` derives inverses in reverse order; deletes are
+  netlink mutation. `vrouter down` derives inverses in reverse order; deletes are
   gated by journal ownership; a failed apply removes its record.
-- The R7 control socket, read-only status, `vnat doctor` diagnostics, and the
+- The R7 control socket, read-only status, `vrouter doctor` diagnostics, and the
   run-dir daemon lock are implemented. Pending/applied reconciliation and
   batch apply remain.
 - Secrets (if any) come from env/file descriptors, never the config file.
@@ -428,12 +428,12 @@ no throughput or latency claim is made before R9.
 | Topology | Linux netns + veth + TUN (`scripts/test_netns.sh`) |
 | Forwarding | Two-host netns ping + TCP (`scripts/test_route.sh`) |
 | TUN | Kernel TUN peer ↔ veth host, ICMP + TCP (`scripts/test_tun.sh`) |
-| Journal | iface/route mutations + `vnat down` (`scripts/test_journal.sh`) |
+| Journal | iface/route mutations + `vrouter down` (`scripts/test_journal.sh`) |
 | NAT/conntrack | SNAT UDP/ICMP/TCP, DNAT/hairpin (`scripts/nat_matrix.sh`) |
 | NAT matrix | Emulated EIM/EDM, hairpin, port-forward, exhaustion |
 | DHCP/DNS | Client emulators; lease persistence across restart |
 | Security/privilege | Journal rollback, default-deny policy, netns isolation |
-| Crash safety | kill -9, reboot simulation, `vnat doctor` |
+| Crash safety | kill -9, reboot simulation, `vrouter doctor` |
 | Android | Emulator (VPN mode), rooted device (root mode) |
 | Performance | `iperf3`, `pktgen`, 64 B and 1500 B, multi-flow |
 
@@ -452,3 +452,4 @@ no throughput or latency claim is made before R9.
 | [009](adr/009-kernel-bridge-offload.md) | Kernel bridge offload with a veth trunk |
 | [010](adr/010-embedded-c-abi.md) | Embedded C ABI and host fd injection |
 | [011](adr/011-web-admin.md) | Optional local web admin (post-v1) |
+| [012](adr/012-project-rename.md) | Rename vNAT to vRouter |

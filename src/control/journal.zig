@@ -1,5 +1,5 @@
 //! Journal of host mutations. Each line is the forward operation applied by
-//! vNAT; rollback derives the inverse. Lines are written (fsync) before the
+//! vRouter; rollback derives the inverse. Lines are written (fsync) before the
 //! kernel mutation, so a crash leaves enough information to repair state.
 
 const std = @import("std");
@@ -299,7 +299,7 @@ pub const Store = struct {
     }
 
     /// Drops the last record. Used when a mutation failed after the journal
-    /// write, so rollback does not touch state that vNAT never applied.
+    /// write, so rollback does not touch state that vRouter never applied.
     pub fn removeLast(self: *Store, io: std.Io) !void {
         const contents_opt = try self.contents(io);
         const data = contents_opt orelse return;
@@ -502,9 +502,9 @@ test "journal line round trip" {
         .{ .addr_add = .{ .dev = "ra", .prefix = testPrefix("10.0.1.1/24") } },
         .{ .addr_del = .{ .dev = "ra", .prefix = testPrefix("10.0.1.1/24") } },
         .{ .link = .{ .dev = "ra", .up = true } },
-        .{ .link_add = .{ .dev = "vnatbr0", .kind = .bridge, .stp = true, .vlan_filtering = true } },
-        .{ .link_add = .{ .dev = "vnatp0", .kind = .veth, .peer = "vnatb0" } },
-        .{ .link_master = .{ .dev = "eth1", .master = "vnatbr0" } },
+        .{ .link_add = .{ .dev = "vrouterbr0", .kind = .bridge, .stp = true, .vlan_filtering = true } },
+        .{ .link_add = .{ .dev = "vrouterp0", .kind = .veth, .peer = "vrouterb0" } },
+        .{ .link_master = .{ .dev = "eth1", .master = "vrouterbr0" } },
         .{ .link_master = .{ .dev = "eth1", .master = null } },
         .{ .bridge_vlan = .{ .dev = "eth1", .vid = 10, .pvid = true, .untagged = true } },
         .{ .route_add = .{

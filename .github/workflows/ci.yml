@@ -27,7 +27,7 @@ jobs:
       - run: test "$(zig version)" = "0.16.0"
       - run: zig build test
       - run: zig build
-      - run: for f in examples/*.json; do ./zig-out/bin/vnat validate "$f"; done
+      - run: for f in examples/*.json; do ./zig-out/bin/vrouter validate "$f"; done
 
   cross:
     runs-on: ubuntu-latest

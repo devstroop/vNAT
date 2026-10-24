@@ -6,12 +6,12 @@
 ## Context
 
 `bridge.offload = "kernel"` was reserved but rejected. A kernel bridge gives
-the best L2 forwarding rate on Linux, but vNAT still owns SVI addressing,
+the best L2 forwarding rate on Linux, but vRouter still owns SVI addressing,
 routing, NAT, DHCP, DNS and the firewall. Moving all of those into the kernel
 would duplicate the portable userspace datapath and its tests.
 
-The bridge also has to remain journaled: a failed setup or `vnat down` must
-remove exactly the links, VLANs and master relationships vNAT created, without
+The bridge also has to remain journaled: a failed setup or `vrouter down` must
+remove exactly the links, VLANs and master relationships vRouter created, without
 adopting or disturbing pre-existing host state.
 
 ## Decision
@@ -32,7 +32,7 @@ For each bridge with `offload = "kernel"`:
 - Let the kernel run STP when `bridge.stp` is set. The synthetic userspace
   bridge disables userspace STP so the two instances cannot disagree.
 - Derive device names from a hash of instance and bridge name
-  (`vnatbr<x>`, `vnatb<x>`, `vnatp<x>`), keeping every name within `IFNAMSIZ`
+  (`vrouterbr<x>`, `vrouterb<x>`, `vrouterp<x>`), keeping every name within `IFNAMSIZ`
   without depending on config order.
 - Reject setup when a target device already exists or a physical member is
   already enslaved. Setup is transactional from a journal checkpoint; failure
@@ -44,12 +44,12 @@ For each bridge with `offload = "kernel"`:
   does not open those devices, so it cannot apply the setting safely. Reject
   firewall `iif`/`oif` references to physical members; those frames enter
   through the synthetic trunk, never under the physical port's config name.
-- Per-port `storm_control` is not enforced on offloaded members. vnatd warns
+- Per-port `storm_control` is not enforced on offloaded members. vrouterd warns
   while any member requests it; setting it to `0` acknowledges the limitation.
   Kernel bridge rate limiting is a future extension.
 
-`vnat down` removes the veth pair, VLAN entries and bridge in reverse journal
-order, then restores each physical member's previous link state. vNAT never
+`vrouter down` removes the veth pair, VLAN entries and bridge in reverse journal
+order, then restores each physical member's previous link state. vRouter never
 adopts an existing bridge or enslaved port.
 
 ## Consequences
@@ -59,14 +59,14 @@ adopts an existing bridge or enslaved port.
 - Routed and SVI traffic crosses the veth trunk once in each direction; this
   is still faster for bridged traffic but adds overhead to routed flows.
 - Kernel bridge state is visible through `bridge vlan show`, `bridge link` and
-  `ip -d link`; vNAT counters cover only traffic that reaches userspace.
+  `ip -d link`; vRouter counters cover only traffic that reaches userspace.
 - A stale bridge from a crashed daemon makes startup fail with `Busy` until
-  `vnat down` (journal) or explicit cleanup. That is preferred over adopting
+  `vrouter down` (journal) or explicit cleanup. That is preferred over adopting
   or resetting host state.
 - Direct per-port references to offloaded physical members are no longer
   meaningful and are rejected by validation.
 - Hotplug events for skipped physical members are consumed by the kernel;
-  vNAT monitors only the synthetic trunk.
+  vRouter monitors only the synthetic trunk.
 
 ## Alternatives
 

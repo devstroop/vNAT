@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to vNAT are documented here. The format follows
+All notable changes to vRouter are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
@@ -9,28 +9,28 @@ All notable changes to vNAT are documented here. The format follows
 ### Added
 
 - R7 Linux control socket: line-delimited JSON over
-  `/run/vnat/control.sock` (mode `0660`, peer-uid check), live read-only
-  `status`, `nat.list` and `conntrack.list`, and the `vnat up`, `vnat doctor`,
-  `vnat nat list` and `vnat conntrack list` CLI commands. The daemon publishes
+  `/run/vrouter/control.sock` (mode `0660`, peer-uid check), live read-only
+  `status`, `nat.list` and `conntrack.list`, and the `vrouter up`, `vrouter doctor`,
+  `vrouter nat list` and `vrouter conntrack list` CLI commands. The daemon publishes
   immutable datapath snapshots once per second. A run-dir lock rejects a
-  second daemon, concurrent `vnat up` starts are serialized, and `vnat down`
-  refuses while a matching daemon is live. `vnat up` writes daemon stderr to
-  `<state_dir>/vnatd.log` and reports its path and tail on failure.
+  second daemon, concurrent `vrouter up` starts are serialized, and `vrouter down`
+  refuses while a matching daemon is live. `vrouter up` writes daemon stderr to
+  `<state_dir>/vrouterd.log` and reports its path and tail on failure.
 - R7 foundation: reusable daemon lifecycle (`src/app/service.zig`) shared by
-  `vnatd` and the versioned C ABI (`include/vnat.h`, `src/ffi.zig`), an
+  `vrouterd` and the versioned C ABI (`include/vrouter.h`, `src/ffi.zig`), an
   injected-fd L3 port for Android `VpnService`, stable lifecycle/error/status
   codes, and a compiled C header/link smoke test.
 - Optional Linux kernel-bridge offload (`bridge.offload = "kernel"`): creates a
   journaled kernel bridge, enslaves existing L2 members, and attaches a veth
   trunk as the bridge's synthetic userspace port. Kernel VLAN filtering/STP,
-  transactional rollback, `vnat down` restoration, and the
+  transactional rollback, `vrouter down` restoration, and the
   `scripts/test_offload.sh` L2/SVI/DHCP/NAT/STP parity test are included.
   Offloaded members reject `create`/`mtu` overrides and warn when per-port
   `storm_control` cannot be enforced by the kernel bridge.
 - R0 scaffold: `build.zig`/`build.zig.zon`, cross-compilation for Linux and
   Android, CI matrix.
 - Strict JSON configuration schema, parser and semantic validator.
-- `vnat` CLI with `version`, `validate` and `help`.
+- `vrouter` CLI with `version`, `validate` and `help`.
 - `std.Io` context helper and leveled text/JSON logger (stack-buffered).
 - `Port` vtable, in-memory reference port, fixed-size buffer pool.
 - Golden Ethernet/IPv4/UDP frame fixtures and round-trip tests.
@@ -50,15 +50,15 @@ All notable changes to vNAT are documented here. The format follows
   `iif`/`oif` (port, interface or bridge), `accept`/`drop`/`reject`,
   `ct_state`, per-rule counters, and default deny before the conntrack
   established shortcut.
-- `vnat firewall list` prints the ordered rule set, default policies and
+- `vrouter firewall list` prints the ordered rule set, default policies and
   control-plane rate limits.
-- `vnat firewall test` evaluates a synthetic packet against the configured
+- `vrouter firewall test` evaluates a synthetic packet against the configured
   rules and prints the matching rule or default action.
-- `vnat firewall counters` reads the per-rule packet and drop snapshot that
-  `vnatd` writes to the run directory every 5 s and on shutdown.
+- `vrouter firewall counters` reads the per-rule packet and drop snapshot that
+  `vrouterd` writes to the run directory every 5 s and on shutdown.
 - Token-bucket limits for generated ICMP errors, ARP processing and DHCP
   server requests (`firewall.rate_limit`); `0` disables a limit.
-- `vnat bridge list` shows bridge membership, effective PVID/tagged VLANs,
+- `vrouter bridge list` shows bridge membership, effective PVID/tagged VLANs,
   tri-state STP/offload and SVI addressing.
 - Per-port storm control (`ports.<name>.storm_control`, default 1000
   flooded frames/s, `0` disables) with a `storm_dropped` counter.
@@ -67,6 +67,16 @@ All notable changes to vNAT are documented here. The format follows
   transitions, and STP-state filtering in the bridge datapath.
 - VLAN netns test covering access/trunk forwarding, SVI reachability and
   per-port VLAN isolation.
+
+### Changed
+
+- **Breaking:** rename the project from vNAT to vRouter (ADR-012). The CLI and
+  daemon are now `vrouter` and `vrouterd`; the C ABI is `vrouter_*` in
+  `include/vrouter.h` (ABI 2); environment variables, default config and run
+  paths, the control socket, journals and the daemon log use
+  `vrouter`/`VROUTER`. There are no compatibility aliases. Stop the old daemon
+  and run `vnat down` before upgrading; `/run/vnat` state is not migrated.
+- Bump the project version to 0.1.0.
 
 ### Fixed
 
@@ -123,23 +133,23 @@ All notable changes to vNAT are documented here. The format follows
 - Forwarding pipeline: TTL decrement, IPv4/TCP/UDP checksum repair (ADR-007),
   ICMP unreachable/time-exceeded/frag-needed, egress MTU enforcement, Ethernet
   and TUN egress.
-- `vnatd` data loop: polls ports, forwards frames and logs counters.
+- `vrouterd` data loop: polls ports, forwards frames and logs counters.
 - Config interfaces/static routes populate local addresses, connected routes
   and the FIB.
 - `scripts/test_route.sh`: two isolated hosts ping and fetch HTTP through
-  `vnatd`; verifies TTL=63, TCP and graceful shutdown.
+  `vrouterd`; verifies TTL=63, TCP and graceful shutdown.
 - Gratuitous ARP announcements for configured local addresses at daemon start.
 - ARP pending-packet queue (32 slots, 1 s): the first packet to an unresolved
   neighbor is flushed on reply instead of being dropped.
 - TUN/L3 ingress and egress: bare IPv4, local echo replies, ICMP errors and
   forwarding between TUN and L2 ports. `scripts/test_tun.sh` covers ICMP and
   TCP through a kernel TUN peer.
-- `vnat iface set|del|up|down` and `vnat route add|del` with journal-before-
-  mutation, ownership-gated deletes, and `vnat down` reverse rollback.
-- JSONL journal under `$VNAT_RUN_DIR` (default `/run/vnat`), atomic and
+- `vrouter iface set|del|up|down` and `vrouter route add|del` with journal-before-
+  mutation, ownership-gated deletes, and `vrouter down` reverse rollback.
+- JSONL journal under `$VROUTER_RUN_DIR` (default `/run/vrouter`), atomic and
   fsynced; failed applies remove their record; partial rollback keeps the
   journal for inspection and retry.
-- `vnat journal` for inspecting recorded mutations.
+- `vrouter journal` for inspecting recorded mutations.
 - `scripts/test_journal.sh`: address/route/link mutations, duplicate no-ops,
   unmanaged-delete rejection, pre-existing state preservation and rollback.
 
@@ -155,11 +165,11 @@ All notable changes to vNAT are documented here. The format follows
   configurable cache size (`dns.max_entries`) and counters.
 - `scripts/test_dhcp.sh`: raw Ethernet DHCP client obtains a lease, pings the
   router and verifies persistence across a daemon restart.
-- `scripts/test_dns.sh`: query through `vnatd`, answer from the fake upstream,
+- `scripts/test_dns.sh`: query through `vrouterd`, answer from the fake upstream,
   then a cache hit; both tests run in CI.
 - Not yet: DNS DoH/DoT.
 - Added: initial DHCP client on the uplink, DNS over TCP, split zones and a
-  local `vnat.` / `router.vnat.` status zone.
+  local `vrouter.` / `router.vrouter.` status zone.
 
 ### R3 — NAT and conntrack
 
@@ -190,7 +200,7 @@ All notable changes to vNAT are documented here. The format follows
 - TUN (`IFF_NO_PI`) and TAP ports, created from config (`"create": "tun"|"tap"`).
 - rtnetlink link dump and link/addr/neigh monitor with bounds-checked parsing.
 - Port manager with stable IDs, MTU application and hotplug refresh.
-- `vnat port list`, `vnat status`, `vnat selftest`, and the `vnatd` daemon
+- `vrouter port list`, `vrouter status`, `vrouter selftest`, and the `vrouterd` daemon
   skeleton with graceful SIGINT/SIGTERM shutdown.
 - `scripts/test_netns.sh`: veth L2 forwarding, TUN/TAP creation, netlink dump,
   manager status and daemon hotplug in a private netns.

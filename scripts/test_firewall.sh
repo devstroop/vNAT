@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Firewall test: ordered first-match rules, default-drop forwarding, reject
-# and explicit interface/port allows. Two isolated hosts talk through vnatd.
+# and explicit interface/port allows. Two isolated hosts talk through vrouterd.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ "${VNAT_FIREWALL_NETNS:-0}" != "1" ]; then
+if [ "${VROUTER_FIREWALL_NETNS:-0}" != "1" ]; then
     ZIG="${ZIG:-zig}"
     command -v "$ZIG" >/dev/null 2>&1 || {
         echo "FAIL: zig not found (set ZIG=/path/to/zig)" >&2
         exit 1
     }
     if [ "${EUID}" -eq 0 ]; then
-        exec unshare -n env VNAT_FIREWALL_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+        exec unshare -n env VROUTER_FIREWALL_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
     fi
-    exec unshare -rn env VNAT_FIREWALL_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
+    exec unshare -rn env VROUTER_FIREWALL_NETNS=1 "ZIG=$(command -v "$ZIG")" bash "$0" "$@"
 fi
 
 ZIG="${ZIG:-zig}"
@@ -25,10 +25,10 @@ command -v "$ZIG" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
-export VNAT_RUN_DIR="$WORK/run"
+export VROUTER_RUN_DIR="$WORK/run"
 BIN="$ROOT/zig-out/bin"
-CFG="$WORK/vnat-firewall.json"
-LOG="$WORK/vnatd.log"
+CFG="$WORK/vrouter-firewall.json"
+LOG="$WORK/vrouterd.log"
 HTTP_LOG="$WORK/http.log"
 
 vpid=""
@@ -86,15 +86,15 @@ cat > "$CFG" <<'JSON'
 JSON
 
 log "offline rule evaluation"
-out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8080 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+out="$("$BIN/vrouter" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8080 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
 echo "$out" | grep -q "rule 3: accept" || die "expected rule 3 accept, got: $out"
-out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8082 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+out="$("$BIN/vrouter" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8082 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
 echo "$out" | grep -q "default: drop" || die "expected default drop, got: $out"
-out="$("$BIN/vnat" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8081 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
+out="$("$BIN/vrouter" firewall test --proto tcp --src 10.0.1.2 --dst 10.0.2.2 --dport 8081 --iif lan --oif wan -c "$CFG")" || die "firewall test failed"
 echo "$out" | grep -q "rule 4: reject" || die "expected rule 4 reject, got: $out"
 ok "ordered match, default and reject"
 
-out="$("$BIN/vnat" firewall list -c "$CFG")" || die "firewall list failed"
+out="$("$BIN/vrouter" firewall list -c "$CFG")" || die "firewall list failed"
 echo "$out" | grep -q "rate-limit: icmp=100/s arp=512/s dhcp=100/s" ||
     die "firewall list missing rate limits, got: $out"
 
@@ -133,23 +133,23 @@ for i in $(seq 1 250); do
 done
 [ -f "$WORK/a.ready" ] || die "host A did not configure"
 [ -f "$WORK/b.ready" ] || die "host B did not configure"
-ok "hosts 10.0.1.2/24 and 10.0.2.2/24 via vnatd"
+ok "hosts 10.0.1.2/24 and 10.0.2.2/24 via vrouterd"
 
-log "vnatd"
-"$BIN/vnatd" -c "$CFG" >"$LOG" 2>&1 &
+log "vrouterd"
+"$BIN/vrouterd" -c "$CFG" >"$LOG" 2>&1 &
 vpid=$!
 
 for i in $(seq 1 100); do
     grep -q "started instance" "$LOG" && break
     if ! kill -0 "$vpid" 2>/dev/null; then
         cat "$LOG"
-        die "vnatd exited"
+        die "vrouterd exited"
     fi
     sleep 0.02
 done
 grep -q "started instance" "$LOG" || {
     cat "$LOG"
-    die "vnatd did not start"
+    die "vrouterd did not start"
 }
 
 log "ordered drop shadows later accept"
@@ -232,7 +232,7 @@ case "$elapsed" in
 esac
 ok "tcp dport 8082 dropped by policy"
 
-kill -0 "$vpid" 2>/dev/null || die "vnatd exited during test"
+kill -0 "$vpid" 2>/dev/null || die "vrouterd exited during test"
 kill -TERM "$vpid"
 for i in $(seq 1 100); do
     kill -0 "$vpid" 2>/dev/null || break
@@ -248,7 +248,7 @@ grep -q "fw-drop=" "$LOG" || {
 }
 
 log "runtime counters"
-counter_out="$("$BIN/vnat" firewall counters -c "$CFG")" || {
+counter_out="$("$BIN/vrouter" firewall counters -c "$CFG")" || {
     cat "$LOG"
     die "firewall counters failed"
 }
@@ -261,6 +261,6 @@ echo "$counter_out" | grep -Eq '^policy: dropped=[1-9]' ||
     die "firewall drop counters not exported: $counter_out"
 ok "runtime firewall counters exported"
 
-echo "--- vnatd ---"
+echo "--- vrouterd ---"
 cat "$LOG"
 ok "test_firewall"

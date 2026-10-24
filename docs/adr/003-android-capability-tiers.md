@@ -21,13 +21,13 @@ Ship two explicit tiers, sharing one core:
 
 ### Tier A — VPN router (no root)
 - `VpnService` fd as an L3 port; protected sockets as uplink.
-- Proxy NAT (TCP/UDP/ICMP) inside vNAT; DNS/firewall/per-app policy.
+- Proxy NAT (TCP/UDP/ICMP) inside vRouter; DNS/firewall/per-app policy.
 - Shippable on Play Store. Cannot serve tethered clients.
 
 ### Tier B — Portable router (root)
 - Raw ports (`AF_PACKET`) on `wlan0`/`ap0`/`usb0`/`rmnet*`; TUN/TAP; netlink.
 - Userspace bridging/routing/NAT; optional kernel offload.
-- Tethering takeover via **Strategy 1** (kernel forwarding + vNAT-owned
+- Tethering takeover via **Strategy 1** (kernel forwarding + vRouter-owned
   NAT/firewall rules) with mandatory journal/rollback. **Strategy 2**
   (NFQUEUE interception) behind an experimental flag.
 - Distributed outside Play Store; capability-probed (`su`, SELinux, netlink,
@@ -40,7 +40,7 @@ slips to v1.1 without blocking Tier A.
 
 - The Android app must present the tier honestly; no silent privilege
   escalation.
-- Tier B needs a robust rollback (`vnat doctor --repair`) because it mutates
+- Tier B needs a robust rollback (`vrouter doctor --repair`) because it mutates
   global tethering state.
 - OEM/SELinux variance is the top support risk; capability probes and clear
   errors are mandatory.

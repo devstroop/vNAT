@@ -1,7 +1,7 @@
 //! Keeps the shipped examples honest: every example must parse and validate.
 
 const std = @import("std");
-const vnat = @import("../src/lib.zig");
+const vrouter = @import("../src/lib.zig");
 
 test "example configs parse and validate" {
     for ([_][]const u8{
@@ -16,9 +16,9 @@ test "example configs parse and validate" {
         );
         defer std.testing.allocator.free(source);
 
-        var parsed = try vnat.config_parse.parse(std.testing.allocator, source);
+        var parsed = try vrouter.config_parse.parse(std.testing.allocator, source);
         defer parsed.deinit();
 
-        try vnat.config_validate.validate(&parsed.config);
+        try vrouter.config_validate.validate(&parsed.config);
     }
 }

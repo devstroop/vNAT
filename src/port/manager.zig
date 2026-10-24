@@ -135,7 +135,7 @@ pub const Manager = struct {
         self.* = undefined;
     }
 
-    /// Opens the rtnetlink monitor. `vnatd` requires it; one-shot commands can
+    /// Opens the rtnetlink monitor. `vrouterd` requires it; one-shot commands can
     /// skip it.
     pub fn enableMonitor(self: *Manager) PortError!void {
         if (self.monitor != null) return;
