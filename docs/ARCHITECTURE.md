@@ -17,8 +17,9 @@
    control plane; config changes are compiled to immutable routing/bridge/NAT
    tables and swapped atomically.
 5. **Journal before mutation.** Every host change has a recorded inverse.
-6. **No GUI, one API.** CLI and a Unix-socket API are the only interfaces; the
-   C ABI is for hosts (Android).
+6. **No GUI in v1, one API.** CLI and a Unix-socket API are the only v1
+   interfaces; the C ABI is for hosts (Android). A post-v1 optional `vnat-web`
+   adapter is an unprivileged client of the same API (ADR-011).
 7. **Hostile input.** Decoders are bounds-checked and fuzzed; no `unreachable`
    on wire data.
 
@@ -99,10 +100,12 @@ vnat/
 │   │   ├── host.zig             iface/route mutations + journal (R2)
 │   │   ├── offload.zig          kernel bridge plan + veth trunk (R5, Linux)
 │   │   └── events.zig           event bus
+│   ├── web/                     POST-V1: HTTP, templates, auth (ADR-011)
 │   └── overlay/                 FUTURE: uplink overlay (ADR-004)
 ├── exec/
 │   ├── vnat/main.zig            CLI (`validate`, `port`, `status`, `iface`, `route`, `down`, `journal`, `selftest`)
-│   └── vnatd/main.zig           daemon (config, netlink, IPv4 forwarding loop)
+│   ├── vnatd/main.zig           daemon (config, netlink, IPv4 forwarding loop)
+│   └── vnatweb/main.zig         POST-V1: unprivileged web admin (ADR-011)
 ├── include/vnat.h
 ├── test/
 │   ├── unit/
@@ -301,6 +304,9 @@ CLI / API ──▶ config::diff ──▶ mutation list ──▶ journal ─�
   Restart-required: ports, bridges, addresses.
 - Events: `port_up/down`, `link_change`, `addr_change`, `dhcp_lease`,
   `nat_expired`, `config_applied`, `error`.
+- Post-v1, an optional `vnat-web` adapter may expose this API over
+  authenticated HTTP. It remains an unprivileged client of the Unix socket and
+  never mutates host state directly (ADR-011).
 
 ## 4. Datapath backends
 
@@ -443,3 +449,4 @@ no throughput or latency claim is made before R9.
 | [008](adr/008-userspace-stp.md) | Optional userspace 802.1D STP |
 | [009](adr/009-kernel-bridge-offload.md) | Kernel bridge offload with a veth trunk |
 | [010](adr/010-embedded-c-abi.md) | Embedded C ABI and host fd injection |
+| [011](adr/011-web-admin.md) | Optional local web admin (post-v1) |

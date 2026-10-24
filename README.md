@@ -104,5 +104,7 @@ Contributor rules: `AGENTS.md`.
 - R7: foundation in progress (C ABI, injected fd port, service lifecycle);
   JNI/VpnService host and proxy NAT pending
 - R8-R9: planned
+- R10 (post-v1): optional local web admin via HTMX and the Unix-socket API
+  (ADR-011)
 
 See `docs/PLAN.md` for milestone details.

@@ -1,6 +1,7 @@
 # vNAT — Project Plan
 
-> Router-first. Linux → Android. No GUI. Zig 0.16.x.
+> Router-first. Linux → Android. No GUI in v1; optional post-v1 web admin.
+> Zig 0.16.x.
 > Scope: [CORE-SCOPE.md](./CORE-SCOPE.md). Design: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## 1. Delivery strategy
@@ -14,6 +15,7 @@ Vertical-slice order:
 R0 skeleton ─▶ R1 ports ─▶ R2 IPv4 forwarding ─▶ R3 NAT/conntrack
    ─▶ R4 DHCP/DNS ─▶ R5 L2 bridge ─▶ R6 firewall
    ─▶ R7 Android VPN ─▶ R8 Android root ─▶ R9 IPv6 + hardening + v1.0
+                                      └─▶ R10 optional web admin (post-v1)
 ```
 
 A usable Linux router exists at the end of **R4**. L2 bridging and Android
@@ -208,6 +210,26 @@ through vNAT's NAT; uninstall/stop restores tethering.
 - [ ] Docs: quickstart, config reference, Android modes, troubleshooting.
 - [ ] v1.0.0.
 
+### R10 — Optional Linux web admin (post-v1, 2–3 weeks)
+
+Prerequisites: v1.0 shipped, the R7 control socket is stable, and read/write
+authorization scopes exist. v1 scope does not change (ADR-011).
+
+- [ ] `vnat-web`: unprivileged Unix-socket client, Zig HTTP server, embedded
+      templates and static assets, vendored/pinned HTMX; no Node, no CDN.
+- [ ] Loopback/Unix-socket defaults; explicit LAN bind; TLS reverse-proxy docs.
+- [ ] Auth/session (PAM or Argon2id), CSRF, Origin/Host checks, strict CSP,
+      rate limits and an audit log for writes.
+- [ ] Read-only status: ports, bridges, routes, leases, conntrack, counters,
+      firewall rules and journal.
+- [ ] Config apply with diff/preview/confirm/rollback; link up/down/reconnect.
+- [ ] Handler/auth tests plus Playwright happy-path and security-negative tests.
+- [ ] systemd unit, packaging and operator docs.
+
+**Exit:** An operator can inspect and safely apply configuration over
+authenticated HTTPS on a Linux box; the web process cannot mutate host state
+or bypass the control socket; v1 CLI/API behavior is unchanged.
+
 ## 3. Effort summary
 
 | Milestone | Weeks (solo) | Cumulative |
@@ -222,6 +244,7 @@ through vNAT's NAT; uninstall/stop restores tethering.
 | R7 Android VPN | 3–4 | 28 |
 | R8 Android root | 3–4 | 32 |
 | R9 Hardening/release | 3–4 | 36 |
+| R10 Optional web admin (post-v1) | 2–3 | 38–39 |
 
 ≈8–9 months solo for a polished Linux+Android v1. A usable Linux router
 (R0–R4) lands at ~4 months. Two people compress R1–R6 by ~35%.
@@ -251,7 +274,8 @@ through vNAT's NAT; uninstall/stop restores tethering.
 | Config/journal complexity | Medium | Medium | Strict schema, transactional apply, property tests |
 | L2 bridge loops in the field | Medium | High | STP option, storm control, loop detection, docs |
 | Privilege model on Linux | Low | Medium | Caps + systemd; optional privilege separation later |
-| Scope creep (GUI/overlay) | High | Medium | Product non-goals; overlay deferred (ADR-004) |
+| Scope creep (GUI/overlay) | High | Medium | v1 non-goals; overlay deferred (ADR-004); web admin deferred post-v1 (ADR-011) |
+| Web admin exposes the control plane | Medium | High | Loopback/Unix-socket default, auth + CSRF + TLS reverse proxy, separate unprivileged client, no direct mutation |
 
 ## 6. Definition of done (v1)
 
@@ -262,7 +286,8 @@ through vNAT's NAT; uninstall/stop restores tethering.
 - Android Mode B: root router for tethered clients with safe rollback.
 - 24 h soak, fuzzing clean, performance budgets met.
 - CLI + API + docs + packages.
-- No GUI, no cloud, no telemetry.
+- No GUI in v1, no cloud, no telemetry; the optional web admin is R10
+  (post-v1, ADR-011).
 
 ## 7. CI matrix
 
@@ -289,3 +314,4 @@ through vNAT's NAT; uninstall/stop restores tethering.
 | 8 | Optional userspace 802.1D STP | Accepted — ADR-008 (R5) |
 | 9 | Kernel bridge offload with a veth trunk | Accepted — ADR-009 (R5) |
 | 10 | Embedded C ABI and host fd injection | Accepted — ADR-010 (R7 foundation) |
+| 11 | Optional local web admin via HTMX | Accepted — ADR-011 (R10, post-v1) |

@@ -9,8 +9,8 @@
 
 **vNAT turns a Linux machine or an Android device into an opt-in, portable
 virtual router**: it attaches to L2/L3 interfaces, bridges or routes between
-them, and provides NAT, DHCP, DNS, firewall and port forwarding — with no GUI,
-just a daemon and a CLI/API.
+them, and provides NAT, DHCP, DNS, firewall and port forwarding — with no GUI
+in v1, just a daemon and a CLI/API. An optional local web admin is post-v1.
 
 ## 2. Why this exists
 
@@ -18,7 +18,7 @@ Routers are normally fixed appliances. But the device in your pocket already
 has Wi-Fi, cellular, USB-C Ethernet and USB tethering; a Linux mini-PC already
 has multiple NICs. What is missing is a **portable, scriptable, auditable
 routing engine** that can use those interfaces on demand, without flashing
-OpenWrt, without a cloud account, and without a GUI.
+OpenWrt, without a cloud account, and without a GUI in v1.
 
 vNAT is that engine. It is *opt-in*: nothing changes on the host until the user
 starts it, and everything it changes is journaled and rolled back.
@@ -52,7 +52,9 @@ starts it, and everything it changes is journaled and rolled back.
 - **`vnat`:** CLI (also embeds the daemon for foreground use).
 - **Android:** host app is thin — it supplies `VpnService` fd / root
   capabilities and renders status; all routing logic is in the core.
-- **No GUI in v1.** JSON output + `vnat status --watch` is the UI.
+- **No GUI in v1.** JSON output + `vnat status --watch` is the UI. An optional
+  post-v1 local web admin consumes the same Unix-socket API; it is not part of
+  v1 and never mutates host state directly (ADR-011).
 
 ## 5. Product principles
 
@@ -66,7 +68,8 @@ starts it, and everything it changes is journaled and rolled back.
    when it is L3. Never force one model.
 5. **Declarative config, imperative escape hatches.** Desired-state config plus
    CLI verbs for live changes.
-6. **No GUI, no cloud, no telemetry.** Local control only.
+6. **No GUI in v1, no cloud, no telemetry.** Local control only. The optional
+   post-v1 web admin is an unprivileged local API client (ADR-011).
 7. **Hostile input.** Every frame/packet/config byte is untrusted.
 
 ## 6. Capability tiers
@@ -83,7 +86,7 @@ release if root testing hardware is available; **T4** is post-v1.
 
 ## 7. Non-goals (v1)
 
-- GUI, mobile UI, web dashboard.
+- GUI, mobile UI, web dashboard in v1 (local web admin is post-v1, ADR-011).
 - Cloud control plane, accounts, billing, telemetry.
 - P2P/VPN overlay, NAT traversal, relay (kept as a future uplink module; see
   `docs/RESEARCH.md` §3 and ADR-004).

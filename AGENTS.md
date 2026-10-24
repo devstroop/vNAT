@@ -1,8 +1,9 @@
 # vNAT — Agent Guide
 
 Portable virtual router in Zig 0.16+: L2/L3 forwarding, bridging, NAT, DHCP,
-DNS and firewall for Linux and Android. No GUI. This file is the contract for
-any agent working in this repo.
+DNS and firewall for Linux and Android. No GUI in v1; an optional post-v1 web
+admin is a separate unprivileged control-socket client (ADR-011). This file is
+the contract for any agent working in this repo.
 
 ## Stack
 
@@ -13,9 +14,10 @@ any agent working in this repo.
 | NAT / firewall | `src/nat/`, `src/firewall/` | conntrack, SNAT/DNAT, rules |
 | Services | `src/services/` | DHCPv4, DNS forwarder |
 | CLI / daemon | `src/cli/`, `src/app/` | Zig |
-| Executables | `exec/` | `vnat`, `vnatd` |
+| Executables | `exec/` | `vnat`, `vnatd`; `vnat-web` post-v1 |
 | C ABI | `src/ffi.zig`, `include/vnat.h` | for Android/iOS/desktop hosts |
 | Control plane | `src/control/` | config diff, journal, unix socket API |
+| Web admin (post-v1) | `src/web/`, `exec/vnatweb/` | Zig HTTP, server-rendered HTMX, Unix-socket client |
 | Tests | `test/` | unit, netns, fuzz, Android smoke |
 
 ## Commands
@@ -114,6 +116,8 @@ Always run `zig build test`. For port/forwarding changes, also run
   fragments) and attach results.
 - New host mutation: journal inverse + rollback test.
 - Android change: emulator smoke (Mode A); rooted-device test (Mode B).
+- Web admin change: handler/auth/CSRF tests + Playwright flows; the web process
+  must never bypass the control socket.
 - Performance-sensitive change: `scripts/perf.sh` before/after.
 
 ## Documentation expectations
@@ -142,7 +146,7 @@ Always run `zig build test`. For port/forwarding changes, also run
 Installed in `.opencode/skills/`:
 - `skill-creator` — build or improve repo-specific skills.
 - `doc-coauthoring` — write ADRs, specs, proposals.
-- `webapp-testing` — Playwright testing for a future dashboard.
+- `webapp-testing` — Playwright testing for the post-v1 web admin.
 
 Use `skill-creator` to add a `vnat-networking` skill once the port/packet
 interfaces stabilize.

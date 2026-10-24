@@ -567,6 +567,9 @@ Every command supports `--json`. Exit codes are stable.
 - Unix domain socket (`/run/vnat/control.sock`), mode `0660`, group `vnat`.
 - Line-delimited JSON requests/responses (easy to script) or JSON-RPC 2.0.
 - No TCP listener by default. If enabled, requires a token and TLS.
+- v1 exposes no HTTP listener. A post-v1 optional `vnat-web` adapter may render
+  this API in a browser; it is an unprivileged client and never mutates host
+  state directly (ADR-011).
 - Streaming events: `port_up`, `port_down`, `link_change`, `dhcp_lease`,
   `nat_expired`, `error`.
 
@@ -675,7 +678,8 @@ workers, buffer pools, batch processing, optional AF_XDP (post-v1).
 
 ## 13. Explicitly out of scope for v1
 
-- GUI / web UI / TUI beyond `status --watch`.
+- GUI / web UI / TUI beyond `status --watch` (local web admin deferred to
+  post-v1, ADR-011).
 - Overlay/P2P/VPN protocols (future uplink port).
 - Dynamic routing protocols.
 - IPv6 RA/DHCPv6 (v1.1), NAT64.
