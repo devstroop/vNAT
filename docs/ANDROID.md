@@ -91,7 +91,28 @@ Rules:
 - `onRevoke()` must stop the data loop and close the fd.
 - One active VPN per user; be prepared to lose to another app.
 
-### 2.3 Lifecycle and permissions
+### 2.3 Native lifecycle and fd ownership
+
+The native library implements the C ABI in `include/vnat.h` (see ADR-010).
+The config must declare an existing L3 port (for example `vpn0`) with
+`"kind": "l3"` and no `create`:
+
+1. `vnat_create(config_json)` — parse and validate.
+2. `vnat_set_port_fd(handle, "vpn0", fd)` — bind the `establish()` descriptor
+   before startup.
+3. `vnat_start(handle)` — blocks until the data plane is ready; vNAT duplicates
+   the fd, so the app may close its copy after this returns. Restarting the
+   same handle reuses the binding, so keep the fd open if a restart is planned.
+4. `onRevoke()` / service shutdown — `vnat_stop(handle)`, then close the VPN
+   interface and destroy the handle.
+
+Events are delivered on the data-plane thread. Callbacks must not call
+`vnat_*` functions other than `vnat_get_status`. The FFI profile does not mutate host state or start
+hotplug monitoring. The shared library calls the platform's `pthread_create` /
+`pthread_join`; Android bionic provides them, while Linux static consumers
+should link with `-pthread`.
+
+### 2.4 Lifecycle and permissions
 
 - Service extends `VpnService`, declared with `android:permission="BIND_VPN_SERVICE"`
   and exported only as required.
@@ -108,7 +129,7 @@ Rules:
 - Doze/App Standby: foreground service + `WakeLock` only while forwarding;
   batch timers; no per-packet wakeups.
 
-### 2.4 DNS
+### 2.5 DNS
 
 - Advertise the router address via `addDnsServer`; vNAT answers locally and
   forwards upstream over protected sockets.
@@ -116,7 +137,7 @@ Rules:
   document this and offer "block DoT" via firewall rules if the user opts in.
 - IPv6 DNS (`addDnsServer` with a v6 address) supported on modern Android.
 
-### 2.5 Limits of Mode A
+### 2.6 Limits of Mode A
 
 - Cannot serve tethered clients.
 - Cannot use raw L2; no bridging.

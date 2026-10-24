@@ -101,6 +101,8 @@ Contributor rules: `AGENTS.md`.
 
 - R0-R4: complete
 - R5-R6: in progress (VLAN bridging and firewall core wired)
-- R7-R9: planned
+- R7: foundation in progress (C ABI, injected fd port, service lifecycle);
+  JNI/VpnService host and proxy NAT pending
+- R8-R9: planned
 
 See `docs/PLAN.md` for milestone details.

@@ -171,7 +171,9 @@ suites.
 
 ### R7 — Android VPN mode (3–4 weeks)
 
-- [ ] JNI bridge + C ABI (`vnat_create`, `set_port_fd`, events).
+- [x] C ABI (`vnat_create`, `set_port_fd`, events, status), injected-fd L3
+  port, shared service lifecycle, and C header/link smoke test.
+- [ ] JNI bridge.
 - [ ] Proxy NAT backend (TCP/UDP/ICMP over protected sockets).
 - [ ] Host `VpnService`: Builder, MTU 1380, routes, DNS, per-app split tunnel.
 - [ ] Foreground service, `onRevoke`, always-on VPN + system lockdown support.
@@ -284,5 +286,6 @@ through vNAT's NAT; uninstall/stop restores tethering.
 | 5 | Conntrack timeouts/port allocation | Accepted — ADR-005 (R3 subset) |
 | 6 | Config/journal formats | Accepted — ADR-006 (R2 subset) |
 | 7 | Repair transport checksums after AF_PACKET | Accepted — ADR-007 |
-| 8 | Privilege model | Open — ADR-008 |
-| 9 | Threading model | Open — ADR-009 |
+| 8 | Optional userspace 802.1D STP | Accepted — ADR-008 (R5) |
+| 9 | Kernel bridge offload with a veth trunk | Accepted — ADR-009 (R5) |
+| 10 | Embedded C ABI and host fd injection | Accepted — ADR-010 (R7 foundation) |

@@ -23,30 +23,47 @@ pub fn build(b: *std.Build) void {
     const is_android = is_linux and
         (target_abi == .android or target_abi == .androideabi);
 
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", comptime parseVersion(build_zon));
-    const build_options_mod = build_options.createModule();
+    const version = comptime parseVersion(build_zon);
 
-    const lib_mod = b.createModule(.{
+    const core_options = b.addOptions();
+    core_options.addOption([]const u8, "version", version);
+    core_options.addOption(bool, "pthread_threads", false);
+    const core_options_mod = core_options.createModule();
+
+    const ffi_options = b.addOptions();
+    ffi_options.addOption([]const u8, "version", version);
+    ffi_options.addOption(bool, "pthread_threads", true);
+    const ffi_options_mod = ffi_options.createModule();
+
+    const core_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lib_mod.addImport("build_options", build_options_mod);
+    core_mod.addImport("build_options", core_options_mod);
+
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ffi_mod.addImport("build_options", ffi_options_mod);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
         .name = "vnat",
-        .root_module = lib_mod,
+        .root_module = ffi_mod,
     });
     b.installArtifact(static_lib);
+    static_lib.installHeader(b.path("include/vnat.h"), "vnat.h");
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "vnat",
-        .root_module = lib_mod,
+        .root_module = ffi_mod,
         .version = .{ .major = 0, .minor = 0, .patch = 1 },
     });
+    shared_lib.linker_allow_shlib_undefined = true;
     b.installArtifact(shared_lib);
 
     if (is_linux and !is_android) {
@@ -55,7 +72,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vnat", .module = lib_mod },
+                .{ .name = "vnat", .module = core_mod },
             },
         });
 
@@ -81,7 +98,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vnat", .module = lib_mod },
+                .{ .name = "vnat", .module = core_mod },
             },
         });
 
@@ -97,7 +114,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("build_options", build_options_mod);
+    test_mod.addImport("build_options", core_options_mod);
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests containing this substring");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
@@ -110,4 +127,23 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const ffi_smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ffi_smoke_mod.addCSourceFile(.{
+        .file = b.path("test/ffi_smoke.c"),
+        .flags = &.{"-std=c11"},
+    });
+    ffi_smoke_mod.addIncludePath(b.path("include"));
+    ffi_smoke_mod.linkLibrary(shared_lib);
+
+    const ffi_smoke = b.addExecutable(.{
+        .name = "ffi-smoke",
+        .root_module = ffi_smoke_mod,
+    });
+    const run_ffi_smoke = b.addRunArtifact(ffi_smoke);
+    test_step.dependOn(&run_ffi_smoke.step);
 }

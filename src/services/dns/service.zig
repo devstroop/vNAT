@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("../../types.zig");
 const message = @import("message.zig");
 const cache_mod = @import("cache.zig");
+const thread = @import("../../thread.zig");
 
 pub const Zone = struct {
     suffix: []const u8,
@@ -23,14 +24,16 @@ pub const Config = struct {
     zones: []const Zone = &.{},
 };
 
-pub const Counters = struct {
-    queries: std.atomic.Value(u64) = .init(0),
-    responses: std.atomic.Value(u64) = .init(0),
-    cache_hits: std.atomic.Value(u64) = .init(0),
-    upstream_errors: std.atomic.Value(u64) = .init(0),
-    dropped: std.atomic.Value(u64) = .init(0),
+const Counter = if (@sizeOf(usize) >= 8) u64 else u32;
 
-    fn inc(counter: *std.atomic.Value(u64)) void {
+pub const Counters = struct {
+    queries: std.atomic.Value(Counter) = .init(0),
+    responses: std.atomic.Value(Counter) = .init(0),
+    cache_hits: std.atomic.Value(Counter) = .init(0),
+    upstream_errors: std.atomic.Value(Counter) = .init(0),
+    dropped: std.atomic.Value(Counter) = .init(0),
+
+    fn inc(counter: *std.atomic.Value(Counter)) void {
         _ = counter.fetchAdd(1, .monotonic);
     }
 };
@@ -57,10 +60,8 @@ pub const Service = struct {
     cache_mutex: std.Io.Mutex = .init,
     counters: Counters = .{},
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    udp_future: std.Io.Future(void) = undefined,
-    tcp_future: std.Io.Future(void) = undefined,
-    udp_started: bool = false,
-    tcp_started: bool = false,
+    udp_thread: ?thread.Thread = null,
+    tcp_thread: ?thread.Thread = null,
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, cfg: Config) Error!Service {
         if (cfg.upstreams.len == 0 and cfg.zones.len == 0) return error.UpstreamBindFailed;
@@ -103,32 +104,39 @@ pub const Service = struct {
     }
 
     pub fn start(self: *Service) Error!void {
-        self.udp_future = std.Io.concurrent(self.io, runUdp, .{self}) catch
+        self.udp_thread = thread.spawn(runUdp, .{self}) catch
             return error.ConcurrencyUnavailable;
-        self.udp_started = true;
         if (self.tcp_listener != null) {
-            self.tcp_future = std.Io.concurrent(self.io, runTcp, .{self}) catch
+            self.tcp_thread = thread.spawn(runTcp, .{self}) catch {
+                self.stop.store(true, .release);
+                self.udp_thread.?.join();
+                self.udp_thread = null;
+                self.stop.store(false, .release);
                 return error.ConcurrencyUnavailable;
-            self.tcp_started = true;
+            };
         }
     }
 
     pub fn deinit(self: *Service) void {
         self.stop.store(true, .release);
+        if (self.tcp_listener) |*listener| {
+            const stream: std.Io.net.Stream = .{ .socket = listener.socket };
+            stream.shutdown(self.io, .both) catch {};
+        }
+        if (self.udp_thread) |udp| {
+            udp.join();
+            self.udp_thread = null;
+        }
+        if (self.tcp_thread) |tcp| {
+            tcp.join();
+            self.tcp_thread = null;
+        }
         self.socket.close(self.io);
         self.upstream_socket.close(self.io);
         self.upstream_socket_tcp.close(self.io);
         if (self.tcp_listener) |*listener| {
-            listener.socket.close(self.io);
+            listener.deinit(self.io);
             self.tcp_listener = null;
-        }
-        if (self.udp_started) {
-            _ = self.udp_future.await(self.io);
-            self.udp_started = false;
-        }
-        if (self.tcp_started) {
-            _ = self.tcp_future.await(self.io);
-            self.tcp_started = false;
         }
         self.cache.deinit();
         self.* = undefined;
@@ -527,4 +535,21 @@ test "service accepts a zone-only configuration" {
         .tcp = false,
     });
     defer service.deinit();
+}
+
+test "tcp listener wakes on deinit" {
+    const zones = [_]Zone{.{
+        .suffix = "lan",
+        .upstreams = &.{.{ .value = 0x0a000001 }},
+    }};
+    var service = try Service.init(testing.io, testing.allocator, .{
+        .listen_ip = .{ .value = 0x7f000001 },
+        .listen_port = 0,
+        .upstreams = &.{},
+        .zones = &zones,
+        .tcp = true,
+    });
+    try service.start();
+    std.Io.sleep(testing.io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    service.deinit();
 }

@@ -10,6 +10,7 @@ const port_mod = @import("port.zig");
 const types = @import("../types.zig");
 const PortError = @import("../errors.zig").PortError;
 const linux = @import("linux/root.zig");
+const fd_port = @import("fd.zig");
 
 pub const Entry = struct {
     config_name: []const u8,
@@ -22,11 +23,19 @@ pub const ExtraPort = struct {
     mtu: ?u16 = null,
 };
 
+pub const InjectedPort = struct {
+    config_name: []const u8,
+    fd: std.posix.fd_t,
+};
+
 pub const OpenOptions = struct {
     /// Config ports that must not be opened (kernel-offloaded bridge members).
     skip: []const []const u8 = &.{},
     /// Synthetic ports opened after configured ports (veth trunk endpoints).
     extras: []const ExtraPort = &.{},
+    /// L3 ports supplied by the host (Android VpnService fd) instead of opened
+    /// from the config.
+    injected: []const InjectedPort = &.{},
 };
 
 pub const Manager = struct {
@@ -69,7 +78,16 @@ pub const Manager = struct {
             const id = types.PortId{ .value = next_id };
             next_id += 1;
 
-            const port = try openOne(a, io, id, map_entry.value_ptr.*);
+            const port = if (findInjected(options.injected, map_entry.key_ptr.*)) |injected| blk: {
+                const port_cfg = map_entry.value_ptr.*;
+                if (port_cfg.kind != .l3 or port_cfg.create != null) return error.InvalidArgument;
+                const p = try fd_port.FdPort.open(a, io, id, .{
+                    .fd = injected.fd,
+                    .name = port_cfg.device,
+                    .mtu = port_cfg.mtu orelse 1380,
+                });
+                break :blk p.port();
+            } else try openOne(a, io, id, map_entry.value_ptr.*);
             errdefer port.deinit(io);
 
             try list.append(a, .{
@@ -93,6 +111,17 @@ pub const Manager = struct {
                 .config_name = try a.dupe(u8, extra.config_name),
                 .port = port,
             });
+        }
+
+        for (options.injected, 0..) |injected, i| {
+            if (findInjected(options.injected[0..i], injected.config_name) != null) {
+                return error.InvalidArgument;
+            }
+            if (!cfg.ports.contains(injected.config_name) or
+                optionallySkipped(options.skip, injected.config_name))
+            {
+                return error.InvalidArgument;
+            }
         }
 
         self.entries = try list.toOwnedSlice(a);
@@ -154,6 +183,13 @@ pub const Manager = struct {
             }
         }
         return event;
+    }
+
+    fn findInjected(injected: []const InjectedPort, name: []const u8) ?InjectedPort {
+        for (injected) |item| {
+            if (std.mem.eql(u8, item.config_name, name)) return item;
+        }
+        return null;
     }
 
     fn optionallySkipped(skip: []const []const u8, name: []const u8) bool {

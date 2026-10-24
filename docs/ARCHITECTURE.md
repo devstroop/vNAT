@@ -41,9 +41,12 @@ vnat/
 ├── src/
 │   ├── lib.zig                  public Zig API
 │   ├── ffi.zig                  C ABI (R7)
+│   ├── thread.zig               std/pthread thread backend
 │   ├── io.zig                   std.Io wiring, timers, cancellation
 │   ├── log.zig                  leveled text/JSON logger
 │   ├── types.zig                PortId, Mac, IpAddr, Mtu, VlanId
+│   ├── app/
+│   │   └── service.zig           shared daemon/FFI lifecycle
 │   ├── config/
 │   │   ├── schema.zig           typed config model
 │   │   ├── parse.zig            strict JSON parser
@@ -53,6 +56,7 @@ vnat/
 │   │   ├── manager.zig          config → ports, hotplug pump
 │   │   ├── pool.zig             buffer pools
 │   │   ├── memory.zig           in-memory port for tests
+│   │   ├── fd.zig               host-injected L3 port
 │   │   ├── linux/
 │   │   │   ├── sys.zig          non-blocking fd helpers, errno mapping
 │   │   │   ├── iface.zig        SIOCGIF* control ioctls
@@ -436,5 +440,6 @@ no throughput or latency claim is made before R9.
 | [005](adr/005-conntrack-nat.md) | Conntrack/NAT design (port allocation, timeouts) |
 | [006](adr/006-config-journal.md) | Config schema and R2 journal format |
 | [007](adr/007-userspace-checksum-repair.md) | Repair transport checksums on forwarded IPv4 |
-| 008 (planned) | Privilege model |
-| 009 (planned) | Threading model |
+| [008](adr/008-userspace-stp.md) | Optional userspace 802.1D STP |
+| [009](adr/009-kernel-bridge-offload.md) | Kernel bridge offload with a veth trunk |
+| [010](adr/010-embedded-c-abi.md) | Embedded C ABI and host fd injection |

@@ -8,6 +8,10 @@ All notable changes to vNAT are documented here. The format follows
 
 ### Added
 
+- R7 foundation: reusable daemon lifecycle (`src/app/service.zig`) shared by
+  `vnatd` and the versioned C ABI (`include/vnat.h`, `src/ffi.zig`), an
+  injected-fd L3 port for Android `VpnService`, stable lifecycle/error/status
+  codes, and a compiled C header/link smoke test.
 - Optional Linux kernel-bridge offload (`bridge.offload = "kernel"`): creates a
   journaled kernel bridge, enslaves existing L2 members, and attaches a veth
   trunk as the bridge's synthetic userspace port. Kernel VLAN filtering/STP,
@@ -58,6 +62,8 @@ All notable changes to vNAT are documented here. The format follows
 
 ### Fixed
 
+- Close DNS sockets only after joining the UDP/TCP workers, and shut down the
+  TCP listener to wake a blocked `accept` during shutdown.
 - Recover 802.1Q tags stripped by VLAN offload using `PACKET_AUXDATA` before
   ingress classification, and add a veth access/trunk netns test.
 - Bound the ARP neighbour cache and miss-rate map; stale entries are pruned and

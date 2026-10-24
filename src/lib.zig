@@ -17,6 +17,10 @@ pub const config_validate = @import("config/validate.zig");
 
 pub const port = @import("port/port.zig");
 pub const memory_port = @import("port/memory.zig");
+pub const fd_port = if (builtin.os.tag == .linux)
+    @import("port/fd.zig")
+else
+    struct {};
 pub const buffer_pool = @import("port/pool.zig");
 
 pub const journal = @import("control/journal.zig");
@@ -57,6 +61,11 @@ pub const manager = if (builtin.os.tag == .linux)
 else
     struct {};
 
+pub const app_service = if (builtin.os.tag == .linux)
+    @import("app/service.zig")
+else
+    struct {};
+
 pub const Config = config_schema.Config;
 pub const Port = port.Port;
 pub const PortId = types.PortId;
@@ -72,6 +81,7 @@ test {
     _ = @import("config/validate.zig");
     _ = @import("port/port.zig");
     _ = @import("port/memory.zig");
+    if (builtin.os.tag == .linux) _ = @import("port/fd.zig");
     _ = @import("port/pool.zig");
     _ = @import("control/journal.zig");
     _ = @import("control/firewall_counters.zig");
@@ -98,5 +108,6 @@ test {
     if (builtin.os.tag == .linux) {
         _ = @import("port/linux/root.zig");
         _ = @import("port/manager.zig");
+        _ = @import("app/service.zig");
     }
 }

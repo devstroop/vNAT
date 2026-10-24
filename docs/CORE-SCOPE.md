@@ -599,6 +599,8 @@ netlink call:
 
 ### 9.5 C ABI (Android / future desktop)
 
+`include/vnat.h` is the ABI; `src/ffi.zig` implements it. ABI version 1:
+
 ```c
 typedef void* vnat_t;
 vnat_t vnat_create(const char* config_json);
@@ -611,8 +613,18 @@ int    vnat_get_status(vnat_t, vnat_status_t*);
 const char* vnat_version(void);
 ```
 
-Rules: opaque handles, fixed-size structs, no allocations across the boundary,
-stable error codes, callbacks on one thread.
+Rules:
+- Opaque handles, fixed-size status, stable error/event codes, no allocation
+  across the boundary.
+- Configured existing L3 ports are eligible for fd injection (`kind = "l3"`,
+  no `create`). The fd is borrowed and duplicated during `vnat_start`; the
+  host may close its copy after startup.
+- `vnat_start` blocks until ready; `STARTED` is delivered before it returns.
+  `vnat_stop` is idempotent. Events run on the data-plane thread; callbacks
+  must not call `vnat_*` functions other than `vnat_get_status`.
+- The FFI profile disables host mutations and hotplug monitoring. It uses the
+  host's pthread implementation rather than Zig's raw-clone thread path.
+- ADR-010 records the ownership, threading and compatibility contract.
 
 ## 10. Platform matrix (v1)
 

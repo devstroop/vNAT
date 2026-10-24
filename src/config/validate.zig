@@ -8,11 +8,21 @@ const schema = @import("schema.zig");
 const types = @import("../types.zig");
 const ConfigError = @import("../errors.zig").ConfigError;
 
+pub const Options = struct {
+    /// Hosts that inject L3 descriptors (Android VpnService) may configure an
+    /// existing L3 port without asking vNAT to create a TUN device.
+    allow_existing_l3: bool = false,
+};
+
 pub fn validate(cfg: *const schema.Config) ConfigError!void {
+    return validateWithOptions(cfg, .{});
+}
+
+pub fn validateWithOptions(cfg: *const schema.Config, options: Options) ConfigError!void {
     if (cfg.version != 1) return error.InvalidVersion;
     try validateInstance(cfg.instance);
 
-    try validatePorts(cfg);
+    try validatePorts(cfg, options);
     try validateBridges(cfg);
     try validateInterfaces(cfg);
     try validateRoutes(cfg);
@@ -77,7 +87,7 @@ fn validateInstance(instance: []const u8) ConfigError!void {
     }
 }
 
-fn validatePorts(cfg: *const schema.Config) ConfigError!void {
+fn validatePorts(cfg: *const schema.Config, options: Options) ConfigError!void {
     var it = cfg.ports.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
@@ -88,7 +98,7 @@ fn validatePorts(cfg: *const schema.Config) ConfigError!void {
 
         const port = entry.value_ptr.*;
         if (port.device.len == 0 or port.device.len >= 16) return error.InvalidValue;
-        if (port.kind == .l3 and port.create == null) {
+        if (port.kind == .l3 and port.create == null and !options.allow_existing_l3) {
             // Existing L3 devices have no fd vNAT can adopt; only TUN can be
             // created and owned by the daemon.
             return error.InvalidValue;
@@ -658,6 +668,16 @@ test "rejects duplicate port devices" {
     var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
     defer parsed.deinit();
     try std.testing.expectError(error.DuplicateName, validate(&parsed.config));
+}
+
+test "host may allow injected l3 ports" {
+    const input =
+        \\{ "version": 1, "instance": "x",
+        \\  "ports": { "wan": { "kind": "l3", "device": "eth0" } } }
+    ;
+    var parsed = try @import("parse.zig").parse(std.testing.allocator, input);
+    defer parsed.deinit();
+    try validateWithOptions(&parsed.config, .{ .allow_existing_l3 = true });
 }
 
 test "rejects existing l3 ports" {
