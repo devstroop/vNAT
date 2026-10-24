@@ -8,6 +8,14 @@ All notable changes to vNAT are documented here. The format follows
 
 ### Added
 
+- R7 Linux control socket: line-delimited JSON over
+  `/run/vnat/control.sock` (mode `0660`, peer-uid check), live read-only
+  `status`, `nat.list` and `conntrack.list`, and the `vnat up`, `vnat doctor`,
+  `vnat nat list` and `vnat conntrack list` CLI commands. The daemon publishes
+  immutable datapath snapshots once per second. A run-dir lock rejects a
+  second daemon, concurrent `vnat up` starts are serialized, and `vnat down`
+  refuses while a matching daemon is live. `vnat up` writes daemon stderr to
+  `<state_dir>/vnatd.log` and reports its path and tail on failure.
 - R7 foundation: reusable daemon lifecycle (`src/app/service.zig`) shared by
   `vnatd` and the versioned C ABI (`include/vnat.h`, `src/ffi.zig`), an
   injected-fd L3 port for Android `VpnService`, stable lifecycle/error/status

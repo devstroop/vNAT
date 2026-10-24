@@ -10,6 +10,8 @@ const dhcp_leases = @import("../services/dhcp/leases.zig");
 const dns_service = @import("../services/dns/service.zig");
 const control_host = @import("../control/host.zig");
 const control_offload = @import("../control/offload.zig");
+const control_server = @import("../control/server.zig");
+const control_state = @import("../control/state.zig");
 const firewall_counters = @import("../control/firewall_counters.zig");
 const netlink = @import("../port/linux/netlink.zig");
 
@@ -46,6 +48,18 @@ pub fn run(
     options: Options,
 ) !void {
     var logger = log.Logger.init(io, cfg.log);
+
+    // Reserve the control socket before any host mutation so a second daemon
+    // fails fast instead of racing the first one's routes and journal.
+    var control_path: ?[]u8 = null;
+    defer if (control_path) |path| gpa.free(path);
+    var control: ?control_server.Server = null;
+    defer if (control) |*server| server.deinit();
+    if (options.state_dir) |state_dir| {
+        const path = try std.fs.path.join(gpa, &.{ state_dir, "control.sock" });
+        control_path = path;
+        control = try control_server.Server.init(io, gpa, path, .{});
+    }
 
     var host: ?control_host.Host = null;
     defer if (host) |*h| h.deinit();
@@ -195,6 +209,24 @@ pub fn run(
 
     try forwarder.announce(io);
 
+    const started_ms = nowMs(io);
+    if (control) |*server| {
+        var snapshot: control_state.Snapshot = .{};
+        buildSnapshot(
+            &snapshot,
+            cfg,
+            &forwarder,
+            manager.count(),
+            options.state_dir.?,
+            control_path.?,
+            started_ms,
+            started_ms,
+        );
+        server.publish(&snapshot);
+        try server.start();
+        logger.info("control socket={s}", .{control_path.?});
+    }
+
     logger.info("started instance={s} ports={d} local={d} routes={d}", .{
         cfg.instance,
         manager.count(),
@@ -204,7 +236,7 @@ pub fn run(
 
     if (options.runtime) |runtime| {
         runtime.port_count.store(@intCast(manager.count()), .release);
-        runtime.started_ms.store(timestamp(nowMs(io)), .release);
+        runtime.started_ms.store(timestamp(started_ms), .release);
         runtime.running.store(true, .release);
     }
     if (options.on_ready) |ready| ready(options.on_ready_ctx);
@@ -212,9 +244,27 @@ pub fn run(
     var buf: [2048]u8 = undefined;
     var netlink_tick: u8 = 0;
     var lease_save_ms = nowMs(io);
+    var control_tick_ms = started_ms;
     while (!stop.load(.acquire)) {
         forwarder.tick(io);
         const now = nowMs(io);
+        if (control) |*server| {
+            if (now - control_tick_ms >= 1_000) {
+                var snapshot: control_state.Snapshot = .{};
+                buildSnapshot(
+                    &snapshot,
+                    cfg,
+                    &forwarder,
+                    manager.count(),
+                    options.state_dir.?,
+                    control_path.?,
+                    started_ms,
+                    now,
+                );
+                server.publish(&snapshot);
+                control_tick_ms = now;
+            }
+        }
         if (options.state_dir) |state_dir| {
             if (now - counter_save_ms >= 5_000) {
                 saveFirewallCounters(
@@ -336,6 +386,108 @@ pub fn run(
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toMilliseconds();
+}
+
+fn buildSnapshot(
+    out: *control_state.Snapshot,
+    cfg: *const schema.Config,
+    forwarder: *const forward.Forwarder,
+    port_count: usize,
+    state_dir: []const u8,
+    control_path: []const u8,
+    started_ms: i64,
+    updated_ms: i64,
+) void {
+    out.* = .{
+        .instance = cfg.instance,
+        .state_dir = state_dir,
+        .control_path = control_path,
+        .started_ms = started_ms,
+        .updated_ms = updated_ms,
+        .ports = @intCast(port_count),
+        .counters = .{
+            .forwarded = forwarder.counters.forwarded,
+            .bridged = forwarder.counters.bridged,
+            .dropped = forwarder.counters.dropped,
+            .firewall_dropped = forwarder.counters.firewall_dropped,
+            .pending_queued = forwarder.counters.pending_queued,
+            .pending_flushed = forwarder.counters.pending_flushed,
+            .conntrack_created = forwarder.conntrack.counters.created,
+            .conntrack_removed = forwarder.conntrack.counters.removed,
+            .conntrack_hits = forwarder.conntrack.counters.hits,
+            .conntrack_misses = forwarder.conntrack.counters.misses,
+            .conntrack_table_full = forwarder.conntrack.counters.table_full,
+            .snat_packets = forwarder.counters.snat_packets,
+            .dnat_packets = forwarder.counters.dnat_packets,
+            .icmp_translated = forwarder.counters.icmp_translated,
+            .dhcp_offers = forwarder.counters.dhcp_offers,
+            .dhcp_acks = forwarder.counters.dhcp_acks,
+            .dhcp_requests = forwarder.counters.dhcp_requests,
+            .dhcp_client_bound = forwarder.counters.dhcp_client_bound,
+            .storm_dropped = forwarder.counters.storm_dropped,
+            .stp_bpdus_rx = forwarder.counters.stp_bpdus_rx,
+            .stp_bpdus_tx = forwarder.counters.stp_bpdus_tx,
+            .stp_filtered = forwarder.counters.stp_filtered,
+            .stp_invalid = forwarder.counters.stp_invalid,
+        },
+    };
+
+    for (forwarder.snat_rules.items) |rule| {
+        if (out.snat_len >= control_state.max_snat) break;
+        out.snat[out.snat_len] = .{
+            .out = portName(forwarder.ports, rule.port),
+            .addr = rule.addr,
+        };
+        out.snat_len += 1;
+    }
+
+    for (forwarder.forward_rules.items) |rule| {
+        if (out.port_forward_len >= control_state.max_port_forward) break;
+        out.port_forward[out.port_forward_len] = .{
+            .proto = rule.proto,
+            .ext_port = rule.ext_port,
+            .to_addr = rule.to_addr,
+            .to_port = rule.to_port,
+            .ingress = if (rule.ingress) |id| portName(forwarder.ports, id) else "",
+        };
+        out.port_forward_len += 1;
+    }
+
+    out.conntrack_total = forwarder.conntrack.count;
+    for (forwarder.conntrack.entries.items) |entry_opt| {
+        if (out.conntrack_len >= control_state.max_conntrack) break;
+        const entry = entry_opt orelse continue;
+        var sampled: control_state.Conntrack = .{
+            .proto = entry.original.proto,
+            .state = @tagName(entry.state),
+            .src = entry.original.src,
+            .sport = entry.original.sport,
+            .dst = entry.original.dst,
+            .dport = entry.original.dport,
+            .packets = entry.packets,
+            .bytes = entry.bytes,
+            .reply_packets = entry.reply_packets,
+            .reply_bytes = entry.reply_bytes,
+            .created_ms = entry.created_ms,
+            .last_seen_ms = entry.last_seen_ms,
+            .timeout_ms = entry.timeout_ms,
+        };
+        if (entry.translated) |translated| {
+            sampled.translated_src = translated.src;
+            sampled.translated_sport = translated.sport;
+            sampled.translated_dst = translated.dst;
+            sampled.translated_dport = translated.dport;
+        }
+        out.conntrack[out.conntrack_len] = sampled;
+        out.conntrack_len += 1;
+    }
+}
+
+fn portName(ports: []const forward.PortEntry, id: types.PortId) []const u8 {
+    for (ports) |entry| {
+        if (entry.id.eql(id)) return entry.config_name;
+    }
+    return "";
 }
 
 fn saveFirewallCounters(

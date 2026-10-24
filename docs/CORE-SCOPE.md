@@ -508,8 +508,11 @@ Rules for config:
   them (R4 DHCP/DNS, R5 VLAN/STP, R6 firewall); existing keys never change
   meaning.
 - Validation before any mutation; all-or-nothing apply.
-- `vnat up` computes a diff and journals each mutation (R7; R2 exposes direct
-  `vnat iface`/`vnat route` verbs).
+- `vnat up` currently validates the config, starts `vnatd` and waits for the
+  control socket; the journaled config diff/apply path remains R7 work. R2
+  exposes direct `vnat iface`/`vnat route` verbs. Daemon stderr is written to
+  `<state_dir>/vnatd.log` (mode `0600`, truncated when a daemon is launched);
+  startup failures print the path and the last 2 KiB of the log.
 - Live-reload only for fields marked hot; otherwise restart required.
 
 ### 9.1.1 Config field status
@@ -529,12 +532,16 @@ apply first.
 
 ### 9.2 CLI
 
-Implemented in R2:
+Implemented:
 
 ```
 vnat validate <config.json>
 vnat port list
 vnat status [-c] <config.json>
+vnat up [-c <config>]
+vnat doctor [-c <config>]
+vnat nat list [-c <config>]
+vnat conntrack list [--state new|established|closing] [--limit <n>] [-c <config>]
 vnat iface set|del <dev> <cidr> [-c <config>]
 vnat iface up|down <dev> [-c <config>]
 vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
@@ -549,29 +556,47 @@ vnat firewall counters [-c <config>]
 vnat firewall test --proto tcp --src 10.0.0.2 --dst 1.1.1.1 --dport 443 [--iif lan0] [-c <config>]
 ```
 
+`vnat down` refuses while the matching daemon is live; stop `vnatd` first.
+
 Planned with their milestones:
 
 ```
-vnat up -c /etc/vnat/vnat.json          # R7 control plane
 vnat bridge create lan                   # R5
 vnat nat add masquerade --out wan0       # R3
-vnat conntrack list [--state established] # R3
 vnat pcap --iface lan --write cap.pcap   # R9
-vnat doctor                              # R7
 ```
 
-Every command supports `--json`. Exit codes are stable.
+JSON output (`--json`) is planned. Exit codes are stable.
 
 ### 9.3 Local API
 
-- Unix domain socket (`/run/vnat/control.sock`), mode `0660`, group `vnat`.
-- Line-delimited JSON requests/responses (easy to script) or JSON-RPC 2.0.
-- No TCP listener by default. If enabled, requires a token and TLS.
-- v1 exposes no HTTP listener. A post-v1 optional `vnat-web` adapter may render
-  this API in a browser; it is an unprivileged client and never mutates host
-  state directly (ADR-011).
-- Streaming events: `port_up`, `port_down`, `link_change`, `dhcp_lease`,
-  `nat_expired`, `error`.
+Implemented (R7 control-socket foundation):
+
+- Unix domain socket (`/run/vnat/control.sock`) under `$VNAT_RUN_DIR`, mode
+  `0660`; the socket group is the daemon's primary group, so run `vnatd` and
+  the CLI as the intended `vnat` user or adjust ownership during deployment.
+  Group-based authorization is not implemented yet.
+- One line-delimited JSON request per connection, one response. The CLI opens
+  a fresh connection per command; streaming events remain planned.
+- One daemon per `$VNAT_RUN_DIR`; a non-blocking advisory lock on
+  `<state_dir>/control.sock.lock` is taken before host mutations. A separate
+  `<state_dir>/control.sock.up.lock` serializes concurrent `vnat up` starts.
+  Use separate run directories for separate instances.
+- Operations: `ping`, `status`, `nat.list`, `conntrack.list` (optional
+  `state` and `limit`). Responses echo the request `id`; failures return
+  `ok:false`, `error_code` and `message`. Each table response also carries the
+  daemon `instance` so clients can reject a mismatched `-c` config.
+- The server accepts root or the daemon's effective uid and rejects other
+  peers with `unauthorized`; until group authorization lands, the effective
+  boundary is the peer uid plus socket permissions.
+- Snapshots are published by the datapath once per second. NAT rules are
+  capped at 64 SNAT + 128 port forwards and conntrack responses at 256 entries
+  (the response carries the full table count).
+- No TCP listener. v1 exposes no HTTP listener. A post-v1 optional `vnat-web`
+  adapter may render this API in a browser; it is an unprivileged client and
+  never mutates host state directly (ADR-011).
+- Streaming events (planned): `port_up`, `port_down`, `link_change`,
+  `dhcp_lease`, `nat_expired`, `error`.
 
 ### 9.4 Journal and rollback
 

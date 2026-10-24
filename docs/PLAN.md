@@ -89,7 +89,9 @@ ICMP frag-needed is implemented). None block the exit criterion.
       RFC 1624 quoted-L4 checksum adjustment).
 - [ ] Incremental checksum updates for ordinary NAT rewrites (full recompute
       is correct but slower).
-- [ ] `vnat nat …`, `vnat conntrack …` (needs the R7 control socket).
+- [x] `vnat nat list`, `vnat conntrack list` (read-only, via the R7 control
+      socket).
+- [ ] `vnat nat add|del …` write verbs.
 - [x] Exhaustion/limit behavior + counters.
 - [x] netns matrix: SNAT TCP/UDP/ICMP, DNAT/hairpin and SNAT/DNAT ICMP-error
       translation are covered by `scripts/nat_matrix.sh`.
@@ -175,6 +177,10 @@ suites.
 
 - [x] C ABI (`vnat_create`, `set_port_fd`, events, status), injected-fd L3
   port, shared service lifecycle, and C header/link smoke test.
+- [x] Linux control socket: one-request JSON protocol, read-only
+  `status`/`nat.list`/`conntrack.list`, `vnat up`/`doctor`/`nat list`/
+  `conntrack list`, a run-dir lock that rejects a second daemon, serialized
+  `vnat up` starts, and daemon stderr captured in `<state_dir>/vnatd.log`.
 - [ ] JNI bridge.
 - [ ] Proxy NAT backend (TCP/UDP/ICMP over protected sockets).
 - [ ] Host `VpnService`: Builder, MTU 1380, routes, DNS, per-app split tunnel.

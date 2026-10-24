@@ -387,13 +387,15 @@ Wintun/Npcap, IP Helper, WFP/New-NetNat.
   one forward op per JSON line, fsynced and atomically replaced before the
   netlink mutation. `vnat down` derives inverses in reverse order; deletes are
   gated by journal ownership; a failed apply removes its record.
-- Pending/applied reconciliation, batch apply, PID lock and `vnat doctor` land
-  with the R7 control plane.
+- The R7 control socket, read-only status, `vnat doctor` diagnostics, and the
+  run-dir daemon lock are implemented. Pending/applied reconciliation and
+  batch apply remain.
 - Secrets (if any) come from env/file descriptors, never the config file.
 
 ## 8. Security
 
-- Control socket is `0660 root:vnat` by default; no TCP listener.
+- Control socket is `0660` owned by the daemon uid and primary group; server
+  authorization currently accepts root or that uid. No TCP listener.
 - Privilege separation option (post-v1): privileged datapath helper +
   unprivileged control process, communicating over a socketpair.
 - Firewall default-deny for inbound/forward.

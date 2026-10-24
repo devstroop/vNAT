@@ -108,6 +108,26 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "up")) {
+        try upCommand(init, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "doctor")) {
+        try doctorCommand(init, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "nat")) {
+        try natCommand(init, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "conntrack")) {
+        try conntrackCommand(init, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "selftest")) {
         const code = try selfTest(io, gpa, args[2..]);
         if (code != 0) std.process.exit(code);
@@ -374,6 +394,532 @@ fn routeCommand(init: std.process.Init, args: []const []const u8) !void {
     });
 }
 
+fn upCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len != 0) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    const path = controlPath(init, &path_buf) catch {
+        try printErr(io, gpa, "control socket path is too long\n", .{});
+        std.process.exit(1);
+    };
+
+    if (queryStatus(io, gpa, path)) |response| {
+        var status = response;
+        defer status.deinit();
+        if (!status.value.ok) {
+            try printErr(io, gpa, "daemon at {s}: {s}: {s}\n", .{
+                path,
+                status.value.error_code orelse "error",
+                status.value.message orelse "request failed",
+            });
+            std.process.exit(1);
+        }
+        if (!std.mem.eql(u8, status.value.status.?.instance, parsed.config.instance)) {
+            try printErr(io, gpa, "daemon instance '{s}' does not match config '{s}'\n", .{
+                status.value.status.?.instance,
+                parsed.config.instance,
+            });
+            std.process.exit(1);
+        }
+        try print(io, gpa, "ok: already running instance={s} pid={d}\n", .{
+            status.value.status.?.instance,
+            status.value.status.?.pid,
+        });
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused, error.Timeout => {},
+        else => {
+            try printErr(io, gpa, "cannot reach {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        },
+    }
+
+    const state_dir = stateDir(init);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, state_dir, std.Io.File.Permissions.fromMode(0o750)) catch |err| {
+        try printErr(io, gpa, "create {s}: {s}\n", .{ state_dir, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    const startup_lock = tryStartupLock(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "cannot lock startup at {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (startup_lock == null) {
+        try waitForDaemon(io, gpa, path, parsed.config.instance, null, null);
+        return;
+    }
+    var startup_lock_file = startup_lock.?;
+    defer startup_lock_file.close(io);
+
+    const locked = daemonLockHeld(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "cannot check daemon lock at {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (locked) {
+        try waitForDaemon(io, gpa, path, parsed.config.instance, null, null);
+        return;
+    }
+
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |stat| {
+        if (stat.kind != .unix_domain_socket) {
+            try printErr(io, gpa, "{s} exists and is not a unix socket\n", .{path});
+            std.process.exit(1);
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            try printErr(io, gpa, "inspect {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        },
+    }
+
+    var log_buf: [512]u8 = undefined;
+    const log_path = std.fmt.bufPrint(&log_buf, "{s}/vnatd.log", .{state_dir}) catch {
+        try printErr(io, gpa, "daemon log path is too long\n", .{});
+        std.process.exit(1);
+    };
+    var log_file = std.Io.Dir.cwd().createFile(io, log_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch |err| {
+        try printErr(io, gpa, "open {s}: {s}\n", .{ log_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer log_file.close(io);
+
+    const configured = init.environ_map.get("VNATD");
+    var daemon_alloc: ?[]u8 = null;
+    defer if (daemon_alloc) |value| gpa.free(value);
+    const daemon = configured orelse blk: {
+        const executable = std.process.executablePathAlloc(io, gpa) catch |err| {
+            try printErr(io, gpa, "locate vnat: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer gpa.free(executable);
+        const dir = std.fs.path.dirname(executable) orelse ".";
+        const sibling = std.fs.path.join(gpa, &.{ dir, "vnatd" }) catch |err| {
+            try printErr(io, gpa, "locate vnatd: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        daemon_alloc = sibling;
+        break :blk sibling;
+    };
+
+    const child = std.process.spawn(io, .{
+        .argv = &.{ daemon, "-c", cfg.path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .{ .file = log_file },
+        .pgid = 0,
+    }) catch |err| {
+        try printErr(io, gpa, "start {s}: {s}\n", .{ daemon, @errorName(err) });
+        std.process.exit(1);
+    };
+    try waitForDaemon(io, gpa, path, parsed.config.instance, child.id, log_path);
+}
+
+fn waitForDaemon(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    instance: []const u8,
+    spawned_pid: ?std.posix.pid_t,
+    log_path: ?[]const u8,
+) !void {
+    var elapsed: u64 = 0;
+    while (elapsed < 5_000) : (elapsed += 100) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+        if (queryStatus(io, gpa, path)) |response| {
+            var status = response;
+            defer status.deinit();
+            if (!status.value.ok) {
+                try printErr(io, gpa, "daemon at {s}: {s}: {s}\n", .{
+                    path,
+                    status.value.error_code orelse "error",
+                    status.value.message orelse "request failed",
+                });
+                std.process.exit(1);
+            }
+            if (!std.mem.eql(u8, status.value.status.?.instance, instance)) {
+                try printErr(io, gpa, "daemon instance '{s}' does not match config '{s}'\n", .{
+                    status.value.status.?.instance,
+                    instance,
+                });
+                std.process.exit(1);
+            }
+            if (log_path) |lp| {
+                try print(io, gpa, "ok: vnatd pid={d} instance={s} socket={s} log={s}\n", .{
+                    status.value.status.?.pid,
+                    status.value.status.?.instance,
+                    path,
+                    lp,
+                });
+            } else {
+                try print(io, gpa, "ok: vnatd pid={d} instance={s} socket={s}\n", .{
+                    status.value.status.?.pid,
+                    status.value.status.?.instance,
+                    path,
+                });
+            }
+            return;
+        } else |_| {}
+    }
+
+    if (spawned_pid) |pid| {
+        try printErr(io, gpa, "vnat: vnatd pid={d} did not publish {s} within 5s; log: {s}\n", .{
+            pid,
+            path,
+            log_path.?,
+        });
+        try printLogTail(io, gpa, log_path.?);
+    } else {
+        try printErr(io, gpa, "vnat: another vnatd is starting but did not publish {s} within 5s\n", .{path});
+    }
+    std.process.exit(1);
+}
+
+fn printLogTail(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        try printErr(io, gpa, "vnat: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer file.close(io);
+
+    const size = file.length(io) catch return;
+    const max_tail = 2048;
+    const start = if (size > max_tail) size - max_tail else 0;
+    var buf: [max_tail]u8 = undefined;
+    const len = file.readPositionalAll(io, &buf, start) catch return;
+    if (len == 0) return;
+
+    try printErr(io, gpa, "--- {s} ---\n", .{path});
+    try std.Io.File.stderr().writeStreamingAll(io, buf[0..len]);
+    if (buf[len - 1] != '\n') try std.Io.File.stderr().writeStreamingAll(io, "\n");
+}
+
+fn doctorCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len != 0) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "fail: config {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+    try print(io, gpa, "ok: config {s} instance={s}\n", .{ cfg.path, parsed.config.instance });
+
+    var path_buf: [512]u8 = undefined;
+    const path = controlPath(init, &path_buf) catch {
+        try printErr(io, gpa, "fail: control socket path is too long\n", .{});
+        std.process.exit(1);
+    };
+
+    const socket_stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+        try printErr(io, gpa, "fail: socket {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (socket_stat.kind != .unix_domain_socket) {
+        try printErr(io, gpa, "fail: {s} is not a unix socket\n", .{path});
+        std.process.exit(1);
+    }
+    try print(io, gpa, "ok: socket {s} mode={o}\n", .{
+        path,
+        @intFromEnum(socket_stat.permissions) & 0o777,
+    });
+
+    var response = queryStatus(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "fail: daemon {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer response.deinit();
+    if (!response.value.ok) {
+        try printErr(io, gpa, "fail: daemon: {s}: {s}\n", .{
+            response.value.error_code orelse "error",
+            response.value.message orelse "request failed",
+        });
+        std.process.exit(1);
+    }
+    const status = response.value.status.?;
+    if (!std.mem.eql(u8, status.instance, parsed.config.instance)) {
+        try printErr(io, gpa, "fail: daemon instance '{s}' does not match config '{s}'\n", .{
+            status.instance,
+            parsed.config.instance,
+        });
+        std.process.exit(1);
+    }
+    try print(io, gpa, "ok: daemon pid={d} version={s} uptime={d}ms ports={d}\n", .{
+        status.pid,
+        status.version,
+        status.uptime_ms,
+        status.ports,
+    });
+
+    var host = openHost(init, &parsed) catch |err| {
+        try printErr(io, gpa, "fail: journal: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer host.deinit();
+    const contents = host.journalContents() catch |err| {
+        try printErr(io, gpa, "fail: journal: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    if (contents) |text| {
+        defer gpa.free(text);
+        const lines = std.mem.count(u8, text, "\n");
+        try print(io, gpa, "ok: journal entries={d}\n", .{lines});
+    } else {
+        try print(io, gpa, "ok: journal empty\n", .{});
+    }
+}
+
+fn natCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len != 1 or !std.mem.eql(u8, cfg.rest[0], "list")) {
+        try printErr(io, gpa, "usage: vnat nat list [-c <config>]\n", .{});
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    const path = controlPath(init, &path_buf) catch {
+        try printErr(io, gpa, "control socket path is too long\n", .{});
+        std.process.exit(1);
+    };
+    var response = controlCall(io, gpa, path, "nat.list", null, null) catch |err| {
+        try printErr(io, gpa, "control {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer response.deinit();
+    if (!response.value.ok) {
+        try printErr(io, gpa, "nat: {s}: {s}\n", .{
+            response.value.error_code orelse "error",
+            response.value.message orelse "request failed",
+        });
+        std.process.exit(1);
+    }
+    const nat = response.value.nat.?;
+    if (!std.mem.eql(u8, nat.instance, parsed.config.instance)) {
+        try printErr(io, gpa, "daemon instance '{s}' does not match config '{s}'\n", .{
+            nat.instance,
+            parsed.config.instance,
+        });
+        std.process.exit(1);
+    }
+
+    try print(io, gpa, "SNAT\n{s:<12} {s}\n", .{ "OUT", "ADDRESS" });
+    for (nat.snat) |rule| {
+        try print(io, gpa, "{s:<12} {s}\n", .{ rule.out, rule.addr });
+    }
+    if (nat.snat.len == 0) try print(io, gpa, "-\n", .{});
+
+    try print(io, gpa, "PORT FORWARD\n{s:<8} {s:>6} {s:<21} {s}\n", .{
+        "PROTO", "EXT", "TO", "INGRESS",
+    });
+    for (nat.port_forward) |rule| {
+        var target_buf: [32]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buf, "{s}:{d}", .{ rule.to_addr, rule.to_port }) catch "?";
+        try print(io, gpa, "{s:<8} {d:>6} {s:<21} {s}\n", .{
+            rule.proto,
+            rule.ext_port,
+            target,
+            rule.ingress orelse "-",
+        });
+    }
+    if (nat.port_forward.len == 0) try print(io, gpa, "-\n", .{});
+}
+
+fn conntrackCommand(init: std.process.Init, args: []const []const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const cfg = splitConfig(args);
+    if (cfg.rest.len == 0 or !std.mem.eql(u8, cfg.rest[0], "list")) {
+        try printErr(io, gpa, "usage: vnat conntrack list [--state <state>] [--limit <n>] [-c <config>]\n", .{});
+        std.process.exit(2);
+    }
+
+    var state_filter: ?[]const u8 = null;
+    var limit: ?u32 = null;
+    var i: usize = 1;
+    while (i < cfg.rest.len) : (i += 1) {
+        const arg = cfg.rest[i];
+        if (std.mem.eql(u8, arg, "--state")) {
+            if (i + 1 >= cfg.rest.len) {
+                try printErr(io, gpa, "conntrack: --state requires a value\n", .{});
+                std.process.exit(2);
+            }
+            i += 1;
+            state_filter = cfg.rest[i];
+            if (!std.mem.eql(u8, state_filter.?, "new") and
+                !std.mem.eql(u8, state_filter.?, "established") and
+                !std.mem.eql(u8, state_filter.?, "closing"))
+            {
+                try printErr(io, gpa, "conntrack: unknown state '{s}'\n", .{state_filter.?});
+                std.process.exit(2);
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--limit")) {
+            if (i + 1 >= cfg.rest.len) {
+                try printErr(io, gpa, "conntrack: --limit requires a value\n", .{});
+                std.process.exit(2);
+            }
+            i += 1;
+            limit = std.fmt.parseInt(u32, cfg.rest[i], 10) catch {
+                try printErr(io, gpa, "conntrack: invalid limit '{s}'\n", .{cfg.rest[i]});
+                std.process.exit(2);
+            };
+            continue;
+        }
+        try printErr(io, gpa, "conntrack: unknown option '{s}'\n", .{arg});
+        std.process.exit(2);
+    }
+
+    var parsed = loadConfig(io, gpa, cfg.path) catch |err| {
+        try printErr(io, gpa, "cannot load {s}: {s}\n", .{ cfg.path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    const path = controlPath(init, &path_buf) catch {
+        try printErr(io, gpa, "control socket path is too long\n", .{});
+        std.process.exit(1);
+    };
+    var response = controlCall(io, gpa, path, "conntrack.list", state_filter, limit) catch |err| {
+        try printErr(io, gpa, "control {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer response.deinit();
+    if (!response.value.ok) {
+        try printErr(io, gpa, "conntrack: {s}: {s}\n", .{
+            response.value.error_code orelse "error",
+            response.value.message orelse "request failed",
+        });
+        std.process.exit(1);
+    }
+    const conntrack = response.value.conntrack.?;
+    if (!std.mem.eql(u8, conntrack.instance, parsed.config.instance)) {
+        try printErr(io, gpa, "daemon instance '{s}' does not match config '{s}'\n", .{
+            conntrack.instance,
+            parsed.config.instance,
+        });
+        std.process.exit(1);
+    }
+    try print(io, gpa, "total={d} returned={d}\n", .{ conntrack.total, conntrack.returned });
+    try print(io, gpa, "{s:<6} {s:<11} {s:<21} {s:<21} {s:<21} {s:>8} {s:>10} {s:>7}\n", .{
+        "PROTO", "STATE", "SOURCE", "DESTINATION", "TRANSLATED", "PACKETS", "BYTES", "TIMEOUT",
+    });
+    for (conntrack.entries) |entry| {
+        var source_buf: [32]u8 = undefined;
+        var dest_buf: [32]u8 = undefined;
+        var translated_buf: [32]u8 = undefined;
+        const source = std.fmt.bufPrint(&source_buf, "{s}:{d}", .{ entry.src, entry.sport }) catch "?";
+        const dest = std.fmt.bufPrint(&dest_buf, "{s}:{d}", .{ entry.dst, entry.dport }) catch "?";
+        const translated = if (entry.translated_src) |source_addr|
+            std.fmt.bufPrint(&translated_buf, "{s}:{d} -> {s}:{d}", .{
+                source_addr,
+                entry.translated_sport,
+                entry.translated_dst orelse source_addr,
+                entry.translated_dport,
+            }) catch "?"
+        else
+            "-";
+        try print(io, gpa, "{s:<6} {s:<11} {s:<21} {s:<21} {s:<21} {d:>8} {d:>10} {d:>7}\n", .{
+            entry.proto,
+            entry.state,
+            source,
+            dest,
+            translated,
+            entry.packets,
+            entry.bytes,
+            entry.timeout_ms,
+        });
+    }
+}
+
+fn controlPath(init: std.process.Init, buf: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/control.sock", .{stateDir(init)});
+}
+
+fn controlCall(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    op: []const u8,
+    state_filter: ?[]const u8,
+    limit: ?u32,
+) !std.json.Parsed(vnat.control_protocol.Response) {
+    var client = try vnat.control_client.Client.connect(io, gpa, path);
+    defer client.deinit();
+    return client.callOp(op, state_filter, limit);
+}
+
+fn queryStatus(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+) !std.json.Parsed(vnat.control_protocol.Response) {
+    return controlCall(io, gpa, path, "status", null, null);
+}
+
+fn daemonLockHeld(io: std.Io, gpa: std.mem.Allocator, control_path: []const u8) !bool {
+    const lock_path = try std.mem.concat(gpa, u8, &.{ control_path, ".lock" });
+    defer gpa.free(lock_path);
+    var file = std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch |err| switch (err) {
+        error.WouldBlock => return true,
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io);
+    return false;
+}
+
+fn tryStartupLock(io: std.Io, gpa: std.mem.Allocator, control_path: []const u8) !?std.Io.File {
+    const lock_path = try std.mem.concat(gpa, u8, &.{ control_path, ".up.lock" });
+    defer gpa.free(lock_path);
+    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch |err| switch (err) {
+        error.WouldBlock => return null,
+        else => return err,
+    };
+    return file;
+}
+
 fn downCommand(init: std.process.Init, args: []const []const u8) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -388,6 +934,38 @@ fn downCommand(init: std.process.Init, args: []const []const u8) !void {
         std.process.exit(1);
     };
     defer parsed.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    const path = controlPath(init, &path_buf) catch {
+        try printErr(io, gpa, "control socket path is too long\n", .{});
+        std.process.exit(1);
+    };
+    const locked = daemonLockHeld(io, gpa, path) catch |err| {
+        try printErr(io, gpa, "cannot check daemon lock at {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (locked) {
+        try printErr(io, gpa, "vnat: daemon is running or starting; stop vnatd first\n", .{});
+        std.process.exit(1);
+    }
+    if (queryStatus(io, gpa, path)) |response| {
+        var status = response;
+        defer status.deinit();
+        if (status.value.ok and
+            std.mem.eql(u8, status.value.status.?.instance, parsed.config.instance))
+        {
+            try printErr(io, gpa, "vnat: daemon pid={d} is running; stop vnatd first\n", .{
+                status.value.status.?.pid,
+            });
+            std.process.exit(1);
+        }
+    } else |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => {},
+        else => {
+            try printErr(io, gpa, "cannot check daemon at {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        },
+    }
 
     var host = openHost(init, &parsed) catch |err| {
         try reportHostError(io, gpa, "state", err);
@@ -1175,6 +1753,10 @@ fn usage(io: std.Io) !void {
         \\  vnat validate <config.json>
         \\  vnat port list
         \\  vnat status [-c] <config.json>
+        \\  vnat up [-c <config>]
+        \\  vnat doctor [-c <config>]
+        \\  vnat nat list [-c <config>]
+        \\  vnat conntrack list [--state new|established|closing] [--limit <n>] [-c <config>]
         \\  vnat iface set|del <dev> <cidr> [-c <config>]
         \\  vnat iface up|down <dev> [-c <config>]
         \\  vnat route add|del <dst> [via <ip>] dev <dev> [metric <n>] [table <n>] [-c <config>]
